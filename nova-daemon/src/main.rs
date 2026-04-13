@@ -242,7 +242,7 @@ async fn handle_connection(
                         Ok(Ok(results)) if !results.is_empty() => {
                             // Dynamic injection: use up to 5% of context window for history
                             let max_inject_chars = (loop_config.context_window / 20).max(1000);
-                            let per_session_chars = max_inject_chars / 3.max(results.len().min(3));
+                            let per_session_chars = max_inject_chars / 3;
 
                             let mut ctx = String::from("\n\n<relevant_history>\nExcerpts from previous conversations:\n");
                             for (i, r) in results.iter().take(3).enumerate() {

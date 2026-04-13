@@ -244,7 +244,7 @@ fn calc_scroll(lines: &[Line], area: Rect, manual_offset: usize) -> u16 {
     // Use unicode display width for accurate CJK handling.
     let total: usize = lines.iter().map(|l| {
         let w = l.width();
-        if w == 0 { 1 } else { (w + inner_width - 1) / inner_width }
+        if w == 0 { 1 } else { w.div_ceil(inner_width) }
     }).sum();
 
     if total <= visible_height {
