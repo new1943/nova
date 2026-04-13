@@ -1,0 +1,18 @@
+[package]
+name = "nova-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nova-api = { path = "../nova-api" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+toml = "0.8"
+dirs = "5"
+glob = "0.3"
