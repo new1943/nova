@@ -753,8 +753,13 @@ struct FileEditInput {
 
 **写入机制**（系统自动，不依赖 LLM 自觉）：
 1. **Compact 前** — 信息即将丢失，用 SideQuery 生成即将被压缩的消息摘要，追加到当天日记
-2. **Session 结束时** — 退出 TUI / /new，用 SideQuery 生成本次对话摘要，追加到当天日记
+2. **Session 结束时** — 退出 TUI / /new，预处理 session（保留 user 原文 + assistant 决策，删工具调用细节），map-reduce 分层摘要（Map 按维度提取关键点 → Reduce 汇总成 ~200 字），追加到当天日记
 3. **每 N 个 turn**（可选）— 定期用 SideQuery 追加增量摘要
+
+**预处理 + Map-Reduce 摘要流程**：
+1. 预处理：保留 user 原文 + assistant 决策，删除工具调用细节
+2. Map 阶段：按 ~180K 字符分批，每批按维度（事件、反馈、用户偏好、项目状态、重要决策、参考资料）提取关键点
+3. Reduce 阶段：合并所有批次摘要，汇总成 ~200 字最终摘要（纯文本，无 markdown）
 
 **整理**：Dream 分析日记内容，生成摘要索引，清理冗余。
 

@@ -154,9 +154,9 @@ fn render_chat_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let title = if !at_bottom {
         let lines_above = start;
         let lines_below = total.saturating_sub(end);
-        format!(" ◈ NOVA [↑{} ↓{}] ", lines_above, lines_below)
+        format!(" ◈ Chat [↑{} ↓{}] ", lines_above, lines_below)
     } else {
-        " ◈ NOVA ".to_string()
+        " ◈ Chat ".to_string()
     };
 
     let border_color = if focused { Theme::PRIMARY } else { Theme::BORDER };

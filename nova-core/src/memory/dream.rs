@@ -206,7 +206,7 @@ Output only the complete updated MEMORY.md content, no explanation.";
     /// Delete diary files older than `days`.
     fn prune_old_diaries(&self, days: i64) -> Result<()> {
         let memories_dir = self.workspace_dir.join("memories");
-        let cutoff = (Utc::now() - chrono::Duration::days(days as i64))
+        let cutoff = (Utc::now() - chrono::Duration::days(days))
             .format("%Y-%m-%d")
             .to_string();
 
@@ -222,11 +222,10 @@ Output only the complete updated MEMORY.md content, no explanation.";
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
             let date = filename.trim_end_matches(".md").to_string();
-            if date < cutoff && date.len() == 10 {
-                if fs::remove_file(&path).is_ok() {
+            if date < cutoff && date.len() == 10
+                && fs::remove_file(&path).is_ok() {
                     removed += 1;
                 }
-            }
         }
 
         if removed > 0 {

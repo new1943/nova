@@ -367,8 +367,8 @@ T03 ─► T13 ─► T14
 
 - [x] 改造 `memory/daily.rs` — 写入 `~/.nova/memories/YYYY-MM-DD.md`（markdown 格式，带时间戳标题）
 - [x] Compact 前自动写入 — 在 `Compactor::compact()` 调用前，用 SideQuery 生成即将被压缩的消息摘要，追加到当天日记
-- [x] Session 结束时自动写入 — 在 daemon 处理 NewSession / TUI 断开时，用 SideQuery 生成本次对话摘要，追加到当天日记
-- [x] SideQuery prompt：从最近 N 条消息中提取关键决策/事件/发现，生成简洁的 markdown 摘要
+- [x] Session 结束时自动写入 — 在 daemon 处理 NewSession / TUI 断开时，生成临时文本（保留 user 原文 + assistant 决策，删工具调用细节），map-reduce 分层摘要，最终输出 ~200 字，追加到当天日记
+- [x] SideQuery prompt：分 Map（按维度提取关键点）和 Reduce（汇总成 ~200 字）两阶段，关注事件、反馈、用户偏好、项目状态、重要决策、参考资料
 - [x] 停用旧记忆系统：移除 daemon 中 DualWriteMemory / MemoryExtractHook / MemoryExtractStopHook 的注册，不再写 JSONL
 
 #### T21.2: 记忆召回管线 ✅

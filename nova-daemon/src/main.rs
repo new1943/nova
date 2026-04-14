@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, error, warn};
@@ -352,7 +352,7 @@ async fn handle_connection(
                     // T21.4: Check dream trigger after each turn
                     if dream_engine.should_dream() {
                         let de = dream_engine.clone();
-                        let mtime = session.token_stats.memory_mtime.clone();
+                        let mtime = session.token_stats.memory_mtime;
                         tokio::spawn(async move {
                             if let Err(e) = de.dream(mtime).await {
                                 warn!("Dream consolidation failed: {}", e);
@@ -423,13 +423,25 @@ async fn handle_connection(
         }
     }
 
+    // T21.1: Write session diary on TUI disconnect (connection closed)
+    if session.messages.len() > 2 {
+        let summary_session = session.clone();
+        let dn = daily_notes.clone();
+        let sq = side_query.clone();
+        tokio::spawn(async move {
+            if let Err(e) = write_session_diary(&dn, &sq, &summary_session).await {
+                warn!("Failed to write session diary on disconnect: {}", e);
+            }
+        });
+    }
+
     session_mgr.save_meta(&session)?;
     Ok(())
 }
 
 // T21.4: Record MEMORY.md mtime at the start of each turn.
 /// Used by Dream to detect if LLM modified MEMORY.md during this turn.
-fn record_memory_mtime(session: &mut nova_core::session::manager::Session, workspace_dir: &PathBuf) {
+fn record_memory_mtime(session: &mut nova_core::session::manager::Session, workspace_dir: &Path) {
     let memory_path = workspace_dir.join("MEMORY.md");
     if let Ok(meta) = std::fs::metadata(&memory_path) {
         if let Ok(mtime) = meta.modified() {
@@ -438,42 +450,106 @@ fn record_memory_mtime(session: &mut nova_core::session::manager::Session, works
     }
 }
 
+const MAP_CHUNK_SIZE: usize = 180_000; // ~180K chars per Map batch
+
+/// Preprocess session: keep user original + assistant decisions, strip tool details.
+fn preprocess_session(messages: &[nova_core::message::Message]) -> String {
+    let mut lines = Vec::new();
+    for m in messages {
+        match m.role {
+            nova_core::message::Role::User => {
+                if let Some(c) = &m.content {
+                    let c = c.trim();
+                    if !c.is_empty() {
+                        lines.push(format!("User: {}", c));
+                    }
+                }
+            }
+            nova_core::message::Role::Assistant => {
+                // Keep content (decisions/reasoning), skip tool_calls
+                if let Some(c) = &m.content {
+                    let c = c.trim();
+                    if !c.is_empty() {
+                        lines.push(format!("Assistant: {}", c));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    lines.join("\n")
+}
+
+/// Map phase: extract key points from one chunk by dimension.
+async fn map_chunk(sq: &SideQuery, chunk: &str) -> anyhow::Result<String> {
+    let system = "You are a key-point extractor. Given a conversation chunk, \
+extract important information along these dimensions:
+- 事件 (events that happened)
+- 反馈 (user feedback / opinions)
+- 用户偏好 (user preferences)
+- 项目状态 (project status / decisions)
+- 重要决策 (key decisions made)
+- 参考资料 (references, links, configurations)
+
+Output a concise list of key points, one per line, in Chinese. \
+If a dimension has no information, skip it. Do not add explanatory text.";
+
+    sq.query_await(system, chunk).await
+}
+
+/// Reduce phase: combine all map results into ~200 char final summary.
+async fn reduce_summaries(sq: &SideQuery, map_results: &[String]) -> anyhow::Result<String> {
+    let combined = map_results.join("\n\n");
+    let system = "You are a diary summarizer. Given multiple key-point extracts from a \
+conversation, write a ~200-character Chinese summary that covers:
+- 事件、反馈、用户偏好、项目状态、重要决策、参考资料
+
+Rules:
+- Output ONLY the summary text in Chinese, no labels, no markdown, no bullet points.
+- Aim for approximately 200 Chinese characters.
+- Focus on what's most important and memorable.";
+
+    sq.query_await(system, &combined).await
+}
+
 async fn write_session_diary(
     daily: &DailyNotes,
     sq: &SideQuery,
     session: &nova_core::session::manager::Session,
 ) -> anyhow::Result<()> {
-    let recent: Vec<String> = session.messages.iter()
-        .rev()
-        .take(30)
-        .filter_map(|m| {
-            let role = match m.role {
-                nova_core::message::Role::User => "User",
-                nova_core::message::Role::Assistant => "Assistant",
-                _ => return None,
-            };
-            let content = m.content.as_deref().unwrap_or("");
-            if content.is_empty() {
-                None
-            } else {
-                Some(format!("{}: {}", role, content))
-            }
-        })
-        .collect();
-
-    if recent.len() < 2 {
+    // Step 1: preprocess — keep user + assistant decisions, strip tool calls
+    let preprocessed = preprocess_session(&session.messages);
+    if preprocessed.len() < 10 {
         return Ok(());
     }
 
-    let conversation = recent.join("\n");
-    let system = "Summarize this conversation session in 2-4 concise Chinese sentences. \
-Focus on: what was discussed, key decisions made, tasks worked on. \
-Output only the summary, no labels.";
-
-    let summary = sq.query_await(system, &conversation).await?;
-    if !summary.trim().is_empty() {
-        daily.append_session(&summary)?;
-        info!("Session diary written: {} chars", summary.len());
+    // Step 2: map phase — split into ~180K chunks
+    let mut map_results = Vec::new();
+    for chunk in preprocessed.chars().collect::<Vec<_>>().chunks(MAP_CHUNK_SIZE) {
+        let chunk_str: String = chunk.iter().collect();
+        match map_chunk(sq, &chunk_str).await {
+            Ok(result) if !result.trim().is_empty() => {
+                map_results.push(result);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Map chunk failed: {}", e);
+            }
+        }
     }
+
+    if map_results.is_empty() {
+        return Ok(());
+    }
+
+    // Step 3: reduce phase — combine all map results into final ~200 char summary
+    let final_summary = reduce_summaries(sq, &map_results).await?;
+    if final_summary.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Step 4: write to diary
+    daily.append_session(&final_summary)?;
+    info!("Session diary written: {} chars ({} map chunks)", final_summary.len(), map_results.len());
     Ok(())
 }
