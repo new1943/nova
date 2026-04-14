@@ -640,3 +640,148 @@ pinned 标记规则：
 | P1 | MEMORY.md 改为工具搜索（不注入） | 中 | 需新增 memory_search 工具 |
 | P2 | 分层 Compact + pinned 消息 | 高 | 需改 Message 结构 |
 | P2 | HEARTBEAT.md 独立区块 | 低 | P0 热加载 |
+
+---
+
+## 8. P0 新增模块设计
+
+### 8.1 FileEditTool — 精确字符串替换
+
+```
+nova-core/src/tools/file_edit.rs
+```
+
+**核心逻辑**：
+
+```rust
+pub struct FileEditTool;
+
+// 参数
+struct FileEditInput {
+    file_path: String,
+    old_string: String,
+    new_string: String,
+    replace_all: bool,  // 默认 false
+}
+
+// 执行流程：
+// 1. 读取文件全文
+// 2. 查找 old_string 出现次数
+//    - 0 次 → 返回错误 "old_string not found"
+//    - 1 次 → 替换
+//    - >1 次 + replace_all=false → 返回错误 "old_string found N times, use replace_all"
+//    - >1 次 + replace_all=true → 全部替换
+// 3. 写回文件
+// 4. 返回 { file_path, replacements_made, preview }
+```
+
+**与 write_file 的区别**：
+- write_file 全量覆盖，适合新建文件或小文件
+- file_edit 精确替换，适合修改大文件中的特定代码段
+
+**注册**：在 `tools/mod.rs` 中导出，在 daemon `make_tools()` 中注册。
+
+### 8.2 findRelevantMemories — 记忆召回管线
+
+```
+nova-core/src/memory/recall.rs
+```
+
+**架构**：系统管线，非工具。嵌入 daemon 的消息处理流程。
+
+```
+用户消息到达
+  │
+  ├─ Agentic Session Search（已有）
+  │    → 搜索历史 session → 注入 <relevant_history>
+  │
+  └─ findRelevantMemories（新增）
+       → 扫描 ~/.nova/memories/*.jsonl
+       → 提取每条记忆的 type + content 摘要
+       → SideQuery 调 LLM 选择最相关的（最多 5 条）
+       → 注入 <relevant_memories> 到 system prompt
+  │
+  ▼
+QueryLoop.run()
+```
+
+**实现**：
+
+```rust
+pub struct MemoryRecall {
+    side_query: SideQuery,
+    memories_dir: PathBuf,
+}
+
+impl MemoryRecall {
+    /// 扫描记忆文件，提取摘要列表
+    fn scan_memories(&self) -> Vec<MemorySummary>;
+
+    /// 用 SideQuery 选择最相关的记忆
+    async fn find_relevant(&self, query: &str) -> Result<Vec<MemoryEntry>>;
+
+    /// 格式化为 system prompt 注入块
+    fn format_injection(&self, memories: &[MemoryEntry]) -> String;
+}
+```
+
+**与 Agentic Session Search 的关系**：
+- 并行执行，共享 10 秒超时
+- Session Search 搜索历史对话，Memory Recall 搜索结构化记忆
+- 两者结果分别注入不同的 XML 块
+
+### 8.3 BrowserTool — Chrome CDP 浏览器自动化
+
+```
+nova-core/src/browser/
+├── mod.rs          # pub mod 导出
+├── tool.rs         # BrowserTool — 工具注册 + action 分发
+├── chrome.rs       # Chrome 进程管理（启动/停止/检测）
+├── cdp.rs          # CDP WebSocket 连接 + 命令发送
+└── actions.rs      # 各 action 实现（navigate/snapshot/screenshot/act）
+```
+
+**依赖**：`chromiumoxide` crate（纯 Rust CDP 客户端）
+
+**架构**：
+
+```
+BrowserTool.execute(action, params)
+  │
+  ├─ start → ChromeManager.launch()
+  │           → tokio::process::Command("chrome")
+  │           → --remote-debugging-port=19222
+  │           → --user-data-dir=~/.nova/browser/nova-profile
+  │           → 等待 CDP 端口就绪
+  │           → chromiumoxide::Browser::connect(ws://127.0.0.1:19222)
+  │
+  ├─ stop → ChromeManager.shutdown()
+  │
+  ├─ navigate → cdp.navigate(url)
+  │
+  ├─ snapshot → cdp.get_page_text() / cdp.get_dom_snapshot()
+  │              → 返回页面文本内容（用于 LLM 理解页面）
+  │
+  ├─ screenshot → cdp.screenshot(full_page, selector)
+  │                → 返回 PNG 文件路径
+  │
+  ├─ act → 根据 kind 分发
+  │   ├─ click(selector) → cdp.click(selector)
+  │   ├─ type(selector, text) → cdp.type(selector, text)
+  │   └─ press(key) → cdp.press(key)
+  │
+  └─ close → cdp.close_tab()
+```
+
+**Chrome 进程管理**：
+- daemon 启动时不启动 Chrome（按需启动）
+- `start` action 时检测是否已有 Chrome 进程
+- 独立 `nova` profile（`~/.nova/browser/nova-profile/`）
+- daemon 退出时自动 kill Chrome 进程
+
+**第一版简化**：
+- 不做 ref 机制（用 CSS 选择器定位）
+- 不做多 profile
+- 不做远程 CDP
+- 不做 Playwright 集成
+- snapshot 返回纯文本（页面可见文本 + 链接），不做 ARIA 树

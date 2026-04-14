@@ -498,13 +498,18 @@ webSearch, webFetch, image, pdf
 OpenClaw 的 browser 能力通过插件系统提供，不在 `openclaw-tools.ts` 直接注册。
 
 核心源码分布：
-- `plugin-sdk/browser-cdp.ts`：CDP URL 解析
-- `plugin-sdk/browser-config.ts`：浏览器配置
-- `plugin-sdk/browser-profiles.ts`：多 profile 管理
-- `plugin-sdk/browser-bridge.ts`：浏览器桥接
-- `plugin-sdk/browser-node-runtime.ts`：节点运行时
-- `plugin-sdk/browser-control-auth.ts`：控制认证
-- `agents/sandbox/browser.ts`：沙箱浏览器
+- `extensions/browser/src/browser-tool.ts`：**工具主入口**，`createBrowserTool()` 工厂函数，按 action 分发
+- `extensions/browser/src/browser-tool.schema.ts`：工具参数 schema（TypeBox 定义）
+- `extensions/browser/src/browser-tool.actions.ts`：act/console/snapshot/tabs 等 action 实现
+- `extensions/browser/src/browser/chrome.ts`：**Chrome 启动核心** — spawn 子进程、`--remote-debugging-port` 参数、user-data-dir 隔离
+- `extensions/browser/src/browser/cdp.ts` + `cdp.helpers.ts`：**CDP 协议核心** — WebSocket 连接、`Page.enable`、截图（`captureScreenshot`）、导航守卫
+- `extensions/browser/src/browser/pw-session.ts` + `pw-ai.ts`：**Playwright on CDP** — 高级操作（click/type/snapshot/PDF）
+- `extensions/browser/src/browser/client-actions*.ts`：客户端操作（core/observe/state/url/types）
+- `extensions/browser/src/browser/control-service.ts`：loopback HTTP 控制服务
+- `extensions/browser/src/browser/bridge-server.ts`：浏览器桥接服务
+- `extensions/browser/src/browser/profiles.ts` + `profiles-service.ts`：多 profile 管理
+- `extensions/browser/src/browser/routes/`：HTTP 路由（agent.act / agent.snapshot / tabs / basic 等）
+- `extensions/browser/src/browser/config.ts` + `constants.ts`：配置和常量
 
 能力（从文档 + 源码推断）：
 - 标签管理：list/open/focus/close
@@ -520,6 +525,21 @@ OpenClaw 的 browser 能力通过插件系统提供，不在 `openclaw-tools.ts`
 - 支持多 profile（openclaw/work/remote）
 - 支持远程 CDP + Browserless 托管
 - Chrome 扩展 relay 模式
+
+**架构要点（NOVA 实现参考）**：
+
+1. **单工具多 action 模式**：一个 `browser` 工具，`action` 参数分发（status/start/stop/tabs/open/snapshot/screenshot/navigate/act/console/pdf/upload/dialog）
+2. **两层 CDP**：底层直接 WebSocket 发 CDP 命令（截图、导航），高层用 Playwright on CDP 做复杂操作（click/type/snapshot/PDF）
+3. **Chrome 启动**：spawn 子进程 + `--remote-debugging-port` + `--user-data-dir` 隔离 profile
+4. **ref 机制**：snapshot 返回 ref ID（数字或 e12 格式），后续操作用 ref 定位元素，不用 CSS 选择器
+5. **loopback HTTP 控制服务**：浏览器操作通过本地 HTTP API 中转
+6. **node proxy**：支持远程浏览器（通过 gateway node.invoke 代理）
+
+**NOVA Rust 实现路线**：
+- 用 `chromiumoxide` crate（纯 Rust CDP 客户端）或 `headless_chrome` crate
+- 启动 Chrome：`tokio::process::Command` + `--remote-debugging-port`
+- 简化架构：daemon 内直接管理 CDP 连接，不需要 HTTP 控制服务中转层
+- 第一版核心 action：start/stop/navigate/snapshot/screenshot/act(click/type/press)/close
 
 ### 3.6 Session 管理（6 个）
 
@@ -674,44 +694,37 @@ Gateway 运行时管理（owner-only）：config.schema.lookup / config.get / co
 
 ## 五、NOVA 缺失工具优先级
 
-### P0 — 核心编码体验
+### P0 — 没有就很痛
+
+| # | 工具 | 来源 | 理由 | 复杂度 |
+|:--|:---|:---|:---|:---|
+| 1 | file_edit | CC FileEdit + OC edit | 精确字符串替换，现在改一行要全量覆盖，大文件直接废 | 中 |
+| 2 | findRelevantMemories | CC memdir 系统管线 | 记忆写了但召回不了等于没写。复用已有 sideQuery，和 Agentic Session Search 同一套路 | 低 |
+| 3 | browser (CDP) | OC browser | 浏览器自动化：搜索/抓取/操作/截图/填表全包，替代 web_search + web_fetch | 高 |
+
+### P1 — 能力明显提升
 
 | 工具 | 来源 | 理由 | 复杂度 |
 |:---|:---|:---|:---|
-| file_edit | CC FileEdit + OC edit | 精确字符串替换，避免全量覆盖 | 中 |
-| web_search | CC WebSearch + OC web_search | agent 搜索最新信息 | 低 |
-| web_fetch | CC WebFetch + OC web_fetch | 抓取网页内容 | 低 |
-| memory_search | OC memory_search + CC memdir | 搜索记忆文件，见下方详解 | 中 |
+| agent | CC AgentTool + OC sessions_spawn | 骨架已有 SubagentSpawner，只差注册为工具 | 低 |
+| todo_write | CC TodoWrite + OC update_plan | 复杂任务没进度追踪，用户看不到在干嘛 | 低 |
+| ask_user | CC AskUserQuestion | 遇到歧义只能猜，不能主动问。TUI 侧需配合 | 低 |
+| apply_patch | OC apply_patch | 多处修改比 file_edit 逐个替换高效 | 中 |
+| skill | CC SkillTool | 骨架已有 SkillsLoader，只差注册为工具 | 低 |
 
-### P1 — Agent 能力
-
-| 工具 | 来源 | 理由 | 复杂度 |
-|:---|:---|:---|:---|
-| agent | CC AgentTool + OC sessions_spawn | 骨架已有 SubagentSpawner | 低 |
-| todo_write | CC TodoWrite + OC update_plan | 任务进度追踪 | 低 |
-| ask_user | CC AskUserQuestion | 向用户提问获取澄清 | 低 |
-| apply_patch | OC apply_patch | 多段补丁 | 中 |
-
-### P2 — 浏览器与高级
+### P2 — 锦上添花
 
 | 工具 | 来源 | 理由 | 复杂度 |
 |:---|:---|:---|:---|
-| browser (CDP) | OC browser | 浏览器自动化，用 chromiumoxide crate | 高 |
-| plan_mode | CC EnterPlanMode | 复杂任务规划模式 | 中 |
+| plan_mode | CC EnterPlanMode | 复杂任务先规划再执行 | 中 |
 | worktree | CC EnterWorktree | 骨架已有 WorktreeManager | 低 |
-| skill | CC SkillTool | 骨架已有 SkillsLoader | 低 |
-| lsp | CC LSP | 代码智能 | 高 |
-
-### P3 — 扩展
-
-| 工具 | 来源 | 理由 | 复杂度 |
-|:---|:---|:---|:---|
-| notebook_edit | CC NotebookEdit | Jupyter 编辑 | 中 |
-| background_bash | CC BashOutput + KillShell | 后台 shell 监控 | 中 |
-| mcp_tool | CC MCPTool | MCP 协议集成 | 高 |
+| background_bash | CC BashOutput + KillShell | 长时间命令监控 | 中 |
+| lsp | CC LSP | 代码智能（跳转定义、引用） | 高 |
+| mcp_tool | CC MCPTool | 接入外部工具生态 | 高 |
 | cron | CC ScheduleCron + OC cron | 骨架已有 HeartbeatScheduler | 低 |
-| structured_output | CC StructuredOutput | SDK/非交互模式结构化输出 | 低 |
 | send_message | CC SendMessage + OC sessions_send | 跨 agent 消息 | 中 |
+| notebook_edit | CC NotebookEdit | Jupyter 编辑 | 中 |
+| structured_output | CC StructuredOutput | SDK/非交互模式结构化输出 | 低 |
 
 ---
 

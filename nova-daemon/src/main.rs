@@ -14,7 +14,7 @@ use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::SideQuery;
 use nova_core::skills::SkillsLoader;
-use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, GlobTool, GrepTool};
+use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool};
 use nova_core::tools::bash::{BashTool, BashMode};
 use nova_core::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
@@ -91,6 +91,7 @@ fn make_tools(mode: &str) -> ToolRegistry {
     tools.register_builtin(Box::new(BashTool::new(bash_mode)));
     tools.register_builtin(Box::new(ReadFileTool));
     tools.register_builtin(Box::new(WriteFileTool));
+    tools.register_builtin(Box::new(FileEditTool));
     tools.register_builtin(Box::new(GlobTool));
     tools.register_builtin(Box::new(GrepTool));
     tools

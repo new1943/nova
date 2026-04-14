@@ -30,10 +30,13 @@
 | T17 | Skills 系统 | P1 | 2h | T05 | ✅ 完成 |
 | T18 | bash 受限模式安全加固 | P2 | 2h | T05 | ✅ 完成 |
 | T19 | 端到端集成测试 | P2 | 4h | 全部 | ❌ 未开始 |
+| T20 | file_edit 精确编辑工具 | P0 | 3h | T05 | ✅ 完成 |
+| T21 | findRelevantMemories 记忆召回 | P0 | 4h | T15 | ❌ 未开始 |
+| T22 | browser (CDP) 浏览器自动化 | P0 | 12h | T05 | ❌ 未开始 |
 
-**总预估**: ~64h
+**总预估**: ~83h
 **已完成**: ~60h（T01-T18）
-**剩余**: ~4h（T19）
+**剩余**: ~23h（T19-T22）
 
 ---
 
@@ -342,6 +345,56 @@ T03 ─► T13 ─► T14
 
 ---
 
+### T20: file_edit 精确编辑工具
+
+**验收标准**: `file_edit` 工具能精确替换文件中的字符串，`old_string` 不唯一时报错，`replace_all=true` 时全部替换，保留缩进。
+
+子任务：
+- [x] 实现 `FileEditTool` 结构体，实现 `Tool` trait
+- [x] 参数解析：file_path、old_string、new_string、replace_all
+- [x] 核心逻辑：读文件 → 查找匹配次数 → 替换 → 写回
+- [x] 错误处理：old_string 未找到、多次匹配但 replace_all=false
+- [x] 在 `tools/mod.rs` 中导出，在 daemon `make_tools()` 中注册
+- [x] 返回 diff 信息（替换次数、文件路径）
+
+---
+
+### T21: findRelevantMemories 记忆召回管线
+
+**验收标准**: 每次用户消息时自动扫描 `~/.nova/memories/*.jsonl`，用 SideQuery 选择最相关的记忆（最多 5 条），注入 system prompt。
+
+子任务：
+- [ ] 实现 `MemoryRecall` 结构体（`memory/recall.rs`）
+- [ ] `scan_memories()` — 扫描 JSONL 文件，提取每条记忆的 type + content 摘要
+- [ ] `find_relevant()` — SideQuery 调 LLM 选择最相关的记忆
+- [ ] `format_injection()` — 格式化为 `<relevant_memories>` XML 块
+- [ ] 在 daemon `handle_connection()` 中集成，与 Agentic Session Search 并行执行
+- [ ] 10 秒超时，失败不影响主流程
+
+---
+
+### T22: browser (CDP) 浏览器自动化
+
+**验收标准**: `browser` 工具能启动 Chrome、导航到 URL、获取页面快照、截图、执行点击/输入操作。
+
+子任务：
+- [ ] 添加 `chromiumoxide` 依赖到 `nova-core/Cargo.toml`
+- [ ] 实现 `browser/chrome.rs` — Chrome 进程管理（启动/停止/检测可执行文件）
+- [ ] 实现 `browser/cdp.rs` — CDP 连接管理（连接/断开/重连）
+- [ ] 实现 `browser/actions.rs` — 各 action 实现
+  - [ ] `navigate(url)` — 导航到 URL
+  - [ ] `snapshot()` — 获取页面可见文本 + 链接列表
+  - [ ] `screenshot(full_page, selector)` — 截图，返回 PNG 文件路径
+  - [ ] `act(click, selector)` — 点击元素
+  - [ ] `act(type, selector, text)` — 输入文本
+  - [ ] `act(press, key)` — 按键
+- [ ] 实现 `browser/tool.rs` — BrowserTool，action 参数分发
+- [ ] 在 `tools/mod.rs` 中导出，在 daemon `make_tools()` 中注册
+- [ ] Chrome profile 隔离（`~/.nova/browser/nova-profile/`）
+- [ ] daemon 退出时自动 kill Chrome 进程
+
+---
+
 ## Phase 2/3 骨架模块状态
 
 > 以下模块在 requirements.md 中标记为"骨架已搭建"，实际均有完整的数据结构和核心逻辑实现。
@@ -375,3 +428,4 @@ T03 ─► T13 ─► T14
 | M5: 策略完整 | T11-T15 | 8 个核心策略全部实现 | ✅ |
 | M6: 功能完整 | T16, T17, T18 | Heartbeat + Skills + 安全 | ✅ |
 | M7: 质量保证 | T19 | 集成测试通过 | ❌ 未开始 |
+| M8: P0 工具 | T20, T21, T22 | file_edit + 记忆召回 + 浏览器 | ❌ 未开始 |

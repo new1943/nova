@@ -326,6 +326,48 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 | `write_file` | ✅ 已实现 | `nova-core/src/tools/write_file.rs` |
 | `glob` | ✅ 已实现 | `nova-core/src/tools/glob.rs` |
 | `grep` | ✅ 已实现 | `nova-core/src/tools/grep.rs` |
+| `file_edit` | 🔧 P0 待实现 | `nova-core/src/tools/file_edit.rs` |
+| `browser` | 🔧 P0 待实现 | `nova-core/src/browser/` |
+
+### P0 新增工具需求
+
+#### file_edit — 精确字符串替换
+
+参考 Claude Code `FileEditTool`，实现精确字符串替换，避免全量覆盖文件。
+
+- 参数：`file_path`、`old_string`（要替换的精确文本）、`new_string`（替换后的文本）、`replace_all`（bool，默认 false）
+- `old_string` 必须在文件中唯一匹配，否则返回错误（除非 `replace_all=true`）
+- 保留精确缩进（tab/空格）
+- 必须先 read_file 过才能 edit（防盲改）— 通过文件状态追踪实现
+- 返回：修改后的 diff 信息（old_string、new_string、替换次数）
+
+#### findRelevantMemories — 记忆召回管线
+
+参考 Claude Code `memdir/findRelevantMemories.ts`，实现记忆文件的自动召回。
+
+- 非工具，是系统管线（类似已有的 Agentic Session Search）
+- 每次用户消息时自动触发，用 SideQuery 调 LLM 从 `~/.nova/memories/*.jsonl` 中选择最相关的记忆
+- 扫描记忆文件，提取每条记忆的摘要/类型
+- LLM 选择最相关的（最多 5 条），注入到 system prompt 的 `<relevant_memories>` 块
+- 与 Agentic Session Search 并行执行，共享 10 秒超时
+
+#### browser (CDP) — 浏览器自动化
+
+参考 OpenClaw `extensions/browser/`，实现 Chrome DevTools Protocol 浏览器控制。
+
+- 单工具多 action 模式：`action` 参数分发
+- 第一版核心 action：
+  - `start`：启动 Chrome（`--remote-debugging-port` + `--user-data-dir` 隔离）
+  - `stop`：关闭浏览器
+  - `navigate`：导航到 URL
+  - `snapshot`：获取页面 DOM/文本快照
+  - `screenshot`：截图（全页/元素）
+  - `act`：操作（click/type/press）— 通过 CSS 选择器或坐标定位
+  - `close`：关闭标签页
+- 使用 `chromiumoxide` crate（纯 Rust CDP 客户端）
+- daemon 内直接管理 CDP 连接，不需要 HTTP 中转层
+- 独立 `nova` 浏览器 profile，不碰用户浏览器
+- 替代 web_search + web_fetch 的功能
 
 ### Agentic Session Search
 
