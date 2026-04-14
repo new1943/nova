@@ -56,9 +56,6 @@ impl StopHook for MemoryExtractStopHook {
             dw.write_and_mark(&session.session_id, MemoryType::Project, &summary).await?;
         }
 
-        // Reset the memory_written flag for next turn
-        session.token_stats.memory_written = false;
-
         Ok(())
     }
 }

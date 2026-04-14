@@ -9,8 +9,10 @@ use nova_api::types::{
 };
 
 use crate::hooks::HookManager;
+use crate::memory::daily::DailyNotes;
 use crate::message::{Message, Role, ToolCall};
 use crate::session::manager::Session;
+use crate::sidequery::SideQuery;
 use crate::token::budget::{BudgetCheck, TokenBudget};
 use crate::token::compact::Compactor;
 use crate::tools::registry::ToolRegistry;
@@ -39,12 +41,14 @@ pub struct QueryLoopConfig {
     pub context_window: usize,
     pub budget_trigger_pct: f32,
     pub compact_target_pct: f32,
+    /// Memories directory for diary writing (Layer 2 episodic memory)
+    pub memories_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for QueryLoopConfig {
     fn default() -> Self {
         Self {
-            max_turns: 20,
+            max_turns: 40,
             tool_timeout: Duration::from_secs(60),
             model: "MiniMax-M2.7".into(),
             max_tokens: 8192,
@@ -53,6 +57,7 @@ impl Default for QueryLoopConfig {
             context_window: 200_000,
             budget_trigger_pct: 0.9,
             compact_target_pct: 0.6,
+            memories_dir: None,
         }
     }
 }
@@ -62,11 +67,19 @@ pub struct QueryLoop {
     pub config: QueryLoopConfig,
     pub tools: ToolRegistry,
     pub hooks: HookManager,
+    pub daily_notes: Option<DailyNotes>,
+    pub side_query: Option<SideQuery>,
 }
 
 impl QueryLoop {
-    pub fn new(tools: ToolRegistry, hooks: HookManager, config: QueryLoopConfig) -> Self {
-        Self { config, tools, hooks }
+    pub fn new(
+        tools: ToolRegistry,
+        hooks: HookManager,
+        config: QueryLoopConfig,
+        daily_notes: Option<DailyNotes>,
+        side_query: Option<SideQuery>,
+    ) -> Self {
+        Self { config, tools, hooks, daily_notes, side_query }
     }
 
     /// Run a full query loop turn for user input.
@@ -76,6 +89,9 @@ impl QueryLoop {
         system_prompt: &str,
         event_tx: mpsc::Sender<LoopEvent>,
     ) -> Result<()> {
+        // Reset turn counter — max_turns limits loop depth per user message, not per session
+        session.reset_turns();
+
         let tool_schemas = self.tools.as_api_schemas();
         let mut budget = TokenBudget::new(
             self.config.context_window,
@@ -98,12 +114,15 @@ impl QueryLoop {
                 break;
             }
 
-            // --- Strategy 2: Pre-flight budget check using cumulative tokens ---
-            // Only check capacity threshold here; diminishing returns is checked post-flight
-            // with per-turn values.
-            let cumulative = session.token_stats.total_input_tokens as usize;
-            if cumulative > 0 && budget.needs_compact(cumulative) {
+            // --- Strategy 2: Pre-flight budget check ---
+            // Estimate current context size from message content rather than cumulative
+            // token counter (which only grows). This avoids re-triggering compact every
+            // turn after the first compaction since total_input_tokens is never reset.
+            let estimated_tokens = estimate_message_tokens(&session.messages);
+            if estimated_tokens > 0 && budget.needs_compact(estimated_tokens) {
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
+                // T21.1: Write diary before compacting (messages will be summarized)
+                self.write_compact_diary(&session.messages).await;
                 match compactor.compact(&session.messages, self.config.context_window).await {
                     Ok(compacted) => session.messages = compacted,
                     Err(e) => warn!("Pre-flight compact failed: {}", e),
@@ -210,6 +229,8 @@ impl QueryLoop {
             // GAP 2: context-overflow → compact and retry this turn
             if context_overflow {
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
+                // T21.1: Write diary before compacting
+                self.write_compact_diary(&session.messages).await;
                 match compactor.compact(&session.messages, self.config.context_window).await {
                     Ok(compacted) => {
                         session.messages = compacted;
@@ -233,6 +254,8 @@ impl QueryLoop {
             match budget.check(input_tokens) {
                 BudgetCheck::NeedsCompact => {
                     let _ = event_tx.send(LoopEvent::CompactTriggered).await;
+                    // T21.1: Write diary before compacting
+                    self.write_compact_diary(&session.messages).await;
                     match compactor.compact(&session.messages, self.config.context_window).await {
                         Ok(compacted) => session.messages = compacted,
                         Err(e) => warn!("Compact failed: {}", e),
@@ -290,6 +313,79 @@ impl QueryLoop {
 
         Ok(())
     }
+
+    // T21.1: Write diary entry before compacting messages.
+    // Uses SideQuery to generate a summary of messages that will be compressed.
+    async fn write_compact_diary(&self, messages: &[Message]) {
+        let daily = match &self.daily_notes {
+            Some(d) => d,
+            None => return,
+        };
+        let sq = match &self.side_query {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Collect recent messages for summarization (last 20)
+        let recent: Vec<String> = messages.iter()
+            .rev()
+            .take(20)
+            .filter_map(|m| {
+                let role = match m.role {
+                    Role::User => "User",
+                    Role::Assistant => "Assistant",
+                    Role::Tool => "Tool",
+                    Role::System => return None,
+                };
+                let content = m.content.as_deref().unwrap_or("");
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(format!("{}: {}", role, content))
+                }
+            })
+            .collect();
+
+        if recent.len() < 3 {
+            return; // Not enough to summarize
+        }
+
+        let conversation = recent.join("\n");
+        let system = "Summarize the following conversation in 1-3 concise Chinese sentences. \
+    Focus on: key decisions, important findings, user preferences mentioned. \
+    Output only the summary, no labels.";
+
+        let prompt = format!("Conversation:\n{}", conversation);
+
+        match sq.query_await(system, &prompt).await {
+            Ok(summary) if !summary.trim().is_empty() => {
+                if let Err(e) = daily.append_compact(&summary) {
+                    warn!("Failed to write compact diary: {}", e);
+                } else {
+                    tracing::info!("Compact diary written: {} chars", summary.len());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Compact diary summary failed: {}", e),
+        }
+    }
+}
+
+/// Estimate the token count of current messages using a simple heuristic (~4 chars per token).
+/// This gives a rough approximation of how many input tokens the next API call will use,
+/// based on the actual message content rather than the ever-growing cumulative counter.
+fn estimate_message_tokens(messages: &[Message]) -> usize {
+    let total_chars: usize = messages.iter()
+        .map(|m| {
+            let content_len = m.content.as_ref().map(|c| c.len()).unwrap_or(0);
+            let tool_len = m.tool_calls.as_ref().map(|tcs| {
+                tcs.iter().map(|tc| tc.name.len() + tc.arguments.to_string().len()).sum::<usize>()
+            }).unwrap_or(0);
+            content_len + tool_len
+        })
+        .sum();
+    // ~4 chars per token is a common rough estimate
+    total_chars / 4
 }
 
 /// Convert session Messages to Anthropic API message format
@@ -341,3 +437,4 @@ fn build_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
     }
     api_msgs
 }
+

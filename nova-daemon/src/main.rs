@@ -2,14 +2,14 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 use nova_core::agent::{QueryLoop, QueryLoopConfig, LoopEvent};
 use nova_core::config::NovaConfig;
 use nova_core::hooks::HookManager;
-use nova_core::hooks::post_sampling::MemoryExtractHook;
-use nova_core::hooks::stop::MemoryExtractStopHook;
-use nova_core::memory::DualWriteMemory;
+use nova_core::memory::daily::DailyNotes;
+use nova_core::memory::dream::DreamEngine;
+use nova_core::memory::recall::MemoryRecall;
 use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::SideQuery;
@@ -97,11 +97,9 @@ fn make_tools(mode: &str) -> ToolRegistry {
     tools
 }
 
-fn make_hooks(dual_write: Arc<Mutex<DualWriteMemory>>) -> HookManager {
-    let mut hooks = HookManager::new();
-    hooks.register_post_sampling(Box::new(MemoryExtractHook::new(dual_write.clone())));
-    hooks.register_stop(Box::new(MemoryExtractStopHook::new(dual_write)));
-    hooks
+fn make_hooks() -> HookManager {
+    // T21.1: Old DualWriteMemory hooks disabled — replaced by T21 layered memory system
+    HookManager::new()
 }
 
 /// Generate tool descriptions string (used by BootstrapLoader)
@@ -141,6 +139,7 @@ async fn run_daemon() -> Result<()> {
         context_window: config.context_window,
         budget_trigger_pct: config.budget_trigger_pct,
         compact_target_pct: config.compact_target_pct,
+        memories_dir: None,
     };
 
     let server = IpcServer::bind(SOCKET_PATH.as_ref()).await?;
@@ -151,7 +150,7 @@ async fn run_daemon() -> Result<()> {
             Ok(conn) => {
                 let workspace_dir = config.workspace.clone();
                 let sd = config.workspace.join("sessions");
-                let md = config.workspace.join("memories");
+                let md = config.workspace.clone(); // workspace root; DailyNotes appends "memories/" internally
                 let lc = loop_config.clone();
                 let sk = skills.clone();
                 let rm = run_mode.clone();
@@ -170,17 +169,45 @@ async fn handle_connection(
     mut conn: nova_ipc::IpcConnection,
     workspace_dir: PathBuf,
     sessions_dir: PathBuf,
-    memories_dir: PathBuf,
-    loop_config: QueryLoopConfig,
+    memories_dir: PathBuf, // workspace root (DailyNotes appends "memories/" internally)
+    mut loop_config: QueryLoopConfig,
     skills: Arc<SkillsLoader>,
     run_mode: String,
 ) -> Result<()> {
     let session_mgr = SessionManager::new(sessions_dir.clone());
-    let dual_write = Arc::new(Mutex::new(DualWriteMemory::new(memories_dir)));
 
     // BootstrapLoader: hot-reloads workspace files with mtime caching
-    let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir)));
+    let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir.clone())));
     let tool_desc = tool_descriptions(&run_mode);
+
+    // DailyNotes: Layer 2 episodic memory (T21.1)
+    let daily_notes = DailyNotes::new(memories_dir.clone());
+
+    // SideQuery for diary generation and recall (T21.1 + T21.2)
+    let side_query = SideQuery::new(
+        loop_config.api_key.clone(),
+        loop_config.api_base_url.clone(),
+        loop_config.model.clone(),
+    );
+
+    // MemoryRecall for diary recall (T21.2)
+    let recall_session_mgr = SessionManager::new(sessions_dir.clone());
+    let memory_recall = MemoryRecall::new(memories_dir.clone(), side_query.clone(), recall_session_mgr);
+
+    // DreamEngine for periodic memory consolidation (T21.4)
+    let dream_sq = SideQuery::new(
+        loop_config.api_key.clone(),
+        loop_config.api_base_url.clone(),
+        loop_config.model.clone(),
+    );
+    let dream_engine = Arc::new(DreamEngine::new(
+        workspace_dir.clone(),
+        memories_dir.clone(),
+        dream_sq,
+    ));
+
+    // Pass memories_dir to QueryLoop for diary writing
+    loop_config.memories_dir = Some(memories_dir.clone());
 
     let mut session = match session_mgr.resume_latest()? {
         Some(s) => {
@@ -221,7 +248,9 @@ async fn handle_connection(
 
                 let msg = nova_core::message::Message::user(&content);
                 session_mgr.append_message(&mut session, msg)?;
-                dual_write.lock().await.clear_marker(&session.session_id);
+
+                // T21.4: Record MEMORY.md mtime at turn start (for Dream dual-write mutex)
+                record_memory_mtime(&mut session, &workspace_dir);
 
                 // Hot-reload system prompt from workspace files (mtime cached)
                 let mut sp = bootstrap.lock().await.build_system_prompt(&tool_desc);
@@ -261,19 +290,33 @@ async fn handle_connection(
                         Ok(Err(e)) => info!("Auto-search failed (non-fatal): {}", e),
                         Err(_) => info!("Auto-search timed out, skipping"),
                     }
+
+                    // T21.2: Memory recall — inject relevant daily diary entries
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        memory_recall.recall(&content, 3),
+                    ).await {
+                        Ok(Ok(injection)) if !injection.is_empty() => {
+                            sp.push_str(&injection);
+                            info!("Memory recall injected diary context (~{} chars)", injection.len());
+                        }
+                        Ok(Ok(_)) | Ok(Err(_)) => {}
+                        Err(_) => info!("Memory recall timed out, skipping"),
+                    }
                 }
 
                 let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
                 let lc = loop_config.clone();
                 let ctx_window = lc.context_window;
-                let dw = dual_write.clone();
+                let dn = daily_notes.clone();
+                let sq_loop = side_query.clone();
                 let session_clone = session.clone();
                 let rm = run_mode.clone();
 
                 let loop_handle = tokio::spawn(async move {
                     let tools = make_tools(&rm);
-                    let hooks = make_hooks(dw);
-                    let ql = QueryLoop::new(tools, hooks, lc);
+                    let hooks = make_hooks();
+                    let ql = QueryLoop::new(tools, hooks, lc, Some(dn), Some(sq_loop));
                     let mut s = session_clone;
                     s.turn_count = 0;
                     let _ = ql.run(&mut s, &sp, event_tx).await;
@@ -305,9 +348,33 @@ async fn handle_connection(
                         let _ = history.append(msg);
                     }
                     session_mgr.save_meta(&session)?;
+
+                    // T21.4: Check dream trigger after each turn
+                    if dream_engine.should_dream() {
+                        let de = dream_engine.clone();
+                        let mtime = session.token_stats.memory_mtime.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = de.dream(mtime).await {
+                                warn!("Dream consolidation failed: {}", e);
+                            } else {
+                                info!("Dream consolidation completed");
+                            }
+                        });
+                    }
                 }
             }
             Request::NewSession => {
+                // T21.1: Write session summary diary before ending current session
+                if session.messages.len() > 2 {
+                    let summary_session = session.clone();
+                    let dn = daily_notes.clone();
+                    let sq = side_query.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = write_session_diary(&dn, &sq, &summary_session).await {
+                            warn!("Failed to write session diary: {}", e);
+                        }
+                    });
+                }
                 session = session_mgr.create(session.max_turns)?;
                 conn.send_event(&Event::SessionCreated {
                     session_id: session.session_id.clone(),
@@ -357,5 +424,56 @@ async fn handle_connection(
     }
 
     session_mgr.save_meta(&session)?;
+    Ok(())
+}
+
+// T21.4: Record MEMORY.md mtime at the start of each turn.
+/// Used by Dream to detect if LLM modified MEMORY.md during this turn.
+fn record_memory_mtime(session: &mut nova_core::session::manager::Session, workspace_dir: &PathBuf) {
+    let memory_path = workspace_dir.join("MEMORY.md");
+    if let Ok(meta) = std::fs::metadata(&memory_path) {
+        if let Ok(mtime) = meta.modified() {
+            session.token_stats.memory_mtime = Some(mtime);
+        }
+    }
+}
+
+async fn write_session_diary(
+    daily: &DailyNotes,
+    sq: &SideQuery,
+    session: &nova_core::session::manager::Session,
+) -> anyhow::Result<()> {
+    let recent: Vec<String> = session.messages.iter()
+        .rev()
+        .take(30)
+        .filter_map(|m| {
+            let role = match m.role {
+                nova_core::message::Role::User => "User",
+                nova_core::message::Role::Assistant => "Assistant",
+                _ => return None,
+            };
+            let content = m.content.as_deref().unwrap_or("");
+            if content.is_empty() {
+                None
+            } else {
+                Some(format!("{}: {}", role, content))
+            }
+        })
+        .collect();
+
+    if recent.len() < 2 {
+        return Ok(());
+    }
+
+    let conversation = recent.join("\n");
+    let system = "Summarize this conversation session in 2-4 concise Chinese sentences. \
+Focus on: what was discussed, key decisions made, tasks worked on. \
+Output only the summary, no labels.";
+
+    let summary = sq.query_await(system, &conversation).await?;
+    if !summary.trim().is_empty() {
+        daily.append_session(&summary)?;
+        info!("Session diary written: {} chars", summary.len());
+    }
     Ok(())
 }

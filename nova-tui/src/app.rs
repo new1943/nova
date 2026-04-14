@@ -26,7 +26,6 @@ pub struct CommandEntry {
     pub name: String,
     pub args_summary: String,
     pub result: Option<String>,
-    pub collapsed: bool,
 }
 
 /// TUI application state
@@ -114,7 +113,6 @@ impl App {
             name,
             args_summary,
             result: None,
-            collapsed: false,
         });
         self.cmd_scroll_offset = 0; // auto-scroll
     }

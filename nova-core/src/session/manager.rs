@@ -13,7 +13,8 @@ pub struct TokenStats {
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     pub turn_tokens: Vec<u32>,
-    pub memory_written: bool,
+    /// T21.4: mtime of MEMORY.md at the start of current turn (for dual-write mutex with Dream)
+    pub memory_mtime: Option<std::time::SystemTime>,
 }
 
 /// Session state
@@ -49,6 +50,12 @@ impl Session {
     pub fn increment_turn(&mut self) -> bool {
         self.turn_count += 1;
         self.turn_count <= self.max_turns
+    }
+
+    /// Reset turn counter for a new user query.
+    /// max_turns limits the agent loop depth per user message, not per session.
+    pub fn reset_turns(&mut self) {
+        self.turn_count = 0;
     }
 }
 

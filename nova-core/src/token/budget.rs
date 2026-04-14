@@ -1,13 +1,14 @@
 /// Token Budget — Strategy 2: dual threshold detection
 ///
 /// Threshold 1 (90%): input_tokens > context_window * 0.9 → trigger Compact
-/// Threshold 2 (3x marginal): current_turn > prev_turn * 3 && current > min → stop loop
+/// Threshold 2 (3x marginal delta): (current - prev) > (prev - prev_prev) * 3 → stop loop
 pub struct TokenBudget {
     context_window: usize,
     trigger_pct: f32,
     marginal_multiplier: f32,
     min_marginal_threshold: usize,
     prev_turn_input: usize,
+    prev_prev_turn_input: usize,
 }
 
 pub enum BudgetCheck {
@@ -24,6 +25,7 @@ impl TokenBudget {
             marginal_multiplier: 3.0,
             min_marginal_threshold: 1000,
             prev_turn_input: 0,
+            prev_prev_turn_input: 0,
         }
     }
 
@@ -43,15 +45,28 @@ impl TokenBudget {
         input_tokens as f32 > self.context_window as f32 * self.trigger_pct
     }
 
-    /// Threshold 2: marginal cost explosion (3x previous turn)
+    /// Threshold 2: marginal cost explosion (3x previous turn's marginal increase)
+    ///
+    /// Compares the *increase* in input tokens between turns, not the absolute values.
+    /// As conversation grows, absolute input_tokens naturally rises; what matters is
+    /// whether the *delta* (new tokens added this turn) is exploding relative to the
+    /// previous turn's delta.
     pub fn is_diminishing(&self, current_turn_input: usize) -> bool {
-        self.prev_turn_input > 0
-            && current_turn_input > self.min_marginal_threshold
-            && current_turn_input > self.prev_turn_input * self.marginal_multiplier as usize
+        // Need at least two prior data points to compute deltas
+        if self.prev_turn_input == 0 || self.prev_prev_turn_input == 0 {
+            return false;
+        }
+        let current_delta = current_turn_input.saturating_sub(self.prev_turn_input);
+        let prev_delta = self.prev_turn_input.saturating_sub(self.prev_prev_turn_input);
+
+        prev_delta > 0
+            && current_delta > self.min_marginal_threshold
+            && current_delta > prev_delta * self.marginal_multiplier as usize
     }
 
     /// Record this turn's input tokens for next comparison
     pub fn record_turn(&mut self, input_tokens: usize) {
+        self.prev_prev_turn_input = self.prev_turn_input;
         self.prev_turn_input = input_tokens;
     }
 

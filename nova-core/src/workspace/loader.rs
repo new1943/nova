@@ -11,7 +11,6 @@ const HEAD_RATIO: f64 = 0.7;
 const TAIL_RATIO: f64 = 0.2;
 
 /// Bootstrap files to load, in injection order.
-/// MEMORY.md is excluded — accessed via tool search, not injected.
 const BOOTSTRAP_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
@@ -20,6 +19,39 @@ const BOOTSTRAP_FILES: &[&str] = &[
     "STATE.md",
     "TASKS.md",
 ];
+
+/// MEMORY.md is loaded separately — it's the working memory layer (Layer 1).
+const MEMORY_FILE: &str = "MEMORY.md";
+
+/// Memory system guidance injected into system prompt.
+/// This guides the LLM to actively maintain MEMORY.md.
+const MEMORY_GUIDANCE: &str = r#"## 记忆系统
+
+你有一个三层记忆系统：
+
+### 层1：MEMORY.md（工作记忆，始终可见）
+- 路径：`~/.nova/MEMORY.md`
+- 内容：用户偏好、项目状态、重要决策、参考资料
+- 分类：`## 用户` / `## 项目` / `## 反馈` / `## 参考`
+- 维护方式：
+  - 用户说"记住..." → 用 file_edit 立即更新对应区块
+  - 重要决策后 → 更新 `## 项目` 区块
+  - 收到反馈 → 更新 `## 反馈` 区块
+  - 保持 <200 行，精炼表达
+- 写入时机：
+  - 用户显式要求："记住这个"、"以后都用..."
+  - 重要反馈："偏好 XXX"、"不要做 YYY"
+  - 项目关键节点：方案选型、架构决策、重大变更
+  - 不要每句话都记，只记值得长期保留的
+
+### 层2：情景记忆（自动写入，不需你操心）
+- 路径：`~/.nova/memories/YYYY-MM-DD.md`
+- 系统自动在 Compact 前和 Session 结束时写入
+- 你可以 `/search <关键词>` 手动召回相关记忆
+
+### 层3：历史 Session（完整细节）
+- 路径：`~/.nova/sessions/<uuid>.jsonl`
+- 通过 Agentic Session Search 自动召回相关历史"#;
 
 /// Cached file entry with mtime for change detection
 #[derive(Debug, Clone)]
@@ -95,12 +127,48 @@ impl BootstrapLoader {
             }
         }
 
+        // Append memory guidance (always, even if MEMORY.md doesn't exist yet)
+        parts.push(MEMORY_GUIDANCE.to_string());
+
+        // Inject MEMORY.md actual content (Layer 1 working memory)
+        let memory_content = self.load_memory();
+        if !memory_content.is_empty() {
+            let mem_budget = MAX_TOTAL_CHARS.saturating_sub(total_chars).min(10_000);
+            if mem_budget >= MIN_FILE_BUDGET {
+                let truncated = truncate_bootstrap(&memory_content, mem_budget);
+                parts.push(format!(
+                    "\n\n---\n\n## MEMORY.md (Your Working Memory)\n\n{}\n\n---\n\n",
+                    truncated
+                ));
+            }
+        }
+
         // Tool descriptions always appended
         if !tool_descriptions.is_empty() {
             parts.push(tool_descriptions.to_string());
         }
 
         parts.join("\n\n---\n\n")
+    }
+
+    /// Load MEMORY.md (Layer 1 working memory).
+    /// Returns empty string if file doesn't exist.
+    pub fn load_memory(&mut self) -> String {
+        self.load_with_cache(MEMORY_FILE)
+    }
+
+    /// Build a system prompt segment for MEMORY.md injection.
+    /// Call this after BOOTSTRAP_FILES to include working memory in context.
+    pub fn build_memory_injection(&mut self, max_chars: usize) -> String {
+        let content = self.load_memory();
+        if content.is_empty() {
+            return String::new();
+        }
+        let truncated = truncate_bootstrap(&content, max_chars);
+        format!(
+            "\n\n---\n\n## Working Memory (MEMORY.md)\n\n{}\n\n---\n\n",
+            truncated
+        )
     }
 
     /// Load a file with mtime caching. Returns empty string if file doesn't exist.

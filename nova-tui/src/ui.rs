@@ -41,12 +41,12 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         let sid_short: String = sid.chars().take(8).collect();
         let bar = budget_bar(app.budget_pct, 10);
         format!(
-            " [●] KIKO v0.1 │ {} │ {}↑ {}↓ │ {} {:.0}%  {}",
+            " [●] NOVA v1.0 │ {} │ {}↑ {}↓ │ {} {:.0}%  {}",
             sid_short, app.token_input, app.token_output,
             bar, app.budget_pct * 100.0, app.status_text,
         )
     } else {
-        format!(" [○] KIKO v0.1 │ {}", app.status_text)
+        format!(" [○] NOVA v1.0 │ {}", app.status_text)
     };
 
     let block = Block::default()
@@ -96,7 +96,7 @@ fn render_chat_panel(f: &mut Frame, app: &mut App, area: Rect) {
     for msg in &app.messages {
         let (prefix, color) = match &msg.role {
             DisplayRole::User => ("▶ You", Theme::USER_MSG),
-            DisplayRole::Assistant => ("◆ Kiko", Theme::ASSISTANT_MSG),
+            DisplayRole::Assistant => ("◆ AI", Theme::ASSISTANT_MSG),
             DisplayRole::System => ("◇ System", Theme::DIM),
         };
 
@@ -173,7 +173,7 @@ fn render_chat_panel(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn chat_block(_app: &App, _focused: bool) -> Block<'static> {
     Block::default()
-        .title(Span::styled(" ◈ NOVA ", Style::default().fg(Theme::ACCENT).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(" ◈ Chat ", Style::default().fg(Theme::ACCENT).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::BORDER))
         .style(Style::default().bg(Theme::BG))

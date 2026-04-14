@@ -412,9 +412,9 @@ main → run_app
 ### 4.5 TUI 布局
 
 ```
-┌─ [●] KIKO v0.1 │ Session: xxx │ Tokens: N↑ N↓ │ Budget: N% ─┐
+┌─ [●] NOVA v1.0 │ Session: xxx │ Tokens: N↑ N↓ │ Budget: N% ─┐
 ├───────────────────────────────────────────────────────────────┤
-│  ◈ NOVA                                                       │
+│  ◈ Chat                                                       │
 │  ▶ You: ...                                                   │
 │  ◆ Kiko: ...                                                  │
 │  ⚙ bash: ...                                                  │
@@ -809,9 +809,9 @@ nova-core/src/memory/
 ├── mod.rs              # pub mod 导出
 ├── dual_write.rs       # 废弃（保留兼容，后续删除）
 ├── store.rs            # 废弃（保留兼容，后续删除）
-├── daily.rs            # 改造 → 日记写入（memories/YYYY-MM-DD.md）
-├── recall.rs           # 新增 — 记忆召回管线
-└── dream.rs            # 新增 — Dream 记忆整理
+├── daily.rs            # DailyNotes → Layer 2 日记（memories/YYYY-MM-DD.md）
+├── recall.rs           # MemoryRecall → 记忆召回管线（实现）
+└── dream.rs           # DreamEngine → 记忆整理（实现）
 ```
 
 #### 8.2.8 实现优先级
