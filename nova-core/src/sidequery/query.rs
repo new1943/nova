@@ -10,6 +10,7 @@ use nova_api::types::{ApiMessage, ApiRequest, Content, ContentBlock};
 /// - Does not count as a turn
 /// - Independent 8K token budget
 /// - Result returned via channel
+#[derive(Clone)]
 pub struct SideQuery {
     api_key: String,
     api_base_url: String,
