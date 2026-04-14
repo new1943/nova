@@ -17,16 +17,12 @@ pub enum BashMode {
 
 /// Bash tool with configurable restriction level
 pub struct BashTool {
-    nova_dir: String,
     mode: BashMode,
 }
 
 impl BashTool {
     pub fn new(mode: BashMode) -> Self {
-        let nova_dir = dirs::home_dir()
-            .map(|h| h.join(".nova").to_string_lossy().to_string())
-            .unwrap_or_else(|| "/.nova".into());
-        Self { nova_dir, mode }
+        Self { mode }
     }
 }
 
@@ -84,10 +80,8 @@ impl BashTool {
             }
         }
 
-        // Always block writes to ~/.nova/
-        if command.contains(&self.nova_dir) || command.contains("~/.nova") || command.contains("$HOME/.nova") {
-            anyhow::bail!("Cannot operate on ~/.nova/ directory");
-        }
+        // .nova directory — no restrictions. Agent needs full access
+        // to memory files for reading and writing.
 
         // Always block privilege escalation
         let first_word = trimmed.split_whitespace().next().unwrap_or("");
@@ -108,6 +102,7 @@ impl BashTool {
 
         Ok(())
     }
+
 }
 
 #[async_trait]

@@ -681,13 +681,109 @@ struct FileEditInput {
 
 **注册**：在 `tools/mod.rs` 中导出，在 daemon `make_tools()` 中注册。
 
-### 8.2 findRelevantMemories — 记忆召回管线
+### 8.2 三层记忆系统
+
+废弃原有 JSONL 记忆存储，改为三层 markdown 记忆模型。
+
+#### 8.2.1 架构总览
 
 ```
-nova-core/src/memory/recall.rs
+~/.nova/
+├── MEMORY.md                    # 层1：工作记忆（始终注入 system prompt）
+├── memories/                    # 层2：情景记忆（按天组织的日记）
+│   ├── 2026-04-13.md
+│   ├── 2026-04-14.md
+│   └── ...
+└── sessions/                    # 层3：细节记忆（完整对话，已有）
+    ├── <uuid>.jsonl
+    └── <uuid>.meta.json
 ```
 
-**架构**：系统管线，非工具。嵌入 daemon 的消息处理流程。
+#### 8.2.2 层1：MEMORY.md（工作记忆）
+
+当前核心事项，LLM 每次对话都能看到。
+
+**存储格式**：纯 markdown，精炼的索引+核心事项，<200 行。
+
+```markdown
+# 记忆
+
+## 用户
+- 全栈开发者，偏好 Rust + TypeScript
+- 喜欢简洁代码，不要过度注释
+
+## 当前项目
+- NOVA：Rust 重写的 OpenClaw，赛博朋克 TUI
+- 正在实现 P0 工具（file_edit, 记忆系统, browser CDP）
+
+## 反馈
+- 不要在回答末尾总结，用户能看 diff
+- 优先用 file_edit 而非 write_file 修改文件
+
+## 参考
+- OpenClaw 源码：/Users/.../openclaw/projects/openclaw
+- Claude Code 源码：/Users/.../openclaw/projects/claude-code-main
+```
+
+**写入机制**：
+1. LLM 主动写 — prompt 引导（AGENTS.md 中描述记忆系统用法）+ 用户显式要求（"记住这个"）
+2. Dream 定期整理 — 从 memories/*.md 日记中提炼核心事项更新
+
+**读取**：BootstrapLoader 每次 API 请求前加载（已有 mtime 缓存），注入 system prompt。
+
+#### 8.2.3 层2：memories/YYYY-MM-DD.md（情景记忆）
+
+按天组织的日记，沿时间线检索。
+
+**存储格式**：markdown，追加式写入，带时间戳。
+
+```markdown
+# 2026-04-14
+
+## 14:30 — NOVA 工具系统扩展
+- 实现了 file_edit 工具（精确字符串替换）
+- 讨论了三层记忆模型设计
+- 决定废弃 JSONL 记忆，改用 markdown
+
+## 16:45 — 浏览器 CDP 设计
+- 参考了 OpenClaw extensions/browser/ 源码
+- 确定用 chromiumoxide crate
+- 第一版只做核心 action
+```
+
+**写入机制**（系统自动，不依赖 LLM 自觉）：
+1. **Compact 前** — 信息即将丢失，用 SideQuery 生成即将被压缩的消息摘要，追加到当天日记
+2. **Session 结束时** — 退出 TUI / /new，用 SideQuery 生成本次对话摘要，追加到当天日记
+3. **每 N 个 turn**（可选）— 定期用 SideQuery 追加增量摘要
+
+**整理**：Dream 分析日记内容，生成摘要索引，清理冗余。
+
+**读取/召回**：用户消息到达时，sideQuery 扫描 memories/*.md 文件名（日期）+ 首行标题，选相关的注入 system prompt。
+
+#### 8.2.4 层3：sessions/（细节记忆）
+
+已有，不变。JSONL 完整对话记录 + Agentic Session Search。
+
+#### 8.2.5 Dream — 记忆整理
+
+参考 Claude Code autoDream + OpenClaw dreaming。
+
+**触发条件**：
+- 距上次整理 ≥ 24 小时 + 有 ≥ 5 个新 session
+- 或用户手动 `/dream`
+- 每个 turn 结束时检查（stopHooks 中）
+
+**执行方式**：forked agent（后台 SideQuery），拿到 read_file + file_edit + write_file（限 memory 目录）。
+
+**整理流程**：
+1. **Orient** — 读 MEMORY.md + ls memories/ 目录
+2. **Gather** — 读最近的 memories/YYYY-MM-DD.md 日记，必要时 grep session transcript
+3. **Consolidate** — 从日记中提炼核心事项更新 MEMORY.md，合并重复，相对日期→绝对日期，删除矛盾
+4. **Prune** — MEMORY.md 保持 <200 行，日记中的冗余条目精简
+
+**锁机制**：`~/.nova/memories/.dream-lock`，PID 文件锁防并发。
+
+#### 8.2.6 召回管线
 
 ```
 用户消息到达
@@ -695,40 +791,37 @@ nova-core/src/memory/recall.rs
   ├─ Agentic Session Search（已有）
   │    → 搜索历史 session → 注入 <relevant_history>
   │
-  └─ findRelevantMemories（新增）
-       → 扫描 ~/.nova/memories/*.jsonl
-       → 提取每条记忆的 type + content 摘要
-       → SideQuery 调 LLM 选择最相关的（最多 5 条）
-       → 注入 <relevant_memories> 到 system prompt
+  └─ Memory Recall（新增）
+  │    → 扫描 memories/*.md 文件名+首行
+  │    → SideQuery 选相关日记（最多 3 天）
+  │    → 读取选中日记内容
+  │    → 注入 <relevant_memories> 到 system prompt
   │
   ▼
 QueryLoop.run()
+  （MEMORY.md 已在 system prompt 中，无需额外召回）
 ```
 
-**实现**：
+#### 8.2.7 模块结构
 
-```rust
-pub struct MemoryRecall {
-    side_query: SideQuery,
-    memories_dir: PathBuf,
-}
-
-impl MemoryRecall {
-    /// 扫描记忆文件，提取摘要列表
-    fn scan_memories(&self) -> Vec<MemorySummary>;
-
-    /// 用 SideQuery 选择最相关的记忆
-    async fn find_relevant(&self, query: &str) -> Result<Vec<MemoryEntry>>;
-
-    /// 格式化为 system prompt 注入块
-    fn format_injection(&self, memories: &[MemoryEntry]) -> String;
-}
+```
+nova-core/src/memory/
+├── mod.rs              # pub mod 导出
+├── dual_write.rs       # 废弃（保留兼容，后续删除）
+├── store.rs            # 废弃（保留兼容，后续删除）
+├── daily.rs            # 改造 → 日记写入（memories/YYYY-MM-DD.md）
+├── recall.rs           # 新增 — 记忆召回管线
+└── dream.rs            # 新增 — Dream 记忆整理
 ```
 
-**与 Agentic Session Search 的关系**：
-- 并行执行，共享 10 秒超时
-- Session Search 搜索历史对话，Memory Recall 搜索结构化记忆
-- 两者结果分别注入不同的 XML 块
+#### 8.2.8 实现优先级
+
+| 阶段 | 内容 | 复杂度 |
+|:---|:---|:---|
+| 1 | 日记写入（Compact 前 + Session 结束时） | 中 |
+| 2 | 召回管线（扫描日记 + SideQuery 选择 + 注入） | 中 |
+| 3 | MEMORY.md prompt 引导（AGENTS.md 中描述用法） | 低 |
+| 4 | Dream 整理（定期后台整理 MEMORY.md + 日记） | 高 |
 
 ### 8.3 BrowserTool — Chrome CDP 浏览器自动化
 

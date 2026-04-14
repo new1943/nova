@@ -31,12 +31,12 @@
 | T18 | bash 受限模式安全加固 | P2 | 2h | T05 | ✅ 完成 |
 | T19 | 端到端集成测试 | P2 | 4h | 全部 | ❌ 未开始 |
 | T20 | file_edit 精确编辑工具 | P0 | 3h | T05 | ✅ 完成 |
-| T21 | findRelevantMemories 记忆召回 | P0 | 4h | T15 | ❌ 未开始 |
+| T21 | 三层记忆系统 | P0 | 10h | T15, T05 | ❌ 未开始 |
 | T22 | browser (CDP) 浏览器自动化 | P0 | 12h | T05 | ❌ 未开始 |
 
-**总预估**: ~83h
-**已完成**: ~60h（T01-T18）
-**剩余**: ~23h（T19-T22）
+**总预估**: ~89h
+**已完成**: ~60h（T01-T18, T20）
+**剩余**: ~29h（T19, T21, T22）
 
 ---
 
@@ -359,17 +359,41 @@ T03 ─► T13 ─► T14
 
 ---
 
-### T21: findRelevantMemories 记忆召回管线
+### T21: 三层记忆系统
 
-**验收标准**: 每次用户消息时自动扫描 `~/.nova/memories/*.jsonl`，用 SideQuery 选择最相关的记忆（最多 5 条），注入 system prompt。
+**验收标准**: MEMORY.md 始终注入 system prompt 且 LLM 可主动维护；Compact 前和 Session 结束时自动写入日记（memories/YYYY-MM-DD.md）；召回管线能从日记中选相关内容注入 system prompt；Dream 能定期整理 MEMORY.md 和日记。
 
-子任务：
-- [ ] 实现 `MemoryRecall` 结构体（`memory/recall.rs`）
-- [ ] `scan_memories()` — 扫描 JSONL 文件，提取每条记忆的 type + content 摘要
-- [ ] `find_relevant()` — SideQuery 调 LLM 选择最相关的记忆
-- [ ] `format_injection()` — 格式化为 `<relevant_memories>` XML 块
-- [ ] 在 daemon `handle_connection()` 中集成，与 Agentic Session Search 并行执行
-- [ ] 10 秒超时，失败不影响主流程
+#### T21.1: 日记写入机制
+
+- [ ] 改造 `memory/daily.rs` — 写入 `~/.nova/memories/YYYY-MM-DD.md`（markdown 格式，带时间戳标题）
+- [ ] Compact 前自动写入 — 在 `Compactor::compact()` 调用前，用 SideQuery 生成即将被压缩的消息摘要，追加到当天日记
+- [ ] Session 结束时自动写入 — 在 daemon 处理 NewSession / TUI 断开时，用 SideQuery 生成本次对话摘要，追加到当天日记
+- [ ] SideQuery prompt：从最近 N 条消息中提取关键决策/事件/发现，生成简洁的 markdown 摘要
+
+#### T21.2: 记忆召回管线
+
+- [ ] 实现 `memory/recall.rs` — MemoryRecall 结构体
+- [ ] `scan_diaries()` — 扫描 memories/*.md 文件名（日期）+ 读取首行标题
+- [ ] `find_relevant()` — SideQuery 调 LLM 从日记列表中选最相关的（最多 3 天）
+- [ ] `format_injection()` — 读取选中日记内容，格式化为 `<relevant_memories>` XML 块
+- [ ] 在 daemon 中集成 — 与 Agentic Session Search 并行执行，10 秒超时
+
+#### T21.3: MEMORY.md prompt 引导
+
+- [ ] 在 AGENTS.md（或 system prompt 模板）中添加记忆系统使用说明
+- [ ] 引导 LLM 用 file_edit/write_file 主动维护 MEMORY.md
+- [ ] 描述四种记忆类型（user/feedback/project/reference）和写入时机
+
+#### T21.4: Dream 记忆整理
+
+- [ ] 实现 `memory/dream.rs` — Dream 整理引擎
+- [ ] 触发条件检查：距上次 ≥24h + ≥5 个新 session（锁文件 `.dream-lock`）
+- [ ] 整理流程：Orient → Gather → Consolidate → Prune（用 SideQuery/forked agent）
+- [ ] 从 memories/*.md 日记提炼核心事项更新 MEMORY.md
+- [ ] 日记摘要索引生成/更新
+- [ ] MEMORY.md 保持 <200 行
+- [ ] 在 daemon stopHooks 中集成触发检查
+- [ ] `/dream` 手动触发支持
 
 ---
 
@@ -428,4 +452,4 @@ T03 ─► T13 ─► T14
 | M5: 策略完整 | T11-T15 | 8 个核心策略全部实现 | ✅ |
 | M6: 功能完整 | T16, T17, T18 | Heartbeat + Skills + 安全 | ✅ |
 | M7: 质量保证 | T19 | 集成测试通过 | ❌ 未开始 |
-| M8: P0 工具 | T20, T21, T22 | file_edit + 记忆召回 + 浏览器 | ❌ 未开始 |
+| M8: P0 工具 | T20, T21, T22 | file_edit + 三层记忆 + 浏览器 | ❌ 未开始 |

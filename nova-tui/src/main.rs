@@ -51,20 +51,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
         }
         Err(e) => {
             app.status_text = format!("Cannot connect: {} — is daemon running?", e);
-            terminal.draw(|f| ui::render(f, &app))?;
+            terminal.draw(|f| ui::render(f, &mut app))?;
             // Wait for quit
             let (tx, mut rx) = mpsc::channel::<InputAction>(16);
-            std::thread::spawn(move || {
-                loop {
-                    let a = input::poll_input();
-                    if tx.blocking_send(a).is_err() { break; }
+            std::thread::spawn(move || loop {
+                let a = input::poll_input();
+                if tx.blocking_send(a).is_err() {
+                    break;
                 }
             });
             loop {
                 if let Ok(InputAction::Quit) = rx.try_recv() {
                     return Ok(());
                 }
-                terminal.draw(|f| ui::render(f, &app))?;
+                terminal.draw(|f| ui::render(f, &mut app))?;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
@@ -72,7 +72,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
 
     client.send_request(&Request::ResumeSession).await?;
 
-    // IPC channels (large buffer to avoid back-pressure)
+    // IPC channels
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(512);
     let (req_tx, mut req_rx) = mpsc::channel::<Request>(16);
 
@@ -97,47 +97,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
 
     // Keyboard input on a dedicated OS thread
     let (input_tx, mut input_rx) = mpsc::channel::<InputAction>(16);
-    std::thread::spawn(move || {
-        loop {
-            let action = input::poll_input();
-            if input_tx.blocking_send(action).is_err() { break; }
+    std::thread::spawn(move || loop {
+        let action = input::poll_input();
+        if input_tx.blocking_send(action).is_err() {
+            break;
         }
     });
 
-    // Pending text buffer for typewriter effect
-    let mut pending_text: Vec<String> = Vec::new();
-
     // Main render loop
     loop {
-        // Drain IPC events — buffer TextDeltas for typewriter effect
+        // Drain ALL IPC events immediately — no artificial typewriter delay.
+        // The key insight from Claude Code and OpenClaw: render the full
+        // streamed text immediately. Users want to see output as fast as
+        // possible, not watch a fake typing animation.
         while let Ok(event) = event_rx.try_recv() {
-            match event {
-                Event::TextDelta { content } => {
-                    pending_text.push(content);
-                }
-                other => handle_ipc_event(&mut app, other),
-            }
-        }
-
-        // Typewriter: feed 1-2 characters per frame for visible streaming effect
-        if !pending_text.is_empty() {
-            let chunk = &mut pending_text[0];
-            // Take 1 char at a time (2 for ASCII to keep it snappy)
-            let take = {
-                let first = chunk.chars().next();
-                match first {
-                    Some(c) if c.is_ascii() => 2.min(chunk.chars().count()),
-                    _ => 1.min(chunk.chars().count()),
-                }
-            };
-            let emit: String = chunk.chars().take(take).collect();
-            let rest: String = chunk.chars().skip(take).collect();
-            app.append_assistant_text(&emit);
-            if rest.is_empty() {
-                pending_text.remove(0);
-            } else {
-                pending_text[0] = rest;
-            }
+            handle_ipc_event(&mut app, event);
         }
 
         // Drain input actions
@@ -156,14 +130,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                             }
                             _ if text.starts_with("/search ") => {
                                 let query = text.trim_start_matches("/search ").to_string();
-                                app.push_message(DisplayRole::System, format!("Searching: {}...", query));
+                                app.push_message(
+                                    DisplayRole::System,
+                                    format!("Searching: {}...", query),
+                                );
                                 app.status_text = "Searching sessions...".into();
-                                let _ = req_tx.send(Request::SearchSessions { query }).await;
+                                let _ = req_tx
+                                    .send(Request::SearchSessions { query })
+                                    .await;
                             }
                             _ => {
+                                // Show user message immediately in chat
                                 app.push_message(DisplayRole::User, text.clone());
                                 app.status_text = "Thinking...".into();
-                                let _ = req_tx.send(Request::UserMessage { content: text }).await;
+                                app.streaming = true;
+                                let _ = req_tx
+                                    .send(Request::UserMessage { content: text })
+                                    .await;
                             }
                         }
                     }
@@ -171,25 +154,56 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                 InputAction::Quit => app.should_quit = true,
                 InputAction::Char(c) => app.insert_char(c),
                 InputAction::Backspace => app.delete_char(),
+                InputAction::Delete => {
+                    // Delete char at cursor (forward delete)
+                    if app.cursor_pos < app.input.len() {
+                        app.input.remove(app.cursor_pos);
+                    }
+                }
                 InputAction::Left => app.move_cursor_left(),
                 InputAction::Right => app.move_cursor_right(),
+                InputAction::Home => app.move_cursor_home(),
+                InputAction::End => app.move_cursor_end(),
+                InputAction::HistoryPrev => {
+                    // In chat focus mode, up/down scroll; otherwise history
+                    if app.focus == app::Focus::Chat {
+                        app.scroll_up();
+                    } else {
+                        app.history_prev();
+                    }
+                }
+                InputAction::HistoryNext => {
+                    if app.focus == app::Focus::Chat {
+                        app.scroll_down();
+                    } else {
+                        app.history_next();
+                    }
+                }
                 InputAction::ScrollUp => app.scroll_up(),
                 InputAction::ScrollDown => app.scroll_down(),
-                InputAction::PageUp => { for _ in 0..10 { app.scroll_up(); } }
-                InputAction::PageDown => { for _ in 0..10 { app.scroll_down(); } }
+                InputAction::PageUp => {
+                    for _ in 0..10 {
+                        app.scroll_up();
+                    }
+                }
+                InputAction::PageDown => {
+                    for _ in 0..10 {
+                        app.scroll_down();
+                    }
+                }
                 InputAction::ToggleFocus => app.toggle_focus(),
                 InputAction::None => {}
             }
         }
 
-        if app.should_quit { break; }
+        if app.should_quit {
+            break;
+        }
 
-        terminal.draw(|f| ui::render(f, &app))?;
+        terminal.draw(|f| ui::render(f, &mut app))?;
 
-        // Faster refresh when streaming text for typewriter effect
-        // 20ms per char ≈ 50 chars/sec, feels like natural typing
-        let delay = if pending_text.is_empty() { 16 } else { 20 };
-        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        // 16ms ≈ 60fps — fast enough for smooth streaming display
+        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
     }
 
     Ok(())
@@ -198,7 +212,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
 fn handle_ipc_event(app: &mut App, event: Event) {
     match event {
         Event::TextDelta { content } => {
+            // Append directly — no buffering, no typewriter effect.
+            // This is how both Claude Code and OpenClaw handle streaming:
+            // render the text as soon as it arrives.
             app.append_assistant_text(&content);
+            app.streaming = true;
         }
         Event::ToolCallStart { name, id: _ } => {
             app.push_command(name, String::new());
@@ -208,16 +226,25 @@ fn handle_ipc_event(app: &mut App, event: Event) {
         }
         Event::TurnEnd => {
             app.status_text = "Ready".into();
+            app.streaming = false;
         }
-        Event::TokenUsage { input, output, budget_pct } => {
+        Event::TokenUsage {
+            input,
+            output,
+            budget_pct,
+        } => {
             app.token_input = input;
             app.token_output = output;
             app.budget_pct = budget_pct;
         }
         Event::Error { message } => {
             app.push_message(DisplayRole::System, format!("Error: {}", message));
+            app.streaming = false;
         }
-        Event::SessionRestored { session_id, message_count } => {
+        Event::SessionRestored {
+            session_id,
+            message_count,
+        } => {
             app.session_id = Some(session_id);
             app.status_text = format!("Restored ({} msgs)", message_count);
         }
@@ -235,7 +262,13 @@ fn handle_ipc_event(app: &mut App, event: Event) {
                 let mut text = format!("Found {} sessions:\n", results.len());
                 for (i, r) in results.iter().enumerate() {
                     let sid_short: String = r.session_id.chars().take(8).collect();
-                    text.push_str(&format!("  {}. [{}] {} ({} msgs)\n", i + 1, sid_short, r.title, r.message_count));
+                    text.push_str(&format!(
+                        "  {}. [{}] {} ({} msgs)\n",
+                        i + 1,
+                        sid_short,
+                        r.title,
+                        r.message_count
+                    ));
                 }
                 app.push_message(DisplayRole::System, text);
             }
