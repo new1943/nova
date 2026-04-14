@@ -122,13 +122,13 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 
 ### 策略 7：双写互斥记忆系统
 
-**状态**: ✅ 已实现
+**状态**: ✅ 已实现（JSONL 版），🔧 重构为三层 markdown 记忆
 
 - 主 agent 已写 → forked agent 跳过
 - 主 agent 未写 → forked agent 兜底
 - 绝不重复写入
 - 记忆类型：user / feedback / project / reference
-- 存储路径：`~/.nova/memories/<type>.jsonl`
+- 存储路径：`~/.nova/memories/<type>.jsonl`（旧）→ 迁移为三层 markdown 记忆（见 P0 新增需求）
 
 ### 策略 8：工具池稳定排序
 
@@ -341,15 +341,63 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 - 必须先 read_file 过才能 edit（防盲改）— 通过文件状态追踪实现
 - 返回：修改后的 diff 信息（old_string、new_string、替换次数）
 
-#### findRelevantMemories — 记忆召回管线
+#### 三层记忆系统
 
-参考 Claude Code `memdir/findRelevantMemories.ts`，实现记忆文件的自动召回。
+参考 Claude Code `memdir/` + `services/autoDream/` 和 OpenClaw `extensions/memory-core/` dreaming 系统，实现基于人类记忆模型的三层记忆架构。
 
-- 非工具，是系统管线（类似已有的 Agentic Session Search）
-- 每次用户消息时自动触发，用 SideQuery 调 LLM 从 `~/.nova/memories/*.jsonl` 中选择最相关的记忆
-- 扫描记忆文件，提取每条记忆的摘要/类型
-- LLM 选择最相关的（最多 5 条），注入到 system prompt 的 `<relevant_memories>` 块
+##### 层1：MEMORY.md（工作记忆）
+
+当前核心事项，LLM 每次对话都能看到。
+
+- 存储：`~/.nova/MEMORY.md`，纯 markdown，精炼索引+核心事项，<200 行
+- 内容分类：用户（角色/偏好）、反馈（纠正/确认）、项目（进行中的工作）、参考（外部系统指针）
+- 写入：LLM 通过 file_edit/write_file 主动维护（prompt 引导 + 用户显式要求）+ Dream 定期整理
+- 读取：BootstrapLoader 每次 API 请求前加载，始终注入 system prompt
+- 参考：Claude Code 的 `MEMORY.md` / `ENTRYPOINT.md` 索引机制
+
+##### 层2：memories/YYYY-MM-DD.md（情景记忆）
+
+按天组织的日记，时间是关键维度。
+
+- 存储：`~/.nova/memories/YYYY-MM-DD.md`，每天一个文件，追加式写入，带时间戳标题
+- 写入时机（系统自动，不依赖 LLM 自觉）：
+  - Compact 前：信息即将丢失，用 SideQuery 生成即将被压缩的消息摘要追加
+  - Session 结束时：退出 TUI / /new，用 SideQuery 生成本次对话摘要追加
+  - 每 N 个 turn（可选）：定期追加增量摘要
+- 整理：Dream 分析日记内容，生成摘要索引，清理冗余
+- 召回：用户消息到达时，SideQuery 从日记文件中选相关的注入 `<relevant_memories>` 到 system prompt
 - 与 Agentic Session Search 并行执行，共享 10 秒超时
+
+##### 层3：sessions/（细节记忆）
+
+完整对话记录，最重的一层，只在需要细节时才翻。
+
+- 已有：JSONL session 文件 + Agentic Session Search
+- 不变
+
+##### Dream — 记忆整理
+
+参考 Claude Code `autoDream`（4 阶段 forked agent）+ OpenClaw dreaming（Light/Deep/REM 三阶段 + 评分系统）。
+
+- 触发条件：距上次整理 ≥24h + ≥5 个新 session，或用户手动 `/dream`
+- 触发时机：每个 turn 结束时检查（stopHooks 中）
+- 执行方式：forked agent / SideQuery，限制在 memory 目录内操作
+- 整理流程：
+  1. Orient — 读 MEMORY.md + ls memories/ 目录
+  2. Gather — 读最近日记，必要时 grep session transcript
+  3. Consolidate — 从日记提炼核心事项更新 MEMORY.md，合并重复，相对日期→绝对日期，删除矛盾
+  4. Prune — MEMORY.md 保持 <200 行，日记冗余条目精简
+- 锁机制：PID 文件锁防并发
+
+##### 三层关系
+
+```
+MEMORY.md          ← 始终可见，精炼的"此刻"
+    ↑ Dream 提炼
+memories/YYYY-MM-DD.md  ← 按需召回，"那天"的摘要
+    ↑ 系统自动写入（Compact 前 / Session 结束时）
+sessions/<uuid>.jsonl   ← 最后手段，完整细节（Agentic Session Search）
+```
 
 #### browser (CDP) — 浏览器自动化
 
