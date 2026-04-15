@@ -828,58 +828,97 @@ nova-core/src/memory/
 | 3 | MEMORY.md prompt 引导（AGENTS.md 中描述用法） | 低 |
 | 4 | Dream 整理（定期后台整理 MEMORY.md + 日记） | 高 |
 
-### 8.3 BrowserTool — Chrome CDP 浏览器自动化
+### 8.3 BrowserTool — Playwright MCP 浏览器自动化（已实现）
 
 ```
-nova-core/src/browser/
-├── mod.rs          # pub mod 导出
-├── tool.rs         # BrowserTool — 工具注册 + action 分发
-├── chrome.rs       # Chrome 进程管理（启动/停止/检测）
-├── cdp.rs          # CDP WebSocket 连接 + 命令发送
-└── actions.rs      # 各 action 实现（navigate/snapshot/screenshot/act）
+nova-core/src/tools/browser.rs   # 单文件，~230 行
 ```
 
-**依赖**：`chromiumoxide` crate（纯 Rust CDP 客户端）
+**技术选型（最终）**：放弃 `chromiumoxide`（纯 Rust CDP），改用 `@playwright/mcp`（Microsoft 官方）。
 
-**架构**：
+核心原因：
+- Playwright 内置 Chromium 极易被反爬检测；`@playwright/mcp` 支持 `executablePath` 指定本机 Chrome
+- `chromiumoxide` 需自己实现 CDP 协议解析（复杂），不如直接 shell out 给成熟库
+
+**架构（每次调用独立子进程）**：
 
 ```
 BrowserTool.execute(action, params)
   │
-  ├─ start → ChromeManager.launch()
-  │           → tokio::process::Command("chrome")
-  │           → --remote-debugging-port=19222
-  │           → --user-data-dir=~/.nova/browser/nova-profile
-  │           → 等待 CDP 端口就绪
-  │           → chromiumoxide::Browser::connect(ws://127.0.0.1:19222)
+  ├─ write_config() — 刷新 ~/.nova/playwright-mcp.json
+  │    └─ 自动探测本机 Chrome 路径
   │
-  ├─ stop → ChromeManager.shutdown()
-  │
-  ├─ navigate → cdp.navigate(url)
-  │
-  ├─ snapshot → cdp.get_page_text() / cdp.get_dom_snapshot()
-  │              → 返回页面文本内容（用于 LLM 理解页面）
-  │
-  ├─ screenshot → cdp.screenshot(full_page, selector)
-  │                → 返回 PNG 文件路径
-  │
-  ├─ act → 根据 kind 分发
-  │   ├─ click(selector) → cdp.click(selector)
-  │   ├─ type(selector, text) → cdp.type(selector, text)
-  │   └─ press(key) → cdp.press(key)
-  │
-  └─ close → cdp.close_tab()
+  └─ call_tool(tool_name, arguments)
+       │
+       ├─ spawn: npx @playwright/mcp@latest --config ~/.nova/playwright-mcp.json
+       │    stdin: [initialize JSON-RPC]
+       │            [notifications/initialized JSON-RPC]
+       │            [tools/call JSON-RPC]
+       │
+       ├─ 从 stdout 逐行读，找 id 匹配的响应（60s 超时）
+       │
+       └─ parse_mcp_response() → 提取 content[].text 或 resource.uri
 ```
 
-**Chrome 进程管理**：
-- daemon 启动时不启动 Chrome（按需启动）
-- `start` action 时检测是否已有 Chrome 进程
-- 独立 `nova` profile（`~/.nova/browser/nova-profile/`）
-- daemon 退出时自动 kill Chrome 进程
+**MCP 消息格式（stdio，每条一行 JSON）**：
 
-**第一版简化**：
-- 不做 ref 机制（用 CSS 选择器定位）
-- 不做多 profile
-- 不做远程 CDP
-- 不做 Playwright 集成
-- snapshot 返回纯文本（页面可见文本 + 链接），不做 ARIA 树
+```json
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"nova","version":"1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"https://example.com"}}}
+```
+
+**playwright-mcp 配置文件**（自动生成到 `~/.nova/playwright-mcp.json`）：
+
+```json
+{
+  "browser": {
+    "launchOptions": {
+      "executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "headless": true,
+      "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled", "--disable-infobars"]
+    },
+    "userDataDir": "~/.nova/browser-profile",
+    "contextOptions": {
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ..."
+    }
+  },
+  "outputDir": "~/.nova/browser-screenshots",
+  "imageResponses": "allow"
+}
+```
+
+**Action → playwright-mcp tool 映射**：
+
+| Nova action | playwright-mcp tool | 参数 |
+|:---|:---|:---|
+| `navigate` | `browser_navigate` | `url` |
+| `snapshot` | `browser_snapshot` | — |
+| `click` | `browser_click` | `ref` 或 `selector` |
+| `type` | `browser_type` | `ref`/`selector` + `text` |
+| `press` | `browser_press_key` | `key` |
+| `scroll_down` | `browser_scroll_down` | — |
+| `scroll_up` | `browser_scroll_up` | — |
+| `screenshot` | `browser_take_screenshot` | — |
+| `go_back` | `browser_navigate_back` | — |
+| `close` | `browser_close` | — |
+
+**Chrome 自动探测顺序**（`discover_chrome`）：
+1. config 指定的 `browser_chrome_path`
+2. `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`
+3. `/Applications/Chromium.app/Contents/MacOS/Chromium`
+4. `/usr/bin/google-chrome` / `/usr/bin/chromium-browser`
+5. 以上均无 → fallback 用 Playwright 内置 Chromium
+
+**NovaConfig 新增字段**：
+
+```rust
+pub browser_chrome_path: Option<String>,   // None = 自动探测
+pub browser_profile_dir: Option<String>,   // None = ~/.nova/browser-profile
+pub browser_headless: Option<bool>,        // None = true
+```
+
+**注册位置**：`nova-daemon/src/main.rs` → `make_tools()` → `tools.register_builtin(Box::new(BrowserTool::new(...)))>`
+
+**前提依赖**：Node.js >= 18（`@playwright/mcp` 通过 `npx --yes` 自动按需下载，首次运行有短暂延迟）。
+

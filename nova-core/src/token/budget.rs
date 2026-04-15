@@ -23,7 +23,7 @@ impl TokenBudget {
             context_window,
             trigger_pct,
             marginal_multiplier: 3.0,
-            min_marginal_threshold: 1000,
+            min_marginal_threshold: 10000, // 从 1000 上调，以容忍网页快照等几千 Token 的正常突变
             prev_turn_input: 0,
             prev_prev_turn_input: 0,
         }

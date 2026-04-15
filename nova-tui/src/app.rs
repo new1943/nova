@@ -138,8 +138,18 @@ impl App {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if c == '\n' || c == '\r' {
+            return;
+        }
         self.input.insert(self.cursor_pos, c);
         self.cursor_pos += c.len_utf8();
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        // Strip out newlines from pasted text to prevent auto-submitting or blowing up single-line inputs
+        let clean_text = text.replace(&['\n', '\r'][..], " ");
+        self.input.insert_str(self.cursor_pos, &clean_text);
+        self.cursor_pos += clean_text.len();
     }
 
     pub fn delete_char(&mut self) {

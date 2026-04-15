@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -65,7 +66,7 @@ impl Default for QueryLoopConfig {
 /// The core Query Loop — strategies 1+2+3+5+6 integrated
 pub struct QueryLoop {
     pub config: QueryLoopConfig,
-    pub tools: ToolRegistry,
+    pub tools: Arc<ToolRegistry>,
     pub hooks: HookManager,
     pub daily_notes: Option<DailyNotes>,
     pub side_query: Option<SideQuery>,
@@ -73,7 +74,7 @@ pub struct QueryLoop {
 
 impl QueryLoop {
     pub fn new(
-        tools: ToolRegistry,
+        tools: Arc<ToolRegistry>,
         hooks: HookManager,
         config: QueryLoopConfig,
         daily_notes: Option<DailyNotes>,
@@ -83,14 +84,15 @@ impl QueryLoop {
     }
 
     /// Run a full query loop turn for user input.
-    pub async fn run(
+    pub async fn run_turn(
         &self,
-        session: &mut Session,
+        mut session: Session,
         system_prompt: &str,
         event_tx: mpsc::Sender<LoopEvent>,
-    ) -> Result<()> {
+    ) -> Result<(Session, Vec<Message>)> {
         // Reset turn counter — max_turns limits loop depth per user message, not per session
         session.reset_turns();
+        let mut newly_added_messages = Vec::new();
 
         let tool_schemas = self.tools.as_api_schemas();
         let mut budget = TokenBudget::new(
@@ -285,14 +287,15 @@ impl QueryLoop {
             let assistant_msg = Message::assistant(content, msg_tool_calls);
 
             // --- Strategy 5: PostSampling Hooks (async, non-blocking) ---
-            self.hooks.fire_post_sampling(&assistant_msg, session).await;
+            self.hooks.fire_post_sampling(&assistant_msg, &session).await;
 
+            newly_added_messages.push(assistant_msg.clone());
             session.add_message(assistant_msg);
 
             // No tool calls → turn done
             if tool_calls.is_empty() {
                 // --- Strategy 6: StopHooks (serial, blocking) ---
-                self.hooks.fire_stop(session).await;
+                self.hooks.fire_stop(&mut session).await;
                 let _ = event_tx.send(LoopEvent::TurnEnd).await;
                 break;
             }
@@ -307,11 +310,13 @@ impl QueryLoop {
                 let _ = event_tx.send(LoopEvent::ToolCallResult {
                     id: tc.id.clone(), content: result.clone(),
                 }).await;
-                session.add_message(Message::tool_result(&tc.id, &result));
+                let tool_msg = Message::tool_result(&tc.id, &result);
+                newly_added_messages.push(tool_msg.clone());
+                session.add_message(tool_msg);
             }
         }
 
-        Ok(())
+        Ok((session, newly_added_messages))
     }
 
     // T21.1: Write diary entry before compacting messages.

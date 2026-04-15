@@ -4,7 +4,7 @@
 //! System auto-writes here at Compact time and Session end.
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::Local;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,7 +24,7 @@ impl DailyNotes {
 
     /// Get today's note file path: ~/.nova/memories/YYYY-MM-DD.md
     fn today_path(&self) -> PathBuf {
-        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let date = Local::now().format("%Y-%m-%d").to_string();
         self.memories_dir.join(format!("{}.md", date))
     }
 
@@ -33,8 +33,8 @@ impl DailyNotes {
     pub fn append(&self, content: &str, entry_type: &str) -> Result<()> {
         fs::create_dir_all(&self.memories_dir)?;
         let path = self.today_path();
-        let time = Utc::now().format("%H:%M:%S").to_string();
-        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let time = Local::now().format("%H:%M:%S").to_string();
+        let date = Local::now().format("%Y-%m-%d").to_string();
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -68,7 +68,7 @@ impl DailyNotes {
 
     /// Read yesterday's notes (empty string if none).
     pub fn read_yesterday(&self) -> String {
-        let yesterday = (Utc::now() - chrono::Duration::days(1))
+        let yesterday = (Local::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
         let path = self.memories_dir.join(format!("{}.md", yesterday));

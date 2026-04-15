@@ -14,7 +14,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+// (unused import removed)
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -198,26 +198,37 @@ impl BrowserTool {
             })?;
 
         std::fs::create_dir_all(&self.user_data_dir)?;
-        info!("Launching Chrome: {chrome}, profile: {}", self.user_data_dir);
 
-        let mut args = vec![
-            format!("--remote-debugging-port={}", self.port),
-            format!("--user-data-dir={}", self.user_data_dir),
-            "--no-first-run".to_string(),
-            "--no-default-browser-check".to_string(),
-            "--disable-default-apps".to_string(),
-        ];
+        let mut child: Option<tokio::process::Child> = None;
 
-        if self.headless {
-            args.push("--headless=new".to_string());
+        if TcpStream::connect(format!("127.0.0.1:{}", self.port))
+            .await
+            .is_ok()
+        {
+            info!("Found existing Chrome on port {}, reusing", self.port);
+        } else {
+            info!("Launching Chrome: {chrome}, profile: {}", self.user_data_dir);
+
+            let mut args = vec![
+                format!("--remote-debugging-port={}", self.port),
+                format!("--user-data-dir={}", self.user_data_dir),
+                "--no-first-run".to_string(),
+                "--no-default-browser-check".to_string(),
+                "--disable-default-apps".to_string(),
+            ];
+
+            if self.headless {
+                args.push("--headless=new".to_string());
+            }
+
+            let c = Command::new(&chrome)
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| anyhow::anyhow!("Failed to launch Chrome: {e}"))?;
+            child = Some(c);
         }
-
-        let child = Command::new(&chrome)
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to launch Chrome: {e}"))?;
 
         // Wait for CDP port to be ready (up to 10s)
         let mut ready = false;
@@ -245,7 +256,7 @@ impl BrowserTool {
 
         let mut session = CdpSession {
             ws,
-            _chrome: Some(child),
+            _chrome: child,
             next_id: 1,
         };
 
@@ -263,19 +274,20 @@ impl BrowserTool {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn get_ws_debugger_url(port: u16) -> Result<String> {
-    let addr = format!("127.0.0.1:{port}");
-    let mut stream = TcpStream::connect(&addr).await?;
+    let output = Command::new("curl")
+        .args(["-s", "--max-time", "5", &format!("http://127.0.0.1:{port}/json")])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("curl failed to execute: {e}"))?;
 
-    let request = format!("GET /json HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
+    if !output.status.success() {
+        anyhow::bail!("curl API check failed with status: {}", output.status);
+    }
 
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    let body = String::from_utf8_lossy(&buf);
-
+    let body = String::from_utf8_lossy(&output.stdout);
     let json_start = body
         .find('[')
-        .ok_or_else(|| anyhow::anyhow!("No JSON in CDP /json response"))?;
+        .ok_or_else(|| anyhow::anyhow!("No JSON in CDP /json response. Body: {}", body))?;
 
     let tabs: Vec<Value> = serde_json::from_str(&body[json_start..])?;
 
@@ -456,162 +468,115 @@ impl Tool for BrowserTool {
             return Ok("Browser closed".into());
         }
 
-        // Ensure session exists
-        let mut guard = self.session.lock().await;
-        if guard.is_none() {
-            info!("Starting Chrome CDP session...");
-            *guard = Some(self.spawn_chrome_session().await?);
+        let max_retries = 3;
+        let mut last_error = String::new();
+
+        for attempt in 0..max_retries {
+            // Ensure session exists
+            {
+                let mut guard = self.session.lock().await;
+                if guard.is_none() {
+                    info!("Starting Chrome CDP session (attempt {})...", attempt + 1);
+                    match self.spawn_chrome_session().await {
+                        Ok(session) => *guard = Some(session),
+                        Err(e) => {
+                            let e_str = e.to_string();
+                            warn!("Spawn failed: {}", e_str);
+                            last_error = e_str;
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Lock again to get the mutable session reference for the action
+            let mut guard = self.session.lock().await;
+            let session = guard.as_mut().unwrap();
+
+            let result: Result<String> = match action {
+                "navigate" => {
+                    let url = args.get("url").and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("navigate requires 'url'"))?;
+                    session.command("Page.navigate", json!({ "url": url })).await?;
+                    session.wait_event("Page.loadEventFired", 15).await.ok();
+                    Ok(format!("Navigated to {}", url))
+                }
+                "snapshot" => session.eval_js(SNAPSHOT_JS).await,
+                "click" => {
+                    let selector = args.get("selector").and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("click requires 'selector'"))?;
+                    let sel_json = serde_json::to_string(selector)?;
+                    let js = format!(r#"(function(){{const el=document.querySelector({});if(!el)return'Not found';el.scrollIntoView({{block:'center'}});el.click();return'Clicked';}})({})"#, sel_json, sel_json);
+                    session.eval_js(&js).await
+                }
+                "type" => {
+                    let selector = args.get("selector").and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("type requires 'selector'"))?;
+                    let text = args.get("text").and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("type requires 'text'"))?;
+                    let sel_json = serde_json::to_string(selector)?;
+                    let text_json = serde_json::to_string(text)?;
+                    let js = format!(r#"(function(){{const el=document.querySelector({});if(!el)return'Not found';el.focus();el.value={};el.dispatchEvent(new Event('input',{{bubbles:true}}));return'Typed';}})({},{})"#, sel_json, text_json, sel_json, text_json);
+                    session.eval_js(&js).await
+                }
+                "press" => {
+                    let key = args.get("key").and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("press requires 'key'"))?;
+                    let (code, key_code) = match key {
+                        "Enter" => ("Enter", 13),
+                        "Tab" => ("Tab", 9),
+                        "Escape" => ("Escape", 27),
+                        "Backspace" => ("Backspace", 8),
+                        "ArrowDown" => ("ArrowDown", 40),
+                        "ArrowUp" => ("ArrowUp", 38),
+                        "ArrowLeft" => ("ArrowLeft", 37),
+                        "ArrowRight" => ("ArrowRight", 39),
+                        " " => ("Space", 32),
+                        _ => (key, 0),
+                    };
+                    session.command("Input.dispatchKeyEvent", json!({"type":"keyDown","key":key,"code":code,"windowsVirtualKeyCode":key_code})).await?;
+                    session.command("Input.dispatchKeyEvent", json!({"type":"keyUp","key":key,"code":code,"windowsVirtualKeyCode":key_code})).await?;
+                    Ok(format!("Pressed: {}", key))
+                }
+                "scroll_down" => session.eval_js("window.scrollBy(0,600);'Scrolled'").await,
+                "scroll_up" => session.eval_js("window.scrollBy(0,-600);'Scrolled'").await,
+                "screenshot" => {
+                    let result = session.command("Page.captureScreenshot", json!({"format":"png"})).await?;
+                    let data = result.get("data").and_then(|d| d.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("No screenshot data"))?;
+                    let dir = dirs::home_dir().unwrap_or_default().join(".nova/browser-screenshots");
+                    std::fs::create_dir_all(&dir)?;
+                    let path = dir.join(format!("{}.png", chrono::Utc::now().format("%Y%m%d_%H%M%S")));
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+                    std::fs::write(&path, bytes)?;
+                    Ok(format!("Screenshot saved: {}", path.display()))
+                }
+                "go_back" => {
+                    session.eval_js("history.back();'Back'").await?;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    Ok("Went back".into())
+                }
+                other => Err(anyhow::anyhow!("Unknown browser action: '{other}'")),
+            };
+
+            // If success, return immediately
+            if let Ok(res) = result {
+                return Ok(res);
+            }
+
+            // On error, log and drop session. Next loop iteration will recreate it.
+            let e_str = result.err().unwrap().to_string();
+            warn!("CDP execution error: {}, resetting session and retrying...", e_str);
+            last_error = e_str;
+            
+            // Drop our current guard before resetting the session
+            drop(guard);
+            
+            let mut main_guard = self.session.lock().await;
+            *main_guard = None;
         }
-        let session = guard.as_mut().unwrap();
 
-        let result: Result<String> = match action {
-            "navigate" => {
-                let url = args
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("navigate requires 'url'"))?;
-                session
-                    .command("Page.navigate", json!({ "url": url }))
-                    .await?;
-                // Wait for page load (timeout 15s, non-fatal)
-                session.wait_event("Page.loadEventFired", 15).await?;
-                Ok(format!("Navigated to {url}"))
-            }
-
-            "snapshot" => session.eval_js(SNAPSHOT_JS).await,
-
-            "click" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("click requires 'selector'"))?;
-                let sel_json = serde_json::to_string(selector)?;
-                let js = format!(
-                    r#"(function(){{
-                        const el = document.querySelector({sel});
-                        if (!el) return 'Element not found: ' + {sel};
-                        el.scrollIntoView({{block:'center'}});
-                        el.click();
-                        return 'Clicked: ' + {sel};
-                    }})()"#,
-                    sel = sel_json
-                );
-                session.eval_js(&js).await
-            }
-
-            "type" => {
-                let selector = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("type requires 'selector'"))?;
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("type requires 'text'"))?;
-                let sel_json = serde_json::to_string(selector)?;
-                let text_json = serde_json::to_string(text)?;
-                let js = format!(
-                    r#"(function(){{
-                        const el = document.querySelector({sel});
-                        if (!el) return 'Element not found: ' + {sel};
-                        el.focus();
-                        el.value = {val};
-                        el.dispatchEvent(new Event('input', {{bubbles:true}}));
-                        el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                        return 'Typed into ' + {sel};
-                    }})()"#,
-                    sel = sel_json,
-                    val = text_json
-                );
-                session.eval_js(&js).await
-            }
-
-            "press" => {
-                let key = args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("press requires 'key'"))?;
-                let (key_code, code) = match key {
-                    "Enter" => (13, "Enter"),
-                    "Tab" => (9, "Tab"),
-                    "Escape" => (27, "Escape"),
-                    "Backspace" => (8, "Backspace"),
-                    "ArrowDown" => (40, "ArrowDown"),
-                    "ArrowUp" => (38, "ArrowUp"),
-                    "ArrowLeft" => (37, "ArrowLeft"),
-                    "ArrowRight" => (39, "ArrowRight"),
-                    " " => (32, "Space"),
-                    _ => (0, key),
-                };
-                session
-                    .command(
-                        "Input.dispatchKeyEvent",
-                        json!({
-                            "type": "keyDown",
-                            "key": key,
-                            "code": code,
-                            "windowsVirtualKeyCode": key_code,
-                            "nativeVirtualKeyCode": key_code,
-                        }),
-                    )
-                    .await?;
-                session
-                    .command(
-                        "Input.dispatchKeyEvent",
-                        json!({
-                            "type": "keyUp",
-                            "key": key,
-                            "code": code,
-                            "windowsVirtualKeyCode": key_code,
-                            "nativeVirtualKeyCode": key_code,
-                        }),
-                    )
-                    .await?;
-                Ok(format!("Pressed: {key}"))
-            }
-
-            "scroll_down" => session.eval_js("window.scrollBy(0, 600); 'Scrolled down'").await,
-            "scroll_up" => session.eval_js("window.scrollBy(0, -600); 'Scrolled up'").await,
-
-            "screenshot" => {
-                let result = session
-                    .command("Page.captureScreenshot", json!({ "format": "png" }))
-                    .await?;
-                let data = result
-                    .get("data")
-                    .and_then(|d| d.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("No screenshot data"))?;
-
-                let dir = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".nova/browser-screenshots");
-                std::fs::create_dir_all(&dir)?;
-
-                let filename = format!(
-                    "{}.png",
-                    chrono::Utc::now().format("%Y%m%d_%H%M%S")
-                );
-                let path = dir.join(&filename);
-                let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
-                std::fs::write(&path, bytes)?;
-
-                Ok(format!("Screenshot saved: {}", path.display()))
-            }
-
-            "go_back" => {
-                session.eval_js("history.back(); 'Navigated back'").await?;
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                Ok("Went back".into())
-            }
-
-            other => anyhow::bail!("Unknown browser action: '{other}'"),
-        };
-
-        // On error, reset session so next call retries
-        if result.is_err() {
-            warn!("CDP error, resetting session");
-            *guard = None;
-        }
-        result
+        Err(anyhow::anyhow!("Browser action failed after retries. Last error: {}", last_error))
     }
 }

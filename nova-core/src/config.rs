@@ -29,6 +29,12 @@ pub struct NovaConfig {
     /// Run mode: "open" = no restrictions, "sandbox" = whitelist + path restrictions
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// Browser: path to system Chrome/Chromium executable (auto-detected if absent)
+    pub browser_chrome_path: Option<String>,
+    /// Browser: user data dir for profile persistence (default: ~/.nova/browser-profile)
+    pub browser_profile_dir: Option<String>,
+    /// Browser: run headless (default: true)
+    pub browser_headless: Option<bool>,
 }
 
 fn default_api_key() -> String { String::new() }
@@ -59,6 +65,9 @@ impl Default for NovaConfig {
             compact_target_pct: default_compact_target(),
             budget_trigger_pct: default_budget_trigger(),
             mode: default_mode(),
+            browser_chrome_path: None,
+            browser_profile_dir: None,
+            browser_headless: None,
         }
     }
 }

@@ -327,7 +327,7 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 | `glob` | ✅ 已实现 | `nova-core/src/tools/glob.rs` |
 | `grep` | ✅ 已实现 | `nova-core/src/tools/grep.rs` |
 | `file_edit` | 🔧 P0 待实现 | `nova-core/src/tools/file_edit.rs` |
-| `browser` | 🔧 P0 待实现 | `nova-core/src/browser/` |
+| `browser` | ✅ 已实现 | `nova-core/src/tools/browser.rs` |
 
 ### P0 新增工具需求
 
@@ -403,23 +403,36 @@ memories/YYYY-MM-DD.md  ← 按需召回，"那天"的摘要
 sessions/<uuid>.jsonl   ← 最后手段，完整细节（Agentic Session Search）
 ```
 
-#### browser (CDP) — 浏览器自动化
+#### browser — 浏览器自动化（已实现）
 
-参考 OpenClaw `extensions/browser/`，实现 Chrome DevTools Protocol 浏览器控制。
+基于 `@playwright/mcp`（Microsoft 官方 Playwright MCP Server），通过 MCP JSON-RPC over stdio 协议驱动浏览器。
 
-- 单工具多 action 模式：`action` 参数分发
-- 第一版核心 action：
-  - `start`：启动 Chrome（`--remote-debugging-port` + `--user-data-dir` 隔离）
-  - `stop`：关闭浏览器
-  - `navigate`：导航到 URL
-  - `snapshot`：获取页面 DOM/文本快照
-  - `screenshot`：截图（全页/元素）
-  - `act`：操作（click/type/press）— 通过 CSS 选择器或坐标定位
-  - `close`：关闭标签页
-- 使用 `chromiumoxide` crate（纯 Rust CDP 客户端）
-- daemon 内直接管理 CDP 连接，不需要 HTTP 中转层
-- 独立 `nova` 浏览器 profile，不碰用户浏览器
-- 替代 web_search + web_fetch 的功能
+**架构（shell out 模式）**：
+- 每次工具调用启动一个 `npx @playwright/mcp@latest --config ~/.nova/playwright-mcp.json` 子进程
+- 通过 stdin 发送三条 MCP JSON-RPC 消息（initialize / notifications/initialized / tools/call）
+- 从 stdout 读取响应，解析后返回给 LLM
+- 零长连接，零状态管理，进程自生自灭
+
+**支持的 action**：
+- `navigate`：导航到 URL
+- `snapshot`：获取页面无障碍树（aria snapshot）文本，含 `@ref` 元素引用
+- `click`：点击元素（ref 或 selector）
+- `type`：输入文字（ref 或 selector）
+- `press`：按键（Enter / Tab / Escape 等）
+- `scroll_down` / `scroll_up`：滚动页面
+- `screenshot`：截图，保存到 `~/.nova/browser-screenshots/`
+- `go_back`：后退
+- `close`：关闭浏览器
+
+**关键特性**：
+- 自动发现本机 Chrome（`/Applications/Google Chrome.app/...`），规避 Playwright 内置 Chromium 被反爬检测的问题
+- 支持指定 User Data Dir 保留登录状态和 Cookies
+- 自定义 User-Agent 伪装正常浏览器
+- `--disable-blink-features=AutomationControlled` 抑制自动化标记
+
+**前提**：系统安装 Node.js >= 18（`brew install node`），`@playwright/mcp` 通过 `npx --yes` 自动按需下载。
+
+**模块**：`nova-core/src/tools/browser.rs`（单文件，~230 行）
 
 ### Agentic Session Search
 
@@ -515,7 +528,13 @@ max_turns = 20
 tool_timeout_secs = 60
 compact_target_pct = 0.6
 budget_trigger_pct = 0.9
+
+# Browser 配置（均为可选，有合理默认值）
+# browser_chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# browser_profile_dir = "/Users/<name>/.nova/browser-profile"
+# browser_headless = true
 ```
+
 
 ---
 

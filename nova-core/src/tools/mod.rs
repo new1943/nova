@@ -5,6 +5,7 @@ pub mod write_file;
 pub mod file_edit;
 pub mod glob;
 pub mod grep;
+pub mod browser;
 
 pub use registry::{Tool, ToolRegistry};
 pub use bash::BashTool;
@@ -13,3 +14,4 @@ pub use write_file::WriteFileTool;
 pub use file_edit::FileEditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use browser::BrowserTool;

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, error, warn};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use nova_core::agent::{QueryLoop, QueryLoopConfig, LoopEvent};
 use nova_core::config::NovaConfig;
@@ -14,13 +15,23 @@ use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::SideQuery;
 use nova_core::skills::SkillsLoader;
-use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool};
+use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool};
 use nova_core::tools::bash::{BashTool, BashMode};
 use nova_core::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
 
 const SOCKET_PATH: &str = "/tmp/nova.sock";
 const PID_FILE: &str = "/tmp/nova.pid";
+
+struct HandleConfig {
+    workspace_dir: PathBuf,
+    sessions_dir: PathBuf,
+    memories_dir: PathBuf,
+    loop_config: QueryLoopConfig,
+    skills: Arc<SkillsLoader>,
+    run_mode: String,
+    tools: Arc<ToolRegistry>,
+}
 
 fn budget_pct_calc(input_tokens: usize, context_window: usize) -> f32 {
     if context_window == 0 { return 0.0; }
@@ -41,9 +52,23 @@ async fn main() -> Result<()> {
         .append(true)
         .open(&log_path)
         .unwrap_or_else(|_| std::fs::File::open("/dev/null").expect("cannot open /dev/null"));
-    tracing_subscriber::fmt()
+
+    // 简洁日志格式: [LEVEL] HH:MM:SS message
+    let fmt_layer = fmt::layer()
         .with_writer(std::sync::Mutex::new(log_file))
-        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .compact();
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
         .init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -82,7 +107,12 @@ fn check_pid_file() -> bool {
     } else { false }
 }
 
-fn make_tools(mode: &str) -> ToolRegistry {
+fn make_tools(
+    mode: &str,
+    browser_chrome_path: Option<String>,
+    browser_profile_dir: Option<String>,
+    browser_headless: bool,
+) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
         _ => BashMode::Open,
@@ -94,8 +124,17 @@ fn make_tools(mode: &str) -> ToolRegistry {
     tools.register_builtin(Box::new(FileEditTool));
     tools.register_builtin(Box::new(GlobTool));
     tools.register_builtin(Box::new(GrepTool));
+
+    // Browser tool — 通过 @playwright/mcp 子进程驱动
+    tools.register_builtin(Box::new(BrowserTool::new(
+        browser_chrome_path,
+        browser_profile_dir,
+        browser_headless,
+    )));
+
     tools
 }
+
 
 fn make_hooks() -> HookManager {
     // T21.1: Old DualWriteMemory hooks disabled — replaced by T21 layered memory system
@@ -103,8 +142,7 @@ fn make_hooks() -> HookManager {
 }
 
 /// Generate tool descriptions string (used by BootstrapLoader)
-fn tool_descriptions(mode: &str) -> String {
-    let tools = make_tools(mode);
+fn tool_descriptions(tools: &ToolRegistry) -> String {
     tools.describe_all()
 }
 
@@ -147,15 +185,30 @@ async fn run_daemon() -> Result<()> {
 
     loop {
         match server.accept().await {
-            Ok(conn) => {
+        Ok(conn) => {
                 let workspace_dir = config.workspace.clone();
                 let sd = config.workspace.join("sessions");
-                let md = config.workspace.clone(); // workspace root; DailyNotes appends "memories/" internally
+                let md = config.workspace.clone();
                 let lc = loop_config.clone();
                 let sk = skills.clone();
                 let rm = run_mode.clone();
+                let tools = Arc::new(make_tools(
+                    &run_mode,
+                    config.browser_chrome_path.clone(),
+                    config.browser_profile_dir.clone(),
+                    config.browser_headless.unwrap_or(true),
+                ));
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(conn, workspace_dir, sd, md, lc, sk, rm).await {
+                    let cfg = HandleConfig {
+                        workspace_dir,
+                        sessions_dir: sd,
+                        memories_dir: md,
+                        loop_config: lc,
+                        skills: sk,
+                        run_mode: rm,
+                        tools,
+                    };
+                    if let Err(e) = handle_connection(conn, cfg).await {
                         error!("Connection error: {}", e);
                     }
                 });
@@ -167,18 +220,20 @@ async fn run_daemon() -> Result<()> {
 
 async fn handle_connection(
     mut conn: nova_ipc::IpcConnection,
-    workspace_dir: PathBuf,
-    sessions_dir: PathBuf,
-    memories_dir: PathBuf, // workspace root (DailyNotes appends "memories/" internally)
-    mut loop_config: QueryLoopConfig,
-    skills: Arc<SkillsLoader>,
-    run_mode: String,
+    cfg: HandleConfig,
 ) -> Result<()> {
+    let workspace_dir = cfg.workspace_dir;
+    let sessions_dir = cfg.sessions_dir;
+    let memories_dir = cfg.memories_dir;
+    let mut loop_config = cfg.loop_config;
+    let skills = cfg.skills;
+    let _run_mode = cfg.run_mode;
+    let tools = cfg.tools;
     let session_mgr = SessionManager::new(sessions_dir.clone());
 
     // BootstrapLoader: hot-reloads workspace files with mtime caching
     let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir.clone())));
-    let tool_desc = tool_descriptions(&run_mode);
+    let tool_desc = tool_descriptions(&tools);
 
     // DailyNotes: Layer 2 episodic memory (T21.1)
     let daily_notes = DailyNotes::new(memories_dir.clone());
@@ -311,16 +366,18 @@ async fn handle_connection(
                 let dn = daily_notes.clone();
                 let sq_loop = side_query.clone();
                 let session_clone = session.clone();
-                let rm = run_mode.clone();
+                let tools_clone = tools.clone();
 
                 let loop_handle = tokio::spawn(async move {
-                    let tools = make_tools(&rm);
                     let hooks = make_hooks();
-                    let ql = QueryLoop::new(tools, hooks, lc, Some(dn), Some(sq_loop));
+                    let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop));
                     let mut s = session_clone;
                     s.turn_count = 0;
-                    let _ = ql.run(&mut s, &sp, event_tx).await;
-                    s
+                    let result = ql.run_turn(s.clone(), &sp, event_tx).await;
+                    match result {
+                        Ok((updated_s, new_msgs)) => (updated_s, new_msgs),
+                        Err(_) => (s, vec![]),
+                    }
                 });
 
                 while let Some(event) = event_rx.recv().await {
@@ -337,14 +394,15 @@ async fn handle_connection(
                         },
                         LoopEvent::Error(e) => Event::Error { message: e },
                     };
-                    conn.send_event(&ipc_event).await?;
+                    conn.send_event(&ipc_event).await.ok();
                 }
 
-                if let Ok(updated) = loop_handle.await {
-                    let old_len = session.messages.len();
+                if let Ok((updated, new_msgs)) = loop_handle.await {
                     session = updated;
                     let history = session_mgr.history_for(&session);
-                    for msg in &session.messages[old_len..] {
+                    // Append ONLY newly added messages instead of relying on `[old_len..]`
+                    // since compaction might reduce the total length in memory!
+                    for msg in &new_msgs {
                         let _ = history.append(msg);
                     }
                     session_mgr.save_meta(&session)?;
@@ -416,6 +474,17 @@ async fn handle_connection(
                 }
             }
             Request::Shutdown => {
+                // T21.1: Write session diary before shutdown
+                if session.messages.len() > 2 {
+                    let summary_session = session.clone();
+                    let dn = daily_notes.clone();
+                    let sq = side_query.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = write_session_diary(&dn, &sq, &summary_session).await {
+                            warn!("Failed to write session diary on shutdown: {}", e);
+                        }
+                    });
+                }
                 session_mgr.save_meta(&session)?;
                 info!("Shutdown requested");
                 std::process::exit(0);
@@ -500,14 +569,19 @@ If a dimension has no information, skip it. Do not add explanatory text.";
 /// Reduce phase: combine all map results into ~200 char final summary.
 async fn reduce_summaries(sq: &SideQuery, map_results: &[String]) -> anyhow::Result<String> {
     let combined = map_results.join("\n\n");
-    let system = "You are a diary summarizer. Given multiple key-point extracts from a \
-conversation, write a ~200-character Chinese summary that covers:
-- 事件、反馈、用户偏好、项目状态、重要决策、参考资料
+    let system = "你是一名会话记录员。根据以下会话要点，写一段 100-200 字的中文总结，要有头有尾，连贯自然。
 
-Rules:
-- Output ONLY the summary text in Chinese, no labels, no markdown, no bullet points.
-- Aim for approximately 200 Chinese characters.
-- Focus on what's most important and memorable.";
+重点记录：
+- 发生了什么（事件）
+- 用户说了什么、反馈如何
+- 项目进展或重要决策
+- 用户的偏好或习惯
+
+要求：
+- 用完整的句子叙述，不是罗列要点
+- 一口气说完，不要分段
+- 100-200 字为宜
+- 只输出中文总结，不加标签不加格式";
 
     sq.query_await(system, &combined).await
 }

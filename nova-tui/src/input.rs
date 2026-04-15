@@ -19,6 +19,7 @@ pub enum InputAction {
     HistoryPrev,
     HistoryNext,
     ToggleFocus,
+    Paste(String),
     None,
 }
 
@@ -56,6 +57,8 @@ pub fn poll_input() -> InputAction {
                 (_, KeyCode::Char(c)) => InputAction::Char(c),
                 _ => InputAction::None,
             };
+        } else if let Ok(Event::Paste(s)) = event::read() {
+            return InputAction::Paste(s);
         }
         // Consume non-Press events (Release, Repeat) silently
         return InputAction::None;

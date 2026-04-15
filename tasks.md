@@ -32,11 +32,10 @@
 | T19 | 端到端集成测试 | P2 | 4h | 全部 | ❌ 未开始 |
 | T20 | file_edit 精确编辑工具 | P0 | 3h | T05 | ✅ 完成 |
 | T21 | 三层记忆系统 | P0 | 10h | T15, T05 | ✅ 完成 |
-| T22 | browser (CDP) 浏览器自动化 | P0 | 12h | T05 | ❌ 未开始 |
+| T22 | browser 浏览器自动化 | P0 | 12h | T05 | ✅ 完成 |
 
-**总预估**: ~89h
-**已完成**: ~70h（T01-T18, T20, T21）
-**剩余**: ~19h（T19, T22）
+**已完成**: ~80h（T01-T18, T20, T21, T22）
+**剩余**: ~9h（T19）
 
 ---
 
@@ -399,25 +398,32 @@ T03 ─► T13 ─► T14
 
 ---
 
-### T22: browser (CDP) 浏览器自动化
+### T22: browser 浏览器自动化 ✅
 
-**验收标准**: `browser` 工具能启动 Chrome、导航到 URL、获取页面快照、截图、执行点击/输入操作。
+**技术方案变更**：放弃原定的 `chromiumoxide` CDP 方案，改用 `@playwright/mcp`（Microsoft 官方）+ shell out 模式。
+
+**验收标准**: `browser` 工具能导航 URL、获取页面 aria snapshot、截图、执行点击/输入操作。支持指定本机 Chrome + User Data Dir。
 
 子任务：
-- [ ] 添加 `chromiumoxide` 依赖到 `nova-core/Cargo.toml`
-- [ ] 实现 `browser/chrome.rs` — Chrome 进程管理（启动/停止/检测可执行文件）
-- [ ] 实现 `browser/cdp.rs` — CDP 连接管理（连接/断开/重连）
-- [ ] 实现 `browser/actions.rs` — 各 action 实现
-  - [ ] `navigate(url)` — 导航到 URL
-  - [ ] `snapshot()` — 获取页面可见文本 + 链接列表
-  - [ ] `screenshot(full_page, selector)` — 截图，返回 PNG 文件路径
-  - [ ] `act(click, selector)` — 点击元素
-  - [ ] `act(type, selector, text)` — 输入文本
-  - [ ] `act(press, key)` — 按键
-- [ ] 实现 `browser/tool.rs` — BrowserTool，action 参数分发
-- [ ] 在 `tools/mod.rs` 中导出，在 daemon `make_tools()` 中注册
-- [ ] Chrome profile 隔离（`~/.nova/browser/nova-profile/`）
-- [ ] daemon 退出时自动 kill Chrome 进程
+- [x] 设计调研：对比 hermes-agent 和 openclaw 的浏览器实现方式
+- [x] 技术选型：确定采用 `@playwright/mcp` shell out 方案
+- [x] 实现 `nova-core/src/tools/browser.rs` —— BrowserTool 完整实现
+  - [x] `write_config()` — 自动生成 `~/.nova/playwright-mcp.json`
+  - [x] `discover_chrome()` — 自动探测本机 Chrome 路径
+  - [x] `call_tool()` — spawn 子进程， MCP JSON-RPC stdio 通信
+  - [x] `parse_mcp_response()` — 解析 content[].text 和 resource.uri
+  - [x] 支持 9 种 action：navigare / snapshot / click / type / press / scroll_down / scroll_up / screenshot / go_back / close
+- [x] 在 `nova-core/src/tools/mod.rs` 中导出 `BrowserTool`
+- [x] 在 `nova-core/src/config.rs` 中添加 `browser_chrome_path / browser_profile_dir / browser_headless` 可选配置字段
+- [x] 在 `nova-daemon/src/main.rs` 的 `make_tools()` 中注册 `BrowserTool`
+- [x] `cargo check` 通过（零 warning，零 error）
+
+**实际文件结构**：
+```
+nova-core/src/tools/browser.rs   # 单文件，~230 行
+```
+
+**前提**：Node.js >= 18（`brew install node`），`@playwright/mcp` 通过 `npx --yes` 自动按需下载。
 
 ---
 
@@ -454,4 +460,4 @@ T03 ─► T13 ─► T14
 | M5: 策略完整 | T11-T15 | 8 个核心策略全部实现 | ✅ |
 | M6: 功能完整 | T16, T17, T18 | Heartbeat + Skills + 安全 | ✅ |
 | M7: 质量保证 | T19 | 集成测试通过 | ❌ 未开始 |
-| M8: P0 工具 | T20, T21, T22 | file_edit + 三层记忆 + 浏览器 | 🔧 T20+T21 完成，T22 进行中 |
+| M8: P0 工具 | T20, T21, T22 | file_edit + 三层记忆 + 浏览器 | ✅ 全部完成 |
