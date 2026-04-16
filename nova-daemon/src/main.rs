@@ -8,6 +8,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use nova_core::agent::{QueryLoop, QueryLoopConfig, LoopEvent};
 use nova_core::config::NovaConfig;
 use nova_core::hooks::HookManager;
+use nova_core::memory::consolidate::MemoryConsolidator;
 use nova_core::memory::daily::DailyNotes;
 use nova_core::memory::dream::DreamEngine;
 use nova_core::memory::recall::MemoryRecall;
@@ -264,6 +265,17 @@ async fn handle_connection(
     // Pass memories_dir to QueryLoop for diary writing
     loop_config.memories_dir = Some(memories_dir.clone());
 
+    // T23: MemoryConsolidator for Layer 1 idle-time dual-write mutex
+    let consolidate_sq = SideQuery::new(
+        loop_config.api_key.clone(),
+        loop_config.api_base_url.clone(),
+        loop_config.model.clone(),
+    );
+    let consolidator = Arc::new(MemoryConsolidator::new(
+        workspace_dir.clone(),
+        consolidate_sq,
+    ));
+
     let mut session = match session_mgr.resume_latest()? {
         Some(s) => {
             conn.send_event(&Event::SessionRestored {
@@ -284,6 +296,34 @@ async fn handle_connection(
     while let Some(req) = conn.recv_request().await? {
         match req {
             Request::UserMessage { content } => {
+                // T23: Idle-time consolidation — if >15min since last activity
+                // and there are unswept messages, consolidate before processing new input.
+                // This captures the "implicit context switch" when user returns after a break.
+                {
+                    let idle_secs = (chrono::Utc::now() - session.updated_at).num_seconds();
+                    let has_unswept = session.last_memory_sweep_index < session.messages.len();
+                    if idle_secs > 900 && has_unswept {
+                        info!(
+                            "T23: Idle detected ({}s), running consolidation on {} unswept messages",
+                            idle_secs,
+                            session.messages.len() - session.last_memory_sweep_index,
+                        );
+                        let cons = (*consolidator).clone();
+                        match cons.consolidate(
+                            &session.messages,
+                            session.last_memory_sweep_index,
+                            session.memory_updated_mutex,
+                        ).await {
+                            Ok(_) => {
+                                session.last_memory_sweep_index = session.messages.len();
+                                session.memory_updated_mutex = false;
+                                session_mgr.save_meta(&session)?;
+                            }
+                            Err(e) => warn!("T23: Idle consolidation failed: {}", e),
+                        }
+                    }
+                }
+
                 // Skill injection
                 let content = if content.starts_with('/') {
                     let skill_name = content.trim_start_matches('/').split_whitespace().next().unwrap_or("");
@@ -367,10 +407,16 @@ async fn handle_connection(
                 let sq_loop = side_query.clone();
                 let session_clone = session.clone();
                 let tools_clone = tools.clone();
+                let cons = consolidator.clone();
 
                 let loop_handle = tokio::spawn(async move {
                     let hooks = make_hooks();
-                    let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop));
+                    let cons_inner = Arc::try_unwrap(cons)
+                        .unwrap_or_else(|arc| (*arc).clone());
+                    let ql = QueryLoop::new(
+                        tools_clone, hooks, lc, Some(dn), Some(sq_loop),
+                        Some(cons_inner),
+                    );
                     let mut s = session_clone;
                     s.turn_count = 0;
                     let result = ql.run_turn(s.clone(), &sp, event_tx).await;
@@ -405,6 +451,25 @@ async fn handle_connection(
                     for msg in &new_msgs {
                         let _ = history.append(msg);
                     }
+
+                    // T23: Detect if any tool call wrote to MEMORY.md
+                    // Scan new_msgs for tool results that indicate MEMORY.md was modified
+                    let memory_written = new_msgs.iter().any(|m| {
+                        // Check assistant tool_calls for write_file/file_edit targeting MEMORY.md
+                        if let Some(tcs) = &m.tool_calls {
+                            tcs.iter().any(|tc| {
+                                (tc.name == "write_file" || tc.name == "file_edit")
+                                    && tc.arguments.to_string().contains("MEMORY.md")
+                            })
+                        } else {
+                            false
+                        }
+                    });
+                    if memory_written {
+                        session.memory_updated_mutex = true;
+                        info!("T23: Detected MEMORY.md write by LLM, mutex set");
+                    }
+
                     session_mgr.save_meta(&session)?;
 
                     // T21.4: Check dream trigger after each turn

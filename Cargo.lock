@@ -1045,6 +1045,7 @@ name = "nova-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "nova-core",
  "nova-ipc",

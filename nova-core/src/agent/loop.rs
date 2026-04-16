@@ -10,6 +10,7 @@ use nova_api::types::{
 };
 
 use crate::hooks::HookManager;
+use crate::memory::consolidate::MemoryConsolidator;
 use crate::memory::daily::DailyNotes;
 use crate::message::{Message, Role, ToolCall};
 use crate::session::manager::Session;
@@ -70,6 +71,7 @@ pub struct QueryLoop {
     pub hooks: HookManager,
     pub daily_notes: Option<DailyNotes>,
     pub side_query: Option<SideQuery>,
+    pub consolidator: Option<MemoryConsolidator>,
 }
 
 impl QueryLoop {
@@ -79,8 +81,9 @@ impl QueryLoop {
         config: QueryLoopConfig,
         daily_notes: Option<DailyNotes>,
         side_query: Option<SideQuery>,
+        consolidator: Option<MemoryConsolidator>,
     ) -> Self {
-        Self { config, tools, hooks, daily_notes, side_query }
+        Self { config, tools, hooks, daily_notes, side_query, consolidator }
     }
 
     /// Run a full query loop turn for user input.
@@ -106,6 +109,7 @@ impl QueryLoop {
             self.config.model.clone(),
         );
         let mut empty_retries: u32 = 0;
+        let mut compaction_exhausted = false;
         const MAX_EMPTY_RETRIES: u32 = 3;
 
         loop {
@@ -123,6 +127,8 @@ impl QueryLoop {
             let estimated_tokens = estimate_message_tokens(&session.messages);
             if estimated_tokens > 0 && budget.needs_compact(estimated_tokens) {
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
+                // T23: Run memory consolidation before compacting (space-triggered)
+                self.run_consolidation(&mut session).await;
                 // T21.1: Write diary before compacting (messages will be summarized)
                 self.write_compact_diary(&session.messages).await;
                 match compactor.compact(&session.messages, self.config.context_window).await {
@@ -234,11 +240,17 @@ impl QueryLoop {
                 // T21.1: Write diary before compacting
                 self.write_compact_diary(&session.messages).await;
                 match compactor.compact(&session.messages, self.config.context_window).await {
-                    Ok(compacted) => {
+                    Ok(compacted) if compacted.len() < session.messages.len() => {
                         session.messages = compacted;
                         // Undo turn increment so retry doesn't waste a turn
                         session.turn_count = session.turn_count.saturating_sub(1);
-                        continue;
+                        continue; // Success, retry the API request
+                    }
+                    Ok(_) => {
+                        let _ = event_tx.send(LoopEvent::Error(
+                            "Context size exceeded model limits, but cannot safely compact further because the most recent messages are too large! Please type /new to start a fresh session.".into()
+                        )).await;
+                        break; // Failed to compact due to massive recent messages, stop infinite loop
                     }
                     Err(e) => {
                         warn!("Context-overflow compact failed: {}", e);
@@ -254,14 +266,28 @@ impl QueryLoop {
             // Post-flight budget check + record turn
             let input_tokens = usage.input_tokens as usize;
             match budget.check(input_tokens) {
-                BudgetCheck::NeedsCompact => {
+                BudgetCheck::NeedsCompact if !compaction_exhausted => {
                     let _ = event_tx.send(LoopEvent::CompactTriggered).await;
+                    // T23: Run memory consolidation before compacting
+                    self.run_consolidation(&mut session).await;
                     // T21.1: Write diary before compacting
                     self.write_compact_diary(&session.messages).await;
                     match compactor.compact(&session.messages, self.config.context_window).await {
-                        Ok(compacted) => session.messages = compacted,
+                        Ok(compacted) => {
+                            if compacted.len() >= session.messages.len() {
+                                // Compaction reached its limit, do not attempt to auto-compact again this session
+                                compaction_exhausted = true;
+                                let _ = event_tx.send(LoopEvent::Error(
+                                    "[Warning] Auto-compaction cannot reduce size further. Approaching hard limits!".into()
+                                )).await;
+                            }
+                            session.messages = compacted;
+                        }
                         Err(e) => warn!("Compact failed: {}", e),
                     }
+                }
+                BudgetCheck::NeedsCompact => {
+                    // Do nothing, we already know we can't compact it further. Wait for hard overflow.
                 }
                 BudgetCheck::Diminishing => {
                     let _ = event_tx.send(LoopEvent::Error(
@@ -303,10 +329,30 @@ impl QueryLoop {
             // Execute each tool call with timeout
             for tc in &tool_calls {
                 let input = tc.parse_input().unwrap_or_default();
-                let result = match self.tools.execute(&tc.name, input, self.config.tool_timeout).await {
+                let mut result = match self.tools.execute(&tc.name, input, self.config.tool_timeout).await {
                     Ok(r) => r,
                     Err(e) => format!("{{\"error\": \"{}\"}}", e),
                 };
+
+                // ==== 工业级核心护城河：Tool-Level Output Truncation ====
+                // 强制对所有工具的单个执行结果进行字符上限管控，防死循环+防爆显存
+                const MAX_TOOL_CHARS: usize = 30000;
+                // 按字节数估算，如果真超了，安全按字符截断
+                if result.len() > MAX_TOOL_CHARS {
+                    let omitted = result.len() - MAX_TOOL_CHARS;
+                    // 确保按 UTF-8 字符边界截断，防止半个中文乱码
+                    let mut byte_index = 0;
+                    for (char_count, (i, _)) in result.char_indices().enumerate() {
+                        if char_count == MAX_TOOL_CHARS {
+                            byte_index = i;
+                            break;
+                        }
+                    }
+                    if byte_index > 0 {
+                        result.truncate(byte_index);
+                        result.push_str(&format!("\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted! Result is too massive. The response has been forcefully truncated to protect token limits.]"));
+                    }
+                }
                 let _ = event_tx.send(LoopEvent::ToolCallResult {
                     id: tc.id.clone(), content: result.clone(),
                 }).await;
@@ -372,6 +418,28 @@ impl QueryLoop {
             }
             Ok(_) => {}
             Err(e) => warn!("Compact diary summary failed: {}", e),
+        }
+    }
+
+    /// T23: Run memory consolidation — checks mutex, calls SideQuery if needed,
+    /// then advances the sweep cursor.
+    async fn run_consolidation(&self, session: &mut Session) {
+        let consolidator = match &self.consolidator {
+            Some(c) => c,
+            None => return,
+        };
+
+        match consolidator.consolidate(
+            &session.messages,
+            session.last_memory_sweep_index,
+            session.memory_updated_mutex,
+        ).await {
+            Ok(_updated) => {
+                // Advance cursor regardless of whether update happened
+                session.last_memory_sweep_index = session.messages.len();
+                session.memory_updated_mutex = false;
+            }
+            Err(e) => warn!("T23: Memory consolidation failed: {}", e),
         }
     }
 }

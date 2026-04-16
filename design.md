@@ -725,9 +725,10 @@ struct FileEditInput {
 - Claude Code 源码：/Users/.../openclaw/projects/claude-code-main
 ```
 
-**写入机制**：
-1. LLM 主动写 — prompt 引导（AGENTS.md 中描述记忆系统用法）+ 用户显式要求（"记住这个"）
-2. Dream 定期整理 — 从 memories/*.md 日记中提炼核心事项更新
+**写入机制**（基于闲时与双写互斥的混合管线）：
+1. **优先（主动写入）** — LLM 主动写：prompt 引导，在日常对话中由框架鼓励调用工具更新，同时将后台会话级别的锁 `memory_updated_mutex` 置 true（表明不需要本轮后续多余插手）。
+2. **兜底（防重空闲检测）** — 随着长时间交互导致游离的 15m 空余（闲时），或因空间濒临上限遭截断（预留池 Compact），都会拉起断点校验；若检查出此前互斥锁未 true，起子线程 SideQuery 给极其冷嘲严格的 Prompt 补全差异后标记新游标；若已被 LLM 写过（锁已阻断），则将扫描位推进直接抛弃防重叠。
+3. **低频整理：Dream** — 从 memories/*.md 日记中提炼更慢节奏的梳理。
 
 **读取**：BootstrapLoader 每次 API 请求前加载（已有 mtime 缓存），注入 system prompt。
 

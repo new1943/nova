@@ -27,6 +27,12 @@ pub struct Session {
     pub turn_count: usize,
     pub max_turns: usize,
     pub token_stats: TokenStats,
+    /// T23: Index of last message processed by memory consolidation sweep.
+    #[serde(default)]
+    pub last_memory_sweep_index: usize,
+    /// T23: True if LLM actively wrote MEMORY.md since last sweep.
+    #[serde(default)]
+    pub memory_updated_mutex: bool,
 }
 
 impl Session {
@@ -39,6 +45,8 @@ impl Session {
             turn_count: 0,
             max_turns,
             token_stats: TokenStats::default(),
+            last_memory_sweep_index: 0,
+            memory_updated_mutex: false,
         }
     }
 
@@ -67,6 +75,12 @@ pub struct SessionMeta {
     pub updated_at: DateTime<Utc>,
     pub turn_count: usize,
     pub token_stats: TokenStats,
+    /// T23: Memory sweep cursor
+    #[serde(default)]
+    pub last_memory_sweep_index: usize,
+    /// T23: Memory dual-write mutex
+    #[serde(default)]
+    pub memory_updated_mutex: bool,
 }
 
 impl From<&Session> for SessionMeta {
@@ -77,6 +91,8 @@ impl From<&Session> for SessionMeta {
             updated_at: s.updated_at,
             turn_count: s.turn_count,
             token_stats: s.token_stats.clone(),
+            last_memory_sweep_index: s.last_memory_sweep_index,
+            memory_updated_mutex: s.memory_updated_mutex,
         }
     }
 }
@@ -152,6 +168,8 @@ impl SessionManager {
                     turn_count: meta.turn_count,
                     max_turns: 20,
                     token_stats: meta.token_stats,
+                    last_memory_sweep_index: meta.last_memory_sweep_index,
+                    memory_updated_mutex: meta.memory_updated_mutex,
                 }))
             }
             None => Ok(None),
