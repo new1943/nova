@@ -33,10 +33,10 @@
 | T20 | file_edit 精确编辑工具 | P0 | 3h | T05 | ✅ 完成 |
 | T21 | 三层记忆系统 | P0 | 10h | T15, T05 | ✅ 完成 |
 | T22 | browser 浏览器自动化 | P0 | 12h | T05 | ✅ 完成 |
-| T23 | 层1闲时双写互斥记忆 | P0 | 4h | T21 | ❌ 未开始 |
+| T23 | 层1闲时双写互斥记忆 | P0 | 4h | T21 | ✅ 完成 |
 
-**已完成**: ~80h（T01-T18, T20, T21, T22）
-**剩余**: ~13h（T19, T23）
+**已完成**: ~84h（T01-T18, T20, T21, T22, T23）
+**剩余**: ~4h（T19）
 
 ---
 
@@ -428,16 +428,16 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 
 ---
 
-### T23: 闲时双写互斥记忆（层1增强） ❌
+### T23: 闲时双写互斥记忆（层1增强） ✅
 
 **验收标准**: Session 中增加互斥锁与处理游标，Daemon 能够识别 15 分钟空闲并触发后台梳理，`loop.rs` 的 Compaction 能够前置触发梳理。利用互斥机制避免短时间内重复更新 `MEMORY.md`。
 
 子任务：
-- [ ] Session 状态体新增 `last_memory_sweep_index` (usize) 与 `memory_updated_mutex` (bool) 并且持久化
-- [ ] 拦截所有修改了 `MEMORY.md` 的工具调用，置 `memory_updated_mutex = true`
-- [ ] Daemon 增加闲时（>15 分钟）轮询任务检测，对有新消息但不活跃的 Session 触发归档
-- [ ] `loop.rs` 的 `NeedsCompact` 复用或旁路触发空间断点归档
-- [ ] 互斥跳过校验：若 Mutex 为 true，重置游标跳过，否则起 SideQuery 用极简 Prompt 做强约束补全，结束后更新游标和锁。
+- [x] Session 状态体新增 `last_memory_sweep_index` (usize) 与 `memory_updated_mutex` (bool) 并且持久化
+- [x] 拦截所有修改了 `MEMORY.md` 的工具调用，置 `memory_updated_mutex = true`
+- [x] Daemon 增加闲时（>15 分钟）轮询任务检测，对有新消息但不活跃的 Session 触发归档
+- [x] `loop.rs` 的 `NeedsCompact` 复用或旁路触发空间断点归档
+- [x] 互斥跳过校验：若 Mutex 为 true，重置游标跳过，否则起 SideQuery 用极简 Prompt 做强约束补全，结束后更新游标和锁。
 
 ---
 
