@@ -98,6 +98,7 @@ impl From<&Session> for SessionMeta {
 }
 
 /// Session manager: create, resume, save, persist
+#[derive(Clone)]
 pub struct SessionManager {
     sessions_dir: PathBuf,
 }
@@ -130,6 +131,31 @@ impl SessionManager {
         history.append(&msg)?;
         session.add_message(msg);
         Ok(())
+    }
+
+    /// Find and resume a specific session by ID
+    pub fn resume_by_id(&self, session_id: &str) -> Result<Option<Session>> {
+        let meta_path = self.sessions_dir.join(format!("{}.meta.json", session_id));
+        if !meta_path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(&meta_path)?;
+        let meta: SessionMeta = serde_json::from_str(&content)?;
+        
+        let history_path = self.sessions_dir.join(format!("{}.jsonl", session_id));
+        let history = SessionHistory::new(history_path);
+        let messages = history.load_all()?;
+        Ok(Some(Session {
+            session_id: meta.session_id,
+            created_at: meta.created_at,
+            updated_at: meta.updated_at,
+            messages,
+            turn_count: meta.turn_count,
+            max_turns: 20,
+            token_stats: meta.token_stats,
+            last_memory_sweep_index: meta.last_memory_sweep_index,
+            memory_updated_mutex: meta.memory_updated_mutex,
+        }))
     }
 
     /// Find and resume the most recently updated session

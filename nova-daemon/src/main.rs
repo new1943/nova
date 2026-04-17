@@ -16,7 +16,7 @@ use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::SideQuery;
 use nova_core::skills::SkillsLoader;
-use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool};
+use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgenticSearchTool};
 use nova_core::tools::bash::{BashTool, BashMode};
 use nova_core::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
@@ -24,7 +24,9 @@ use nova_ipc::{IpcServer, Event, Request};
 const SOCKET_PATH: &str = "/tmp/nova.sock";
 const PID_FILE: &str = "/tmp/nova.pid";
 
-struct HandleConfig {
+mod discord;
+
+pub struct HandleConfig {
     workspace_dir: PathBuf,
     sessions_dir: PathBuf,
     memories_dir: PathBuf,
@@ -113,6 +115,8 @@ fn make_tools(
     browser_chrome_path: Option<String>,
     browser_profile_dir: Option<String>,
     browser_headless: bool,
+    side_query: SideQuery,
+    session_manager: SessionManager,
 ) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
@@ -133,17 +137,19 @@ fn make_tools(
         browser_headless,
     )));
 
+    tools.register_builtin(Box::new(AgenticSearchTool::new(side_query, session_manager)));
+
     tools
 }
 
 
-fn make_hooks() -> HookManager {
+pub fn make_hooks() -> HookManager {
     // T21.1: Old DualWriteMemory hooks disabled — replaced by T21 layered memory system
     HookManager::new()
 }
 
 /// Generate tool descriptions string (used by BootstrapLoader)
-fn tool_descriptions(tools: &ToolRegistry) -> String {
+pub fn tool_descriptions(tools: &ToolRegistry) -> String {
     tools.describe_all()
 }
 
@@ -184,6 +190,35 @@ async fn run_daemon() -> Result<()> {
     let server = IpcServer::bind(SOCKET_PATH.as_ref()).await?;
     info!("Listening on {}", SOCKET_PATH);
 
+    if config.discord_enabled {
+        if let Some(token) = config.discord_token.clone() {
+            let tools_dc = Arc::new(make_tools(
+                &run_mode,
+                config.browser_chrome_path.clone(),
+                config.browser_profile_dir.clone(),
+                config.browser_headless.unwrap_or(true),
+                SideQuery::new(loop_config.api_key.clone(), loop_config.api_base_url.clone(), loop_config.model.clone()),
+                SessionManager::new(config.workspace.join("sessions")),
+            ));
+            let dc_cfg = Arc::new(HandleConfig {
+                workspace_dir: config.workspace.clone(),
+                sessions_dir: config.workspace.join("sessions"),
+                memories_dir: config.workspace.clone(),
+                loop_config: loop_config.clone(),
+                skills: skills.clone(),
+                run_mode: run_mode.clone(),
+                tools: tools_dc,
+            });
+            tokio::spawn(async move {
+                if let Err(e) = discord::start(token, dc_cfg).await {
+                    error!("Discord gateway crashed: {}", e);
+                }
+            });
+        } else {
+            warn!("Discord enabled but no token provided");
+        }
+    }
+
     loop {
         match server.accept().await {
         Ok(conn) => {
@@ -193,11 +228,20 @@ async fn run_daemon() -> Result<()> {
                 let lc = loop_config.clone();
                 let sk = skills.clone();
                 let rm = run_mode.clone();
+                let sq_for_tools = SideQuery::new(
+                    lc.api_key.clone(),
+                    lc.api_base_url.clone(),
+                    lc.model.clone(),
+                );
+                let sm_for_tools = SessionManager::new(sd.clone());
+
                 let tools = Arc::new(make_tools(
                     &run_mode,
                     config.browser_chrome_path.clone(),
                     config.browser_profile_dir.clone(),
                     config.browser_headless.unwrap_or(true),
+                    sq_for_tools,
+                    sm_for_tools,
                 ));
                 tokio::spawn(async move {
                     let cfg = HandleConfig {
@@ -360,10 +404,15 @@ async fn handle_connection(
                     let search_mgr = SessionManager::new(sessions_dir.clone());
                     let searcher = AgenticSessionSearch::new(sq, search_mgr);
 
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        searcher.search(&content),
-                    ).await {
+                    let search_fut = searcher.search(&content);
+                    let recall_fut = memory_recall.recall(&content, 3);
+
+                    let (search_res, recall_res) = tokio::join!(
+                        tokio::time::timeout(std::time::Duration::from_secs(15), search_fut),
+                        tokio::time::timeout(std::time::Duration::from_secs(15), recall_fut),
+                    );
+
+                    match search_res {
                         Ok(Ok(results)) if !results.is_empty() => {
                             // Dynamic injection: use up to 5% of context window for history
                             let max_inject_chars = (loop_config.context_window / 20).max(1000);
@@ -387,10 +436,7 @@ async fn handle_connection(
                     }
 
                     // T21.2: Memory recall — inject relevant daily diary entries
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        memory_recall.recall(&content, 3),
-                    ).await {
+                    match recall_res {
                         Ok(Ok(injection)) if !injection.is_empty() => {
                             sp.push_str(&injection);
                             info!("Memory recall injected diary context (~{} chars)", injection.len());
@@ -575,7 +621,7 @@ async fn handle_connection(
 
 // T21.4: Record MEMORY.md mtime at the start of each turn.
 /// Used by Dream to detect if LLM modified MEMORY.md during this turn.
-fn record_memory_mtime(session: &mut nova_core::session::manager::Session, workspace_dir: &Path) {
+pub fn record_memory_mtime(session: &mut nova_core::session::manager::Session, workspace_dir: &Path) {
     let memory_path = workspace_dir.join("MEMORY.md");
     if let Ok(meta) = std::fs::metadata(&memory_path) {
         if let Ok(mtime) = meta.modified() {
@@ -651,7 +697,7 @@ async fn reduce_summaries(sq: &SideQuery, map_results: &[String]) -> anyhow::Res
     sq.query_await(system, &combined).await
 }
 
-async fn write_session_diary(
+pub async fn write_session_diary(
     daily: &DailyNotes,
     sq: &SideQuery,
     session: &nova_core::session::manager::Session,

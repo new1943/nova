@@ -35,6 +35,11 @@ pub struct NovaConfig {
     pub browser_profile_dir: Option<String>,
     /// Browser: run headless (default: true)
     pub browser_headless: Option<bool>,
+    /// Discord Gateway: enabled flag (default: false)
+    #[serde(default = "default_discord_enabled")]
+    pub discord_enabled: bool,
+    /// Discord Gateway: Bot Token (required if enabled)
+    pub discord_token: Option<String>,
 }
 
 fn default_api_key() -> String { String::new() }
@@ -49,6 +54,7 @@ fn default_tool_timeout() -> u64 { 60 }
 fn default_compact_target() -> f32 { 0.6 }
 fn default_budget_trigger() -> f32 { 0.9 }
 fn default_mode() -> String { "open".into() }
+fn default_discord_enabled() -> bool { false }
 
 impl Default for NovaConfig {
     fn default() -> Self {
@@ -68,6 +74,8 @@ impl Default for NovaConfig {
             browser_chrome_path: None,
             browser_profile_dir: None,
             browser_headless: None,
+            discord_enabled: default_discord_enabled(),
+            discord_token: None,
         }
     }
 }

@@ -139,8 +139,8 @@ nova-ipc ←──────────────── nova-tui
 │  ├────────────┴────────────┴──────────────┤ │
 │  │ Session │ Memory │ Tools │ Workspace   │ │
 │  ├────────────────────────────────────────┤ │
-│  │ IpcServer (Unix Socket)                │ │
-│  └────────────────────────────────────────┘ │
+│  │ IpcServer (Unix Socket) │ Discord API  │ │
+│  └─────────────────────────┴──────────────┘ │
 └──────────────────────────────────────────────┘
            ↕ /tmp/nova.sock (JSON lines)
 ┌──────────────────────────────────────────────┐
@@ -798,6 +798,28 @@ struct FileEditInput {
   │    → 搜索历史 session → 注入 <relevant_history>
   │
   └─ Memory Recall（新增）
+
+### 8.3 AgenticSearchTool — 暴露语义搜索
+
+```text
+nova-core/src/tools/agentic_search.rs
+```
+
+**核心逻辑**：
+将内置的 `AgenticSessionSearch` 封装为主动调用的工具暴露给 LLM。
+
+```rust
+pub struct AgenticSearchTool {
+    side_query: SideQuery,
+    session_manager: SessionManager,
+}
+
+// 接收 query，调用 AgenticSessionSearch 获取最相关的历史，格式化输出
+```
+**特点**：
+- **无范围限制**：默认扫描所有可用 Session，支持跨项目检索。
+- **主动触发**：通过明确的 description 指导大模型在特定语境（“回忆一下…”）主动调用。
+- **依赖注入**：在 `make_tools()` 时注入 `SideQuery`（用于二次 LLM 排序）和 `SessionManager`（克隆支持）。
   │    → 扫描 memories/*.md 文件名+首行
   │    → SideQuery 选相关日记（最多 3 天）
   │    → 读取选中日记内容

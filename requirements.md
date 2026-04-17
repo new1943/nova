@@ -328,6 +328,7 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 | `grep` | ✅ 已实现 | `nova-core/src/tools/grep.rs` |
 | `file_edit` | 🔧 P0 待实现 | `nova-core/src/tools/file_edit.rs` |
 | `browser` | ✅ 已实现 | `nova-core/src/tools/browser.rs` |
+| `agentic_search` | ✅ 已实现 | `nova-core/src/tools/agentic_search.rs` |
 
 ### P0 新增工具需求
 
@@ -433,6 +434,25 @@ sessions/<uuid>.jsonl   ← 最后手段，完整细节（Agentic Session Search
 **前提**：系统安装 Node.js >= 18（`brew install node`），`@playwright/mcp` 通过 `npx --yes` 自动按需下载。
 
 **模块**：`nova-core/src/tools/browser.rs`（单文件，~230 行）
+
+#### agentic_search — 主动历史检索
+
+将后台自动执行的 Agentic Session Search 包装为工具暴露给 LLM，允许 AI 主动进行跨 Session 检索。
+
+- **功能**：接收 `query` 参数，在工作区所有过往的 Session 中检索相关对话。
+- **触发场景**：明确指导大模型在用户提及“回忆”、“以前讨论过”、“还记得吗”等字眼时调用。
+- **突破限制**：无特定项目或 Session 范围限制，默认扫描 `SessionManager` 中能加载的所有历史。
+
+**模块**：`nova-core/src/tools/agentic_search.rs`
+
+#### discord — Discord 网关接入
+
+将 Nova 接入 Discord，允许通过 Discord 频道或私聊直接与 Agent 交互，实现类似 Hermes/OpenClaw 的使用体验。
+
+- **运行模式**：与 `nova-daemon` 一起作为内部协程（Task）启动，无需独立的网关进程。TUI 和 Discord 视为不同的客户端通道，共享 Daemon 的上下文与 Session 管理。
+- **配置驱动**：通过 `discord_enabled=true` 和环境中的 `DISCORD_TOKEN` 开启。
+- **会话映射**：将 Discord 的 Channel ID 或是 Thread ID 与 Nova 的 `SessionId` 绑定，确保在 Discord 中的对话能沿用本地的 `~/.nova/sessions` JSONL 记忆。
+- **核心交互**：过滤自身消息和非相关消息，提取文本后注入 Daemon 的 Query Loop，并在响应生成后转换回 Discord 消息格式（或 Markdown）。
 
 ### Agentic Session Search
 
@@ -553,8 +573,8 @@ budget_trigger_pct = 0.9
 
 ## 八、Out of Scope
 
-- OpenClaw Gateway
-- 多 Channel 支持
+- OpenClaw Gateway (独立的 Node.js Gateway 进程)
+- 多 Channel 支持 (除 Discord 之外的其他渠道暂时 out-of-scope)
 - WebSocket API / Web Control UI
 - 多节点（iOS/Android）
 - OAuth / Pairing

@@ -6,6 +6,7 @@ pub mod file_edit;
 pub mod glob;
 pub mod grep;
 pub mod browser;
+pub mod agentic_search;
 
 pub use registry::{Tool, ToolRegistry};
 pub use bash::BashTool;
@@ -15,3 +16,4 @@ pub use file_edit::FileEditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use browser::BrowserTool;
+pub use agentic_search::AgenticSearchTool;

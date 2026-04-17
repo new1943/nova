@@ -34,8 +34,12 @@
 | T21 | 三层记忆系统 | P0 | 10h | T15, T05 | ✅ 完成 |
 | T22 | browser 浏览器自动化 | P0 | 12h | T05 | ✅ 完成 |
 | T23 | 层1闲时双写互斥记忆 | P0 | 4h | T21 | ✅ 完成 |
+| T24 | agentic_search 工具暴露 | P0 | 2h | T05, T21 | ✅ 完成 |
+| T25 | Discord 配置与依赖 (`serenity`) | P0 | 1h | — | ✅ 完成 |
+| T26 | Discord 消息监听与 Session 映射 | P0 | 4h | T25 | ✅ 完成 |
+| T27 | Discord Gateway 嵌入 Daemon | P0 | 2h | T26 | ✅ 完成 |
 
-**已完成**: ~84h（T01-T18, T20, T21, T22, T23）
+**已完成**: ~97h（T01-T18, T20, T21, T22, T23, T24, T25, T26, T27）
 **剩余**: ~4h（T19）
 
 ---
@@ -441,6 +445,18 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 
 ---
 
+### T24: agentic_search 工具暴露 ✅
+
+**验收标准**: 封装 `AgenticSessionSearch` 为 `agentic_search` 工具，暴露给 LLM 使得 AI 可以主动根据用户指令搜索所有历史。
+
+子任务：
+- [x] 创建 `nova-core/src/tools/agentic_search.rs`
+- [x] 实现 `AgenticSearchTool` 并定义明确的触发场景 prompt
+- [x] 修改 `SessionManager` 以支持 `Clone`
+- [x] 注入 `SideQuery` 与 `SessionManager` 依赖到 `make_tools()` 中
+
+---
+
 ## Phase 2/3 骨架模块状态
 
 > 以下模块在 requirements.md 中标记为"骨架已搭建"，实际均有完整的数据结构和核心逻辑实现。
@@ -475,3 +491,4 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 | M6: 功能完整 | T16, T17, T18 | Heartbeat + Skills + 安全 | ✅ |
 | M7: 质量保证 | T19 | 集成测试通过 | ❌ 未开始 |
 | M8: P0 工具 | T20, T21, T22 | file_edit + 三层记忆 + 浏览器 | ✅ 全部完成 |
+| M9: Discord 接入 | T25, T26, T27 | Daemon 内嵌 Discord Client 模式 | ✅ |

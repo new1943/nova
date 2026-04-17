@@ -6,7 +6,7 @@ use crate::session::manager::SessionManager;
 use crate::sidequery::SideQuery;
 
 /// Max chars of transcript per session sent to the LLM
-const MAX_TRANSCRIPT_CHARS: usize = 8000;
+const MAX_TRANSCRIPT_CHARS: usize = 1000;
 /// Max messages to scan from start/end of a session
 const MAX_MESSAGES_TO_SCAN: usize = 200;
 /// Max sessions to send to the LLM for ranking

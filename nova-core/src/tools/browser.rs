@@ -399,7 +399,10 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a persistent Chrome browser via CDP (zero automation fingerprint).\n\n\
+        "Search the internet, visit websites, and read web pages.\n\
+        Use this tool especially when the user asks questions like 'Search the web for...',\n\
+        'Look up...', 'Open this website...', or needs real-time information from the internet.\n\n\
+        It controls a persistent Chrome browser via CDP (zero automation fingerprint) to browse like a human.\n\n\
         WORKFLOW: 1) navigate to URL → 2) snapshot to read page → 3) interact (click/type/press) → 4) snapshot again.\n\n\
         IMPORTANT:\n\
         - Always 'snapshot' after 'navigate' to see the page.\n\
