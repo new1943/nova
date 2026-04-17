@@ -285,8 +285,8 @@ async fn process_discord_message(
         text_buffer = "Done.".into();
     }
     
-    if text_buffer.len() > 1950 {
-        let trunc_text = text_buffer[..1950].to_string() + "\n...(truncated)";
+    if text_buffer.chars().count() > 1950 {
+        let trunc_text = text_buffer.chars().take(1950).collect::<String>() + "\n...(truncated)";
         let builder = EditMessage::new().content(trunc_text);
         let _ = reply_msg.edit(&ctx.http, builder).await;
     } else {

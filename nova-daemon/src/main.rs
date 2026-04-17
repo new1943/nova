@@ -340,6 +340,8 @@ async fn handle_connection(
     while let Some(req) = conn.recv_request().await? {
         match req {
             Request::UserMessage { content } => {
+                info!("Received UserMessage ({} chars)", content.len());
+                tracing::debug!("UserMessage content: {}", content);
                 // T23: Idle-time consolidation — if >15min since last activity
                 // and there are unswept messages, consolidate before processing new input.
                 // This captures the "implicit context switch" when user returns after a break.

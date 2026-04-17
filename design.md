@@ -945,3 +945,158 @@ pub browser_headless: Option<bool>,        // None = true
 
 **前提依赖**：Node.js >= 18（`@playwright/mcp` 通过 `npx --yes` 自动按需下载，首次运行有短暂延迟）。
 
+
+
+---
+
+## 9. 工具追平 Claude Code 设计（T28-T33）
+
+> 参考源码：`~/Documents/openclaw/projects/claude-code-main/tools/`
+> 目标：Nova 已有工具对标 Claude Code 42 个检查项全部对齐
+
+### 9.1 FileReadTracker — 全局读写追踪
+
+**作用**：read_file/write_file/file_edit 共用的状态追踪器，防止盲写/盲改。
+
+```rust
+// nova-core/src/tools/read_tracker.rs
+
+pub struct ReadTracker {
+    /// file_path -> (mtime_ns, is_partial_view)
+    reads: RwLock<HashMap<PathBuf, FileReadState>>,
+}
+
+#[derive(Clone)]
+pub struct FileReadState {
+    pub timestamp: u64,       // mtime in nanoseconds
+    pub content: Option<String>, // full content snapshot
+    pub is_partial_view: bool,  // true if read with start_line/end_line
+    pub offset: Option<usize>,  // start_line (1-based)
+    pub limit: Option<usize>,   // end_line
+}
+
+impl ReadTracker {
+    pub fn record_read(&self, path: &Path, state: FileReadState);
+    pub fn get_read_state(&self, path: &Path) -> Option<FileReadState>;
+    pub fn invalidate(&self, path: &Path);  // 文件被外部修改时调用
+}
+```
+
+**Mtime 检测逻辑**：
+- 写入前比对 mtime，防止 linter/用户修改覆盖
+- Windows 云同步场景：用 content hash fallback
+
+### 9.2 bash 安全加固（T28）
+
+**参考**：`claude-code-main/tools/BashTool/bashSecurity.ts`（~1000 行，22 种检查）
+
+**安全检查分类**：
+
+| 类别 | 检查项 | Claude Code 行数 |
+|:---|:---|:---|
+| Zsh 危险命令 | zmodload/emulate/sysopen/zpty/ztcp 等 20+ 个 | ~200 行 |
+| JQ 安全 | jq --run . script / jq -f | ~100 行 |
+| Curl/Wget | 可疑 URL/主机/端口检测 | ~80 行 |
+| Shell 语法 | 命令替换 / brace expansion / control chars | ~200 行 |
+| Git commit | git commit -m 等注入检测 | ~80 行 |
+| Heredoc 安全 | 安全 heredoc 模式验证 | ~200 行 |
+| Proc environ | /proc/self/environ 读取检测 | ~30 行 |
+
+### 9.3 write_file/file_edit 原子写入
+
+**参考**：`claude-code-main/tools/FileWriteTool/FileWriteTool.ts`
+
+```rust
+// nova-core/src/tools/atomic_write.rs
+
+/// 原子写入：temp file + rename
+pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let temp_dir = path.parent().unwrap_or(Path::new("."));
+    let temp_file = temp_dir.join(".tmp.xxx");
+    std::fs::write(&temp_file, content)?;
+    std::fs::rename(&temp_file, path)?;  // 原子替换
+    Ok(())
+}
+
+/// 文件历史备份
+pub fn backup_before_write(path: &Path) -> Result<PathBuf> {
+    let history_dir = dirs::home_dir().unwrap().join(".nova/file_history");
+    std::fs::create_dir_all(&history_dir)?;
+    let backup_name = format!(
+        "{}_{}.bak",
+        path.to_string_lossy().replace("/", "_"),
+        chrono::Utc::now().format("%Y%m%d_%H%M%S")
+    );
+    let backup_path = history_dir.join(backup_name);
+    std::fs::copy(path, &backup_path)?;
+    Ok(backup_path)
+}
+```
+
+### 9.4 Structured Patch 输出
+
+**参考**：`claude-code-main/tools/FileEditTool/types.ts`
+
+```rust
+// nova-core/src/tools/diff.rs
+
+#[derive(Debug, Serialize)]
+pub struct DiffHunk {
+    pub old_start: usize,
+    pub old_lines: usize,
+    pub new_start: usize,
+    pub new_lines: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffLine {
+    pub line_type: LineType, // Add/Remove/Context
+    pub content: String,
+}
+```
+
+### 9.5 grep head_limit + offset 分页
+
+**参考**：`claude-code-main/tools/GrepTool/GrepTool.ts`
+
+| 参数 | 类型 | 说明 |
+|:---|:---|:---|
+| output_mode | enum | content / files_with_matches / count |
+| head_limit | usize | 最多返回 N 条（默认 250，0=无限制） |
+| offset | usize | 跳过前 N 条（分页） |
+| -B | usize | 匹配前 N 行上下文 |
+| -A | usize | 匹配后 N 行上下文 |
+
+### 9.6 工具文件结构（增强后）
+
+```
+nova-core/src/tools/
+├── mod.rs              # Tool trait 定义
+├── registry.rs         # ToolRegistry
+├── bash.rs            # BashTool（增强后 ~500 行）
+├── bash/
+│   └── security.rs    # BashSecurity — 22 种检查（T28）
+├── read_file.rs       # ReadFileTool（增强后）
+├── read_tracker.rs    # FileReadTracker — 全局读写追踪（T29）
+├── write_file.rs      # WriteFileTool（增强后 ~200 行）
+├── file_edit.rs       # FileEditTool（增强后 ~200 行）
+├── glob.rs            # GlobTool（增强后 ~150 行）
+├── grep.rs            # GrepTool（增强后 ~300 行）
+├── diff.rs            # Structured patch 算法（T30-T31）
+├── browser.rs         # BrowserTool（T22）
+└── agentic_search.rs  # AgenticSearchTool（T24）
+```
+
+### 9.7 优先级与依赖
+
+| 任务 | 预估 | 复杂度 |
+|:---|:---|:---|
+| T28 bash 安全 | 6h | 高 |
+| T29 read_file 增强 | 3h | 中 |
+| T30 write_file 增强 | 3h | 中 |
+| T31 file_edit 增强 | 2h | 中 |
+| T32 grep 增强 | 2h | 低 |
+| T33 glob 增强 | 1h | 低 |
+
+**预计总工作量**：~17h

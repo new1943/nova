@@ -38,6 +38,12 @@
 | T25 | Discord 配置与依赖 (`serenity`) | P0 | 1h | — | ✅ 完成 |
 | T26 | Discord 消息监听与 Session 映射 | P0 | 4h | T25 | ✅ 完成 |
 | T27 | Discord Gateway 嵌入 Daemon | P0 | 2h | T26 | ✅ 完成 |
+| T28 | bash 安全加固（追平 Claude Code） | P0 | 6h | T05 | 🔨 进行中 |
+| T29 | read_file 增强（read-first/mtime/设备拦截） | P0 | 3h | T05 | ❌ 未开始 |
+| T30 | write_file 增强（read-first/原子写入/历史备份） | P0 | 3h | T05 | ❌ 未开始 |
+| T31 | file_edit 增强（read-first/mtime/原子写入） | P0 | 2h | T05 | ❌ 未开始 |
+| T32 | grep 增强（分页/多模式/VCS排除） | P1 | 2h | T05 | ❌ 未开始 |
+| T33 | glob 增强（路径验证） | P1 | 1h | T05 | ❌ 未开始 |
 
 **已完成**: ~97h（T01-T18, T20, T21, T22, T23, T24, T25, T26, T27）
 **剩余**: ~4h（T19）
@@ -457,6 +463,103 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 
 ---
 
+### T28: bash 安全加固（追平 Claude Code）🔨进行中
+
+**验收标准**: bash 工具拥有与 Claude Code 同等的 22 种安全检查能力，覆盖 Zsh 危险命令、JQ/Curl/Wget/Ssh/Nc 深度校验、Shell 语法分析等。
+
+**参考源码**: `claude-code-main/tools/BashTool/bashSecurity.ts`（~1000 行，22 种检查）
+
+子任务：
+- [ ] **Zsh 危险命令拦截** — `zmodload`/`emulate`/`sysopen`/`zpty`/`ztcp`/`mapfile`/`zf_rm` 等 20+ 个
+- [ ] **JQ 安全校验** — 拦截 `jq --run . script` 执行任意代码
+- [ ] **Curl/Wget/Ssh/Nc 安全校验** — 拦截可疑 URL/主机/端口
+- [ ] **Shell 语法树分析** — 用 regex 模拟 tree-sitter 检测危险命令结构
+- [ ] **Brace expansion 拦截** — `{1..10}` / `a{b,c}d` 构造
+- [ ] **Control character 拦截** — `\x00-\x1f` 控制字符
+- [ ] **Git commit message 注入检测** — `git commit -m "$()"` 等
+- [ ] **Proc environ 访问检测** — `/proc/self/environ` 读取
+- [ ] **Heredoc 安全验证** — `$(cat <<'DELIM'\n...\nDELIM)` 模式
+- [ ] **命令替换拦截** — `$()` / `` ` ``（已有），扩展 `$(<` / `<>(` 等
+- [ ] **权限提升拦截** — `sudo`/`su`/`doas`（已有）
+
+---
+
+### T29: read_file 增强（追平 Claude Code）
+
+**验收标准**: read_file 必须先被调用过才能在 write_file/file_edit 中使用，增加 mtime 追踪防并发修改，增加设备文件拦截。
+
+**参考源码**: `claude-code-main/tools/FileReadTool/FileReadTool.ts`
+
+子任务：
+- [ ] **FileReadTracker** — 全局追踪已读文件 + mtime + 是否全量读取
+- [ ] **Read-first 校验** — `file_edit`/`write_file` 执行前检查 tracker
+- [ ] **设备文件拦截** — `/dev/zero`/`/dev/random`/`/dev/stdin` 等
+- [ ] **文件修改检测** — 写入前比对 mtime，防止 linter/用户修改覆盖
+- [ ] **部分读取标记** — `start_line`/`end_line` 时标记 `isPartialView`
+
+---
+
+### T30: write_file 增强（追平 Claude Code）
+
+**验收标准**: 必须先 read 才能 write，增加原子写入（temp+rename），增加文件历史备份。
+
+**参考源码**: `claude-code-main/tools/FileWriteTool/FileWriteTool.ts`
+
+子任务：
+- [ ] **Read-first 校验** — 检查 FileReadTracker，未读则报错
+- [ ] **原子写入** — `temp file + fs::rename` 保证写入原子性
+- [ ] **目录自动创建** — `fs::create_dir_all(parent)`（已有，验证存在）
+- [ ] **文件历史备份** — 写入前备份原文件到 `~/.nova/file_history/`
+- [ ] **Structured patch 输出** — 返回 diff hunk（类似 Claude Code）
+
+---
+
+### T31: file_edit 增强（追平 Claude Code）
+
+**验收标准**: 增加 read-first 校验、mtime 防并发修改、原子写入、structured patch 输出。
+
+**参考源码**: `claude-code-main/tools/FileEditTool/FileEditTool.ts`
+
+子任务：
+- [ ] **Read-first 校验** — 必须先 read 过该文件才能 edit
+- [ ] **Mtime 防并发修改** — 检查文件 mtime 是否晚于 read 时间
+- [ ] **原子写入** — `temp file + fs::rename`
+- [ ] **Structured patch** — 返回 unified diff 格式
+- [ ] **LSP 通知占位** — 预留接口（Rust LSP 生态不成熟，可后补）
+- [ ] **Quote 规范化占位** — 处理弯引号/直引号混用（可后补）
+
+---
+
+### T32: grep 增强（追平 Claude Code）
+
+**验收标准**: 增加 head_limit+offset 分页、多输出模式（content/files/count）、VCS 目录自动排除。
+
+**参考源码**: `claude-code-main/tools/GrepTool/GrepTool.ts`
+
+子任务：
+- [ ] **head_limit + offset** — `rg --max-count` + 跳过 N 条
+- [ ] **多输出模式** — `files_with_matches`（已有）/ `content`（已有）/ `count`（新增）
+- [ ] **-B / -A 上下文** — 匹配行的前/后 N 行
+- [ ] **VCS 目录排除** — `.git`/`.svn`/`.hg`/`.sl` 自动排除
+- [ ] **文件类型过滤** — `--type js/py/rs`（rg --type）
+- [ ] **相对路径输出** — 显示相对于 cwd 的路径（节省 token）
+
+---
+
+### T33: glob 增强（追平 Claude Code）
+
+**验收标准**: 增加路径存在性验证、结果限制（100 条）。
+
+**参考源码**: `claude-code-main/tools/GlobTool/GlobTool.ts`
+
+子任务：
+- [ ] **路径存在性验证** — 指定 path 时检查目录是否存在
+- [ ] **结果限制** — 默认最多 100 条，避免大量结果
+- [ ] **按 mtime 排序** — 最近修改的文件排在前面
+- [ ] **相对路径输出** — 相对于 cwd 返回路径
+
+---
+
 ## Phase 2/3 骨架模块状态
 
 > 以下模块在 requirements.md 中标记为"骨架已搭建"，实际均有完整的数据结构和核心逻辑实现。
@@ -492,3 +595,5 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 | M7: 质量保证 | T19 | 集成测试通过 | ❌ 未开始 |
 | M8: P0 工具 | T20, T21, T22 | file_edit + 三层记忆 + 浏览器 | ✅ 全部完成 |
 | M9: Discord 接入 | T25, T26, T27 | Daemon 内嵌 Discord Client 模式 | ✅ |
+
+| M10 | 工具追平 Claude Code | T28-T33 | bash/grep/glob/read/write/edit 安全对齐 | 🔨 进行中 |

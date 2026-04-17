@@ -51,7 +51,7 @@ impl Tool for ReadFileTool {
             (Some(s), Some(e)) => {
                 let lines: Vec<&str> = content.lines().collect();
                 let s = s.saturating_sub(1).min(lines.len());
-                let e = e.min(lines.len());
+                let e = e.max(s).min(lines.len());
                 Ok(lines[s..e].join("\n"))
             }
             (Some(s), None) => {

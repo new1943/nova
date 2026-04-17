@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{warn, info, debug, error};
 
 use nova_api::stream::{AccumulatedToolCall, StreamEvent};
 use nova_api::types::{
@@ -96,6 +96,7 @@ impl QueryLoop {
         // Reset turn counter — max_turns limits loop depth per user message, not per session
         session.reset_turns();
         let mut newly_added_messages = Vec::new();
+        info!("--- Starting new query loop for user input ---");
 
         let tool_schemas = self.tools.as_api_schemas();
         let mut budget = TokenBudget::new(
@@ -139,6 +140,7 @@ impl QueryLoop {
 
             // Build request
             let api_messages = build_api_messages(&session.messages);
+            info!("Sending API request to {} ({} messages, estimated {} tokens)", self.config.model, api_messages.len(), estimated_tokens);
             let req = ApiRequest {
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
@@ -197,6 +199,7 @@ impl QueryLoop {
                     }
                     StreamEvent::MessageStop { .. } => {}
                     StreamEvent::Error(e) => {
+                        error!("API stream error: {}", e);
                         // GAP 2: detect context-overflow for auto compact+retry
                         let lower = e.to_lowercase();
                         if lower.contains("context_length") || lower.contains("too many tokens")
@@ -211,6 +214,7 @@ impl QueryLoop {
 
             // Check if the stream task itself errored
             if let Ok(Err(e)) = stream_handle.await {
+                error!("API stream fatal error: {}", e);
                 if text_content.is_empty() && tool_calls.is_empty() {
                     let _ = event_tx.send(LoopEvent::Error(format!("API stream error: {}", e))).await;
                     break;
@@ -329,9 +333,17 @@ impl QueryLoop {
             // Execute each tool call with timeout
             for tc in &tool_calls {
                 let input = tc.parse_input().unwrap_or_default();
-                let mut result = match self.tools.execute(&tc.name, input, self.config.tool_timeout).await {
-                    Ok(r) => r,
-                    Err(e) => format!("{{\"error\": \"{}\"}}", e),
+                info!("Executing tool: `{}` with args: {}", tc.name, input);
+                let mut result = match self.tools.execute(&tc.name, input.clone(), self.config.tool_timeout).await {
+                    Ok(r) => {
+                        info!("Tool `{}` completed successfully ({} bytes)", tc.name, r.len());
+                        debug!("Tool result: {}", r);
+                        r
+                    }
+                    Err(e) => {
+                        error!("Tool `{}` failed: {}", tc.name, e);
+                        format!("{{\"error\": \"{}\"}}", e)
+                    }
                 };
 
                 // ==== 工业级核心护城河：Tool-Level Output Truncation ====
