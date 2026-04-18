@@ -38,7 +38,7 @@
 | T25 | Discord 配置与依赖 (`serenity`) | P0 | 1h | — | ✅ 完成 |
 | T26 | Discord 消息监听与 Session 映射 | P0 | 4h | T25 | ✅ 完成 |
 | T27 | Discord Gateway 嵌入 Daemon | P0 | 2h | T26 | ✅ 完成 |
-| T28 | bash 安全加固（追平 Claude Code） | P0 | 6h | T05 | 🔨 进行中 |
+| T28 | bash 安全加固（追平 Claude Code） | P0 | 6h | T05 | ❌ 未开始 |
 | T29 | read_file 增强（read-first/mtime/设备拦截） | P0 | 3h | T05 | ❌ 未开始 |
 | T30 | write_file 增强（read-first/原子写入/历史备份） | P0 | 3h | T05 | ❌ 未开始 |
 | T31 | file_edit 增强（read-first/mtime/原子写入） | P0 | 2h | T05 | ❌ 未开始 |
@@ -463,7 +463,7 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 
 ---
 
-### T28: bash 安全加固（追平 Claude Code）🔨进行中
+### T28: bash 安全加固（追平 Claude Code）❌未开始
 
 **验收标准**: bash 工具拥有与 Claude Code 同等的 22 种安全检查能力，覆盖 Zsh 危险命令、JQ/Curl/Wget/Ssh/Nc 深度校验、Shell 语法分析等。
 

@@ -4,8 +4,13 @@
 **日期**: 2026-04-08
 **状态**: Phase 1 已实现 + Phase 2/3 骨架已搭建
 
-> 基于 Claude Code 源码分析 + OpenClaw 文档，完整记录所有策略。
+> 基于 Claude Code 源码分析 + OpenClaw 源码 + Hermes Agent 源码，完整记录所有策略。
 
+| 项目 | 路径 |
+|:---|:---|
+| Claude Code 泄露源码 | ~/Documents/openclaw/projects/claude-code-main/ |
+| Hermes Agent 源码 | ~/Documents/openclaw/projects/hermes-agent/ |
+| OpenClaw 源码 | ~/Documents/openclaw/projects/openclaw/ |
 ---
 
 ## 一、项目定位
@@ -453,6 +458,32 @@ sessions/<uuid>.jsonl   ← 最后手段，完整细节（Agentic Session Search
 - **配置驱动**：通过 `discord_enabled=true` 和环境中的 `DISCORD_TOKEN` 开启。
 - **会话映射**：将 Discord 的 Channel ID 或是 Thread ID 与 Nova 的 `SessionId` 绑定，确保在 Discord 中的对话能沿用本地的 `~/.nova/sessions` JSONL 记忆。
 - **核心交互**：过滤自身消息和非相关消息，提取文本后注入 Daemon 的 Query Loop，并在响应生成后转换回 Discord 消息格式（或 Markdown）。
+
+##### 已知问题
+
+| 问题 | 影响 | 优先级 |
+|:---|:---|:---|
+| 不支持 `/new`、`/search`、`/dream` 等 slash 命令 | Discord 用户无法新建 session、搜索历史、触发记忆整理 | P1 |
+| 每次消息都是独立的 `UserMessage`，无 session 恢复机制 | Discord 对话不连续，无法跨 session 累积上下文 | P0 |
+
+###### 问题详解
+
+**P0 — Session 不连续**：
+
+Discord bot 当前实现是"收到消息 → 发送 `Request::UserMessage` → 返回响应"，每次都是独立的消息流。Session 状态（messages 历史、token budget、工具状态）全部丢失。
+
+对比 TUI：TUI 保持持久连接，Session 状态全程维护。
+
+影响：Discord 用户无法获得连贯的对话体验，每次都是新 session。
+
+**P1 — 缺少命令支持**：
+
+TUI 支持的命令在 Discord 中完全不可用：
+- `/new` — 新建 Session
+- `/search <query>` — 语义搜索历史
+- `/dream` — 手动触发记忆整理
+
+这些命令需要解析用户消息前缀，映射到对应的 `Request` 枚举类型。
 
 ### Agentic Session Search
 
