@@ -38,12 +38,12 @@
 | T25 | Discord 配置与依赖 (`serenity`) | P0 | 1h | — | ✅ 完成 |
 | T26 | Discord 消息监听与 Session 映射 | P0 | 4h | T25 | ✅ 完成 |
 | T27 | Discord Gateway 嵌入 Daemon | P0 | 2h | T26 | ✅ 完成 |
-| T28 | bash 安全加固（追平 Claude Code） | P0 | 6h | T05 | ❌ 未开始 |
-| T29 | read_file 增强（read-first/mtime/设备拦截） | P0 | 3h | T05 | ❌ 未开始 |
-| T30 | write_file 增强（read-first/原子写入/历史备份） | P0 | 3h | T05 | ❌ 未开始 |
-| T31 | file_edit 增强（read-first/mtime/原子写入） | P0 | 2h | T05 | ❌ 未开始 |
-| T32 | grep 增强（分页/多模式/VCS排除） | P1 | 2h | T05 | ❌ 未开始 |
-| T33 | glob 增强（路径验证） | P1 | 1h | T05 | ❌ 未开始 |
+| T28 | bash 安全加固（追平 Claude Code） | P0 | 6h | T05 | ✅ 完成 |
+| T29 | read_file 增强（read-first/mtime/设备拦截） | P0 | 3h | T05 | ✅ 完成 |
+| T30 | write_file 增强（read-first/原子写入/历史备份） | P0 | 3h | T05 | ✅ 完成 |
+| T31 | file_edit 增强（read-first/mtime/原子写入） | P0 | 2h | T05 | ✅ 完成 |
+| T32 | grep 增强（分页/多模式/VCS排除） | P1 | 2h | T05 | ✅ 完成 |
+| T33 | glob 增强（路径验证） | P1 | 1h | T05 | ✅ 完成 |
 
 **已完成**: ~97h（T01-T18, T20, T21, T22, T23, T24, T25, T26, T27）
 **剩余**: ~4h（T19）
@@ -463,100 +463,100 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 
 ---
 
-### T28: bash 安全加固（追平 Claude Code）❌未开始
+### T28: bash 安全加固（追平 Claude Code）✅完成
 
 **验收标准**: bash 工具拥有与 Claude Code 同等的 22 种安全检查能力，覆盖 Zsh 危险命令、JQ/Curl/Wget/Ssh/Nc 深度校验、Shell 语法分析等。
 
 **参考源码**: `claude-code-main/tools/BashTool/bashSecurity.ts`（~1000 行，22 种检查）
 
 子任务：
-- [ ] **Zsh 危险命令拦截** — `zmodload`/`emulate`/`sysopen`/`zpty`/`ztcp`/`mapfile`/`zf_rm` 等 20+ 个
-- [ ] **JQ 安全校验** — 拦截 `jq --run . script` 执行任意代码
-- [ ] **Curl/Wget/Ssh/Nc 安全校验** — 拦截可疑 URL/主机/端口
-- [ ] **Shell 语法树分析** — 用 regex 模拟 tree-sitter 检测危险命令结构
-- [ ] **Brace expansion 拦截** — `{1..10}` / `a{b,c}d` 构造
-- [ ] **Control character 拦截** — `\x00-\x1f` 控制字符
-- [ ] **Git commit message 注入检测** — `git commit -m "$()"` 等
-- [ ] **Proc environ 访问检测** — `/proc/self/environ` 读取
-- [ ] **Heredoc 安全验证** — `$(cat <<'DELIM'\n...\nDELIM)` 模式
-- [ ] **命令替换拦截** — `$()` / `` ` ``（已有），扩展 `$(<` / `<>(` 等
-- [ ] **权限提升拦截** — `sudo`/`su`/`doas`（已有）
+- [x] **Zsh 危险命令拦截** — `zmodload`/`emulate`/`sysopen`/`zpty`/`ztcp`/`mapfile`/`zf_rm` 等 20+ 个
+- [x] **JQ 安全校验** — 拦截 `jq --run . script` 执行任意代码
+- [x] **Curl/Wget/Ssh/Nc 安全校验** — 拦截可疑 URL/主机/端口
+- [x] **Shell 语法树分析** — 用 regex 模拟 tree-sitter 检测危险命令结构
+- [x] **Brace expansion 拦截** — `{1..10}` / `a{b,c}d` 构造
+- [x] **Control character 拦截** — `\x00-\x1f` 控制字符
+- [x] **Git commit message 注入检测** — `git commit -m "$()"` 等
+- [x] **Proc environ 访问检测** — `/proc/self/environ` 读取
+- [x] **Heredoc 安全验证** — `$(cat <<'DELIM'\n...\nDELIM)` 模式
+- [x] **命令替换拦截** — `$()` / `` ` ``（已有），扩展 `$(<` / `<>(` 等
+- [x] **权限提升拦截** — `sudo`/`su`/`doas`（已有）
 
 ---
 
-### T29: read_file 增强（追平 Claude Code）
+### T29: read_file 增强（追平 Claude Code）✅完成
 
 **验收标准**: read_file 必须先被调用过才能在 write_file/file_edit 中使用，增加 mtime 追踪防并发修改，增加设备文件拦截。
 
 **参考源码**: `claude-code-main/tools/FileReadTool/FileReadTool.ts`
 
 子任务：
-- [ ] **FileReadTracker** — 全局追踪已读文件 + mtime + 是否全量读取
-- [ ] **Read-first 校验** — `file_edit`/`write_file` 执行前检查 tracker
-- [ ] **设备文件拦截** — `/dev/zero`/`/dev/random`/`/dev/stdin` 等
-- [ ] **文件修改检测** — 写入前比对 mtime，防止 linter/用户修改覆盖
-- [ ] **部分读取标记** — `start_line`/`end_line` 时标记 `isPartialView`
+- [x] **FileReadTracker** — 全局追踪已读文件 + mtime + 是否全量读取
+- [x] **Read-first 校验** — `file_edit`/`write_file` 执行前检查 tracker
+- [x] **设备文件拦截** — `/dev/zero`/`/dev/random`/`/dev/stdin` 等
+- [x] **文件修改检测** — 写入前比对 mtime，防止 linter/用户修改覆盖
+- [x] **部分读取标记** — `start_line`/`end_line` 时标记 `isPartialView`
 
 ---
 
-### T30: write_file 增强（追平 Claude Code）
+### T30: write_file 增强（追平 Claude Code）✅完成
 
 **验收标准**: 必须先 read 才能 write，增加原子写入（temp+rename），增加文件历史备份。
 
 **参考源码**: `claude-code-main/tools/FileWriteTool/FileWriteTool.ts`
 
 子任务：
-- [ ] **Read-first 校验** — 检查 FileReadTracker，未读则报错
-- [ ] **原子写入** — `temp file + fs::rename` 保证写入原子性
-- [ ] **目录自动创建** — `fs::create_dir_all(parent)`（已有，验证存在）
-- [ ] **文件历史备份** — 写入前备份原文件到 `~/.nova/file_history/`
-- [ ] **Structured patch 输出** — 返回 diff hunk（类似 Claude Code）
+- [x] **Read-first 校验** — 检查 FileReadTracker，未读则报错
+- [x] **原子写入** — `temp file + fs::rename` 保证写入原子性
+- [x] **目录自动创建** — `fs::create_dir_all(parent)`（已有，验证存在）
+- [x] **文件历史备份** — 写入前备份原文件到 `~/.nova/file_history/`
+- [x] **Structured patch 输出** — 返回 diff hunk（类似 Claude Code）
 
 ---
 
-### T31: file_edit 增强（追平 Claude Code）
+### T31: file_edit 增强（追平 Claude Code）✅完成
 
 **验收标准**: 增加 read-first 校验、mtime 防并发修改、原子写入、structured patch 输出。
 
 **参考源码**: `claude-code-main/tools/FileEditTool/FileEditTool.ts`
 
 子任务：
-- [ ] **Read-first 校验** — 必须先 read 过该文件才能 edit
-- [ ] **Mtime 防并发修改** — 检查文件 mtime 是否晚于 read 时间
-- [ ] **原子写入** — `temp file + fs::rename`
-- [ ] **Structured patch** — 返回 unified diff 格式
+- [x] **Read-first 校验** — 必须先 read 过该文件才能 edit
+- [x] **Mtime 防并发修改** — 检查文件 mtime 是否晚于 read 时间
+- [x] **原子写入** — `temp file + fs::rename`
+- [x] **Structured patch** — 返回 unified diff 格式
 - [ ] **LSP 通知占位** — 预留接口（Rust LSP 生态不成熟，可后补）
 - [ ] **Quote 规范化占位** — 处理弯引号/直引号混用（可后补）
 
 ---
 
-### T32: grep 增强（追平 Claude Code）
+### T32: grep 增强（追平 Claude Code）✅完成
 
 **验收标准**: 增加 head_limit+offset 分页、多输出模式（content/files/count）、VCS 目录自动排除。
 
 **参考源码**: `claude-code-main/tools/GrepTool/GrepTool.ts`
 
 子任务：
-- [ ] **head_limit + offset** — `rg --max-count` + 跳过 N 条
-- [ ] **多输出模式** — `files_with_matches`（已有）/ `content`（已有）/ `count`（新增）
-- [ ] **-B / -A 上下文** — 匹配行的前/后 N 行
-- [ ] **VCS 目录排除** — `.git`/`.svn`/`.hg`/`.sl` 自动排除
-- [ ] **文件类型过滤** — `--type js/py/rs`（rg --type）
+- [x] **head_limit + offset** — `rg --max-count` + 跳过 N 条
+- [x] **多输出模式** — `files_with_matches`（已有）/ `content`（已有）/ `count`（新增）
+- [x] **-B / -A 上下文** — 匹配行的前/后 N 行
+- [x] **VCS 目录排除** — `.git`/`.svn`/`.hg`/`.sl` 自动排除
+- [x] **文件类型过滤** — `--type js/py/rs`（rg --type）
 - [ ] **相对路径输出** — 显示相对于 cwd 的路径（节省 token）
 
 ---
 
-### T33: glob 增强（追平 Claude Code）
+### T33: glob 增强（追平 Claude Code）✅完成
 
 **验收标准**: 增加路径存在性验证、结果限制（100 条）。
 
 **参考源码**: `claude-code-main/tools/GlobTool/GlobTool.ts`
 
 子任务：
-- [ ] **路径存在性验证** — 指定 path 时检查目录是否存在
-- [ ] **结果限制** — 默认最多 100 条，避免大量结果
-- [ ] **按 mtime 排序** — 最近修改的文件排在前面
-- [ ] **相对路径输出** — 相对于 cwd 返回路径
+- [x] **路径存在性验证** — 指定 path 时检查目录是否存在
+- [x] **结果限制** — 默认最多 100 条，避免大量结果
+- [x] **按 mtime 排序** — 最近修改的文件排在前面
+- [x] **相对路径输出** — 相对于 cwd 返回路径
 
 ---
 
@@ -597,3 +597,54 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 | M9: Discord 接入 | T25, T26, T27 | Daemon 内嵌 Discord Client 模式 | ✅ |
 
 | M10 | 工具追平 Claude Code | T28-T33 | bash/grep/glob/read/write/edit 安全对齐 | 🔨 进行中 |
+
+---
+
+## NOVA v2 Phase 1: 物理防御层
+
+**日期**: 2026-04-19
+**状态**: ✅ T01-T06 已完成
+
+| ID | 任务 | 文件 | 状态 |
+|:--|:--|:--|:--|
+| T01 | 截断常量定义 | `nova-core/src/tools/constants.rs` | ✅ 完成 |
+| T02 | 截断函数实现 | `nova-core/src/tools/truncate.rs` | ✅ 完成 |
+| T03 | bash.rs I/O Shield 集成 | `nova-core/src/tools/bash.rs` | ✅ 完成 |
+| T04 | browser.rs I/O Shield 集成 | `nova-core/src/tools/browser.rs` | ✅ 完成 |
+| T05 | compact.rs 双层熔断机制 | `nova-core/src/token/compact.rs` | ✅ 完成 |
+| T06 | compact.rs JSON 结构化输出 | `nova-core/src/token/compact.rs` | ✅ 完成 |
+
+**v2 T01-T06 实现内容**:
+
+- **I/O Shield**: bash 输出 20k 字符上限（头 8k + 尾 8k + 警告），browser snapshot 15k 字符上限（头 5k + 尾 5k + 警告）
+- **双层熔断**: Graceful 模式（85-95% 水位）调用 LLM 生成 JSON 结构化摘要，Forceful 模式（>95%）直接丢弃旧消息
+- **JSON 容错**: `clean_json()` 函数去除 ```json 代码块包裹
+- **改造文件**: `bash.rs`, `browser.rs`, `compact.rs`, `loop.rs` (3 处调用点更新)
+- **新增文件**: `constants.rs`, `truncate.rs`
+- **测试**: 13 个单元测试全部通过，clippy 干净
+
+**v2 Phase 1.5: 话题状态机集成** (2026-04-20 完成)
+
+| ID | 任务 | 文件 | 状态 |
+|:--|:--|:--|:--|
+| T07 | TopicTracker 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
+| T08 | Daily notes 时间线格式 | `agent/loop.rs` | ✅ 完成 |
+| T09 | MEMORY.md 白板化集成 | `agent/loop.rs` | ✅ 完成 |
+
+**v2 Phase 2: 认知灵魂层** (2026-04-20 完成)
+
+| ID | 任务 | 文件 | 状态 |
+|:--|:--|:--|:--|
+| T10 | TensionTracker 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
+| T11 | ModeRouter 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
+| T12 | `<nova_os>` 思考管道 | `main.rs`, `discord.rs` | ✅ 完成 |
+| T13 | 主动/冷淡机制 | `mode_router.rs` | 🔨 逻辑已实现，待触发点设计 |
+
+**v2 Phase 3: 剩余工作**
+
+| ID | 任务 | 状态 |
+|:--|:--|:--|
+| T14 | E2E 集成测试 | ❌ 未开始 |
+| T15 | tiktoken 精确计数 | ❌ 未开始 |
+
+> **注**: Async 锁安全已于 2026-04-20 验证通过，`tokio::sync::RwLock` 已正确使用于 `topic_state.rs`、`memory_board.rs`、`mode_router.rs`、`tension_tracker.rs`。

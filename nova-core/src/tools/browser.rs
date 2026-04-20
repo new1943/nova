@@ -23,6 +23,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{info, warn};
 
 use crate::tools::registry::Tool;
+use crate::tools::truncate::truncate_browser;
 
 const CDP_PORT: u16 = 19222;
 
@@ -505,7 +506,15 @@ impl Tool for BrowserTool {
                     session.wait_event("Page.loadEventFired", 15).await.ok();
                     Ok(format!("Navigated to {}", url))
                 }
-                "snapshot" => session.eval_js(SNAPSHOT_JS).await,
+                "snapshot" => {
+                    let result = session.eval_js(SNAPSHOT_JS).await?;
+                    // I/O Shield: truncate超长页面内容
+                    let truncated = truncate_browser(&result);
+                    if truncated.len() < result.len() {
+                        tracing::warn!("browser snapshot truncated: {} -> {} chars", result.len(), truncated.len());
+                    }
+                    Ok(truncated)
+                }
                 "click" => {
                     let selector = args.get("selector").and_then(|v| v.as_str())
                         .ok_or_else(|| anyhow::anyhow!("click requires 'selector'"))?;

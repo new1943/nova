@@ -1,8 +1,8 @@
 # NOVA 智能体防爆与进化方案
 
-**版本**: v2.0
-**日期**: 2026-04-18
-**状态**: 设计阶段
+**版本**: v2.2
+**日期**: 2026-04-20
+**状态**: Phase 1 物理防御层 + Phase 1.5 + Phase 2 已完成，Phase 3 进行中
 
 > 基于白洁 Agent Pro 架构思想 + 物理防御策略的综合方案
 
@@ -20,36 +20,42 @@
 
 ## 已知风险（设计时遗漏，需开发时注意）
 
-| # | 问题 | 影响 | 优先级 |
-|:---|:---|:---|:---|
-| 1 | **Async Rust 锁陷阱** | 在 async 上下文中使用 `std::sync::RwLock` 会导致 Send 约束错误或死锁 | P0 |
-| 2 | **LLM JSON 解析的 Markdown 刺客** | LLM 用 ```json 包裹输出，直接解析会失败 | P0 |
-| 3 | **Token 计数精确度** | 字符估算（除以 4）在 95% 临界点误差可达数千 tokens | P0 |
-| 4 | **TUI 渲染拦截器缺失** | `<nova_os>` 标签会直接暴露在用户界面 | P1 |
+| # | 问题 | 影响 | 优先级 | 状态 |
+|:---|:---|:---|:---|:---|
+| 1 | **Async Rust 锁陷阱** | 在 async 上下文中使用 `std::sync::RwLock` 会导致 Send 约束错误或死锁 | P0 | ✅ 已修复 |
+| 2 | **LLM JSON 解析的 Markdown 刺客** | LLM 用 ```json 包裹输出，直接解析会失败 | P0 | ✅ 已修复 |
+| 3 | **Token 计数精确度** | 字符估算（除以 4）在 95% 临界点误差可达数千 tokens | P0 | ⚠️ 待处理 |
+| 4 | **TUI/Discord 渲染拦截器缺失** | `<nova_os>` 标签会直接暴露在用户界面 | P1 | ✅ 已修复 |
 
-### 风险 1：Async Rust 锁陷阱
+### 风险 1：Async Rust 锁陷阱 ✅ 已修复
 
 **问题**：在 `topic_state.rs`、`memory_board.rs`、`mode_router.rs` 中使用了 `RwLock`，在 async 上下文中跨越 `.await` 会导致编译错误或死锁。
 
 **解决方案**：使用 `tokio::sync::RwLock` 替代 `std::sync::RwLock`。
 
-### 风险 2：LLM JSON 解析的 Markdown 刺客
+**验证**：`cargo check --all-targets` 通过，`topic_state.rs`、`memory_board.rs`、`mode_router.rs`、`tension_tracker.rs` 均已使用 `tokio::sync::RwLock`。
+
+### 风险 2：LLM JSON 解析的 Markdown 刺客 ✅ 已修复
 
 **问题**：即便 Prompt 要求"只输出 JSON"，LLM 仍极大概率用 ```json 或 ``` 包裹内容。
 
 **解决方案**：在 `serde_json::from_str()` 前增加 `clean_json()` 清洗函数。
 
-### 风险 3：Token 计数精确度
+**验证**：`compact.rs` 中已实现 `clean_json()` 函数，Phase 1 v2 T06 已完成。
+
+### 风险 3：Token 计数精确度 ⚠️ 待处理
 
 **问题**：如果 `TokenBudget` 使用字符估算（`len() / 4`），在 95% 临界点误差可达数千 tokens。
 
 **解决方案**：集成 `tiktoken-rs` 进行精确计数。
 
-### 风险 4：TUI 渲染拦截器缺失
+### 风险 4：TUI/Discord 渲染拦截器缺失 ✅ 已修复
 
 **问题**：`prompt.rs` 输出的 `<nova_os>` 标签如果直接显示在 TUI，会暴露内部推演过程。
 
 **解决方案**：在 TUI 和 Discord 客户端增加正则拦截器过滤 `<nova_os>...</nova_os>`。
+
+**验证**：`nova-tui/src/ui.rs` 中 `filter_nova_os()` 在渲染消息时过滤，`nova-daemon/src/discord.rs` 中同样在发送消息前过滤。
 
 ---
 

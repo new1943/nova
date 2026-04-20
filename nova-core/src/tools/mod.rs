@@ -1,4 +1,6 @@
 pub mod registry;
+pub mod constants;
+pub mod truncate;
 pub mod bash;
 pub mod read_file;
 pub mod write_file;
@@ -7,6 +9,7 @@ pub mod glob;
 pub mod grep;
 pub mod browser;
 pub mod agentic_search;
+pub mod file_tracker;
 
 pub use registry::{Tool, ToolRegistry};
 pub use bash::BashTool;
@@ -17,3 +20,4 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use browser::BrowserTool;
 pub use agentic_search::AgenticSearchTool;
+pub use file_tracker::{FileReadTracker, create_shared_tracker, SharedFileReadTracker};

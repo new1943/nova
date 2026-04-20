@@ -2,12 +2,43 @@
 //!
 //! Writes to `~/.nova/memories/YYYY-MM-DD.md` in markdown format.
 //! System auto-writes here at Compact time and Session end.
+//!
+//! Supports two formats:
+//! - Legacy: `## HH:MM:SS — EntryType\n\n<content>\n`
+//! - Topic Timeline: `## HH:MM — TopicName [Status Icon]\n\n...details...\n`
 
 use anyhow::Result;
 use chrono::Local;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+
+use super::topic_state::TopicStatus;
+
+/// Status icon mapping
+fn status_icon(status: TopicStatus) -> &'static str {
+    match status {
+        TopicStatus::Started => "🟢 开始",
+        TopicStatus::Active => "🔵 进行中",
+        TopicStatus::Suspended => "🟡 挂起",
+        TopicStatus::Archived => "⚫ 已归档",
+    }
+}
+
+/// Topic timeline entry
+#[derive(Debug, Clone)]
+pub struct DiaryEntry {
+    /// Time (HH:MM:SS)
+    pub time: String,
+    /// Topic name
+    pub topic: String,
+    /// Topic status
+    pub status: TopicStatus,
+    /// Detailed description
+    pub description: Option<String>,
+    /// Key conclusions
+    pub conclusions: Vec<String>,
+}
 
 /// Daily notes manager — writes to `~/.nova/memories/YYYY-MM-DD.md`
 #[derive(Clone)]
@@ -48,6 +79,66 @@ impl DailyNotes {
         }
 
         writeln!(file, "## {} — {}\n\n{}\n", time, entry_type, content)?;
+        Ok(())
+    }
+
+    /// Append a topic timeline entry to today's daily note.
+    /// Format: `## HH:MM — TopicName [Status Icon]\n\n...details...\n`
+    pub fn append_topic_entry(&self, entry: &DiaryEntry) -> Result<()> {
+        fs::create_dir_all(&self.memories_dir)?;
+        let path = self.today_path();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+
+        // If this is a new file (new day), write the date header first
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if file_size == 0 {
+            writeln!(file, "# {}\n", date)?;
+        }
+
+        // Format the entry
+        let icon = status_icon(entry.status.clone());
+        let mut entry_text = format!("## {} — {} [{}]", entry.time, entry.topic, icon);
+
+        if !entry.conclusions.is_empty() {
+            entry_text.push_str("\n\n");
+            for conclusion in &entry.conclusions {
+                entry_text.push_str(&format!("- {}\n", conclusion));
+            }
+        }
+
+        if let Some(ref desc) = entry.description {
+            if !entry.conclusions.is_empty() {
+                entry_text.push_str(&format!("\n{}", desc));
+            } else {
+                entry_text.push_str(&format!("\n\n{}", desc));
+            }
+        }
+
+        writeln!(file, "{}\n", entry_text)?;
+        Ok(())
+    }
+
+    /// Append a Compact result as topic timeline entries.
+    /// Creates entries for all archived topics.
+    pub fn append_compact_topics(&self, archived_topics: &[String], active_summary: &str) -> Result<()> {
+        let time = Local::now().format("%H:%M:%S").to_string();
+
+        for topic in archived_topics {
+            let entry = DiaryEntry {
+                time: time.clone(),
+                topic: topic.clone(),
+                status: TopicStatus::Archived,
+                description: Some(format!("活跃摘要：{}", active_summary)),
+                conclusions: Vec::new(),
+            };
+            self.append_topic_entry(&entry)?;
+        }
+
         Ok(())
     }
 

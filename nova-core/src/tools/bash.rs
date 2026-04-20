@@ -5,6 +5,11 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::tools::registry::Tool;
+use crate::tools::truncate::truncate_bash;
+
+pub mod security;
+
+use security::validate_bash_command;
 
 /// Run mode for the bash tool
 #[derive(Debug, Clone, PartialEq)]
@@ -32,67 +37,68 @@ impl Default for BashTool {
     }
 }
 
-// Always blocked — catastrophic / destructive patterns
-const BLOCKED_PATTERNS: &[&str] = &[
-    "rm -rf /", "rm -rf /*", "rm -rf ~",
-    "mkfs", "dd if=",
-    ":(){ :|:& };:",
-    "shutdown", "reboot", "halt", "poweroff",
-    "mv / ", "cp /dev/null",
-];
-
-// Sandbox-only: allowed command whitelist
-const SANDBOX_ALLOWED: &[&str] = &[
-    "ls", "cat", "find", "head", "tail", "wc", "diff", "stat",
-    "echo", "pwd", "which", "env", "date", "whoami", "uname",
-    "grep", "rg", "ag", "sed", "awk", "sort", "uniq", "tr",
-    "file", "du", "df", "tree", "less", "more",
-    "git", "cargo", "rustc", "python", "python3", "node",
-    "mkdir", "touch", "cp", "mv", "rm",
-];
-
-// Blocked shell operators (both modes)
-const BLOCKED_OPERATORS: &[&str] = &[
-    "$(", "`",
-    "<(", ">(",
-];
-
 impl BashTool {
     fn validate(&self, command: &str) -> Result<()> {
-        let cmd_lower = command.to_lowercase();
-        let trimmed = cmd_lower.trim();
+        let lowered = command.to_lowercase();
+        let trimmed = lowered.trim();
 
         if trimmed.is_empty() {
             anyhow::bail!("Empty command");
         }
 
-        // Always block catastrophic patterns
-        for pat in BLOCKED_PATTERNS {
+        // Run security validations
+        if let Err(e) = validate_bash_command(command) {
+            anyhow::bail!("{}", e.message);
+        }
+
+        // Always block catastrophic patterns (override)
+        let blocked: &[&str] = &[
+            "rm -rf /",
+            "rm -rf /*",
+            "rm -rf ~",
+            "mkfs",
+            "dd if=",
+            ":(){ :|:& };:",
+            "shutdown",
+            "reboot",
+            "halt",
+            "poweroff",
+            "mv / ",
+            "cp /dev/null",
+        ];
+
+        for pat in blocked {
             if trimmed.contains(pat) {
                 anyhow::bail!("Blocked dangerous command pattern: {}", pat);
             }
         }
 
-        // Always block command/process substitution
-        for op in BLOCKED_OPERATORS {
+        // Always block command substitution (from security module)
+        let blocked_ops: &[&str] = &["$(", "`", "<(", ">("];
+        for op in blocked_ops {
             if command.contains(op) {
-                anyhow::bail!("Blocked operator: '{}' — not allowed", op);
+                // Check if it's properly quoted
+                let quoted_check = security::quote::QuoteState::extract_unquoted(command);
+                if quoted_check.1.contains(op) {
+                    // Unquoted - block
+                    anyhow::bail!("Blocked operator: '{}' — not allowed", op);
+                }
             }
         }
 
-        // .nova directory — no restrictions. Agent needs full access
-        // to memory files for reading and writing.
-
         // Always block privilege escalation
         let first_word = trimmed.split_whitespace().next().unwrap_or("");
-        if first_word == "sudo" || first_word == "su" || first_word == "doas" {
+        if first_word == "sudo"
+            || first_word == "su"
+            || first_word == "doas"
+        {
             anyhow::bail!("Blocked: privilege escalation not allowed");
         }
 
         // Sandbox mode: enforce command whitelist
         if self.mode == BashMode::Sandbox {
             let base_cmd = first_word.rsplit('/').next().unwrap_or(first_word);
-            if !SANDBOX_ALLOWED.contains(&base_cmd) {
+            if !security::constants::is_sandbox_allowed(base_cmd) {
                 anyhow::bail!(
                     "Sandbox mode: '{}' not in allowed list. Use mode = \"open\" in config to remove restrictions.",
                     base_cmd
@@ -102,17 +108,22 @@ impl BashTool {
 
         Ok(())
     }
-
 }
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &str { "bash" }
+    fn name(&self) -> &str {
+        "bash"
+    }
 
     fn description(&self) -> &str {
         match self.mode {
-            BashMode::Open => "Execute a bash command. Open mode: most commands allowed, only catastrophic patterns blocked.",
-            BashMode::Sandbox => "Execute a bash command. Sandbox mode: only whitelisted commands allowed.",
+            BashMode::Open => {
+                "Execute a bash command. Open mode: most commands allowed, only catastrophic patterns blocked."
+            }
+            BashMode::Sandbox => {
+                "Execute a bash command. Sandbox mode: only whitelisted commands allowed."
+            }
         }
     }
 
@@ -130,7 +141,8 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let command = args.get("command")
+        let command = args
+            .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' field"))?;
 
@@ -147,11 +159,27 @@ impl Tool for BashTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        if output.status.success() {
-            Ok(stdout.to_string())
+        let final_output = if output.status.success() {
+            stdout.to_string()
         } else {
-            Ok(format!("Exit code: {}\nstdout: {}\nstderr: {}",
-                output.status.code().unwrap_or(-1), stdout, stderr))
+            format!(
+                "Exit code: {}\nstdout: {}\nstderr: {}",
+                output.status.code().unwrap_or(-1),
+                stdout,
+                stderr
+            )
+        };
+
+        // I/O Shield: truncate超长输出
+        let truncated = truncate_bash(&final_output);
+        if truncated.len() < final_output.len() {
+            tracing::warn!(
+                "bash output truncated: {} -> {} chars",
+                final_output.len(),
+                truncated.len()
+            );
         }
+
+        Ok(truncated)
     }
 }

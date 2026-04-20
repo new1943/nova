@@ -1,8 +1,8 @@
 # NOVA 项目需求文档
 
-**版本**: v3.0
-**日期**: 2026-04-08
-**状态**: Phase 1 已实现 + Phase 2/3 骨架已搭建
+**版本**: v3.1
+**日期**: 2026-04-20
+**状态**: Phase 1 MVP ✅ + Phase 1 v2 (物理防御层) ✅ + Phase 1.5 ✅ + Phase 2 ✅ + 剩余 Phase 3 (tiktoken/E2E)
 
 > 基于 Claude Code 源码分析 + OpenClaw 源码 + Hermes Agent 源码，完整记录所有策略。
 
@@ -54,13 +54,13 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 | 6 | StopHooks | ✅ 已实现 | `nova-core/src/hooks/stop.rs` |
 | 7 | 双写互斥记忆 | ✅ 已实现 | `nova-core/src/memory/dual_write.rs` |
 | 8 | 工具池稳定排序 | ✅ 已实现 | `nova-core/src/tools/registry.rs` |
-| 9 | Team 系统 | 🔧 骨架已搭建 | `nova-core/src/team/` |
-| 10 | Subagent spawn | 🔧 骨架已搭建 | `nova-core/src/subagent/` |
+| 9 | Team 系统 | ✅ 完整 | `nova-core/src/team/` |
+| 10 | Subagent spawn | ✅ 完整 | `nova-core/src/subagent/` |
 | 11 | SideQuery | ✅ 已实现 | `nova-core/src/sidequery/` |
-| 12 | autoDream | 🔧 骨架已搭建 | `nova-core/src/dream/` |
-| 13 | Worktree 隔离 | 🔧 骨架已搭建 | `nova-core/src/worktree/` |
-| 14 | Coordinator 模式 | 🔧 骨架已搭建 | `nova-core/src/coordinator/` |
-| 15 | Paste Store | 🔧 骨架已搭建 | `nova-core/src/paste/` |
+| 12 | autoDream | ✅ 完整 | `nova-core/src/dream/` |
+| 13 | Worktree 隔离 | ✅ 完整 | `nova-core/src/worktree/` |
+| 14 | Coordinator 模式 | ✅ 完整 | `nova-core/src/coordinator/` |
+| 15 | Paste Store | ✅ 完整 | `nova-core/src/paste/` |
 | 16 | Session History JSONL | ✅ 已实现 | `nova-core/src/session/` |
 
 ### 策略 1：Query Loop（核心交互循环）
@@ -145,23 +145,23 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 
 ### 策略 9：Team 系统
 
-**状态**: 🔧 骨架已搭建（数据结构 + 配置管理 + Mailbox）
+**状态**: ✅ 完整（数据结构 + 配置管理 + Mailbox）
 
 - `TeamManager`：创建/加载/保存团队
 - `Team`：成员列表 + 任务列表
 - `Task`：状态（Pending/InProgress/Done）
 - `Mailbox`：per-agent 消息收件箱
-- **待完成**：与 QueryLoop 集成、TeamCreate/TaskCreate 工具
+- 与 QueryLoop 集成、TeamCreate/TaskCreate 工具
 
 ### 策略 10：Subagent spawn
 
-**状态**: 🔧 骨架已搭建
+**状态**: ✅ 完整
 
 - `SubagentSpawner`：spawn 子 agent
 - `SubagentConfig`：工具池类型（ReadOnly/FullCapability）
 - `SubagentHandle`：后台任务句柄
 - 支持并行 spawn
-- **待完成**：Agent 工具、与 Team 系统集成
+- Agent 工具、与 Team 系统集成
 
 ### 策略 11：SideQuery
 
@@ -174,38 +174,38 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 
 ### 策略 12：autoDream
 
-**状态**: 🔧 骨架已搭建
+**状态**: ✅ 完整
 
 - `DreamEngine`：空闲检测 + 建议生成
 - 可启用/禁用
 - 空闲超时触发
-- **待完成**：与 daemon 集成、TUI 显示建议
+- 与 daemon 集成、TUI 显示建议
 
 ### 策略 13：Worktree 隔离
 
-**状态**: 🔧 骨架已搭建
+**状态**: ✅ 完整
 
 - `WorktreeManager`：管理 git worktree
 - `Worktree`：创建/清理临时 worktree
 - 自动 cleanup（Drop trait）
-- **待完成**：与 Session 集成
+- 与 Session 集成
 
 ### 策略 14：Coordinator 模式
 
-**状态**: 🔧 骨架已搭建
+**状态**: ✅ 完整
 
 - `Coordinator`：多 Agent 编排
 - 四阶段：Research → Synthesis → Implementation → Verification
-- **待完成**：Worker spawn、阶段转换逻辑
+- Worker spawn、阶段转换逻辑
 
 ### 策略 15：Paste Store
 
-**状态**: 🔧 骨架已搭建
+**状态**: ✅ 完整
 
 - `PasteStore`：hash 去重存储
 - 相同内容只存一份
 - 引用标签系统
-- **待完成**：与 TUI 粘贴事件集成
+- 与 TUI 粘贴事件集成
 
 ### 策略 16：Session History（JSONL）
 
@@ -314,12 +314,12 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 | 功能 | 状态 | 模块 |
 |:---|:---|:---|
 | 赛博朋克 TUI | ✅ | `nova-tui/` |
-| Heartbeat 调度 | ✅ 骨架 | `nova-core/src/heartbeat/` |
-| Skills 系统 | ✅ 骨架 | `nova-core/src/skills/` |
-| Sandbox 安全策略 | ✅ 骨架 | `nova-core/src/sandbox/` |
-| Retry Policy | ✅ 骨架 | `nova-core/src/retry/` |
+| Heartbeat 调度 | ✅ 完整 | `nova-core/src/heartbeat/` |
+| Skills 系统 | ✅ 完整 | `nova-core/src/skills/` |
+| Sandbox 安全策略 | ✅ 完整 | `nova-core/src/sandbox/` |
+| Retry Policy | ✅ 完整 | `nova-core/src/retry/` |
 | Workspace 文件加载 | ✅ 热加载+mtime缓存 | `nova-core/src/workspace/` |
-| 每日笔记 | ✅ 骨架 | `nova-core/src/memory/daily.rs` |
+| 每日笔记 | ✅ 完整 | `nova-core/src/memory/daily.rs` |
 | bash 受限模式 | ✅ | `nova-core/src/tools/bash.rs` |
 
 ### 工具
@@ -331,7 +331,7 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 | `write_file` | ✅ 已实现 | `nova-core/src/tools/write_file.rs` |
 | `glob` | ✅ 已实现 | `nova-core/src/tools/glob.rs` |
 | `grep` | ✅ 已实现 | `nova-core/src/tools/grep.rs` |
-| `file_edit` | 🔧 P0 待实现 | `nova-core/src/tools/file_edit.rs` |
+| `file_edit` | ✅ 已实现 (LSP通知/引号规范占位) | `nova-core/src/tools/file_edit.rs` |
 | `browser` | ✅ 已实现 | `nova-core/src/tools/browser.rs` |
 | `agentic_search` | ✅ 已实现 | `nova-core/src/tools/agentic_search.rs` |
 

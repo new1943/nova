@@ -20,6 +20,77 @@ use nova_core::workspace::BootstrapLoader;
 
 use crate::{HandleConfig, tool_descriptions, make_hooks, record_memory_mtime};
 
+/// Filter `<nova_os>...</nova_os>` blocks from content before sending to Discord.
+/// This prevents internal reasoning tags from being exposed to users.
+fn filter_nova_os(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut search_start = 0;
+
+    while let Some(start) = content[search_start..].find("<nova_os>") {
+        let absolute_start = search_start + start;
+        result.push_str(&content[search_start..absolute_start]);
+
+        if let Some(end) = content[absolute_start..].find("</nova_os>") {
+            search_start = absolute_start + end + "</nova_os>".len();
+        } else {
+            break;
+        }
+    }
+
+    result.push_str(&content[search_start..]);
+    result
+}
+
+/// v2 Phase 2: Build <nova_os> thinking pipe section for Discord system prompt.
+async fn discord_build_nova_os_section(
+    mode_router: Arc<tokio::sync::RwLock<nova_core::memory::ModeRouter>>,
+    tension_tracker: Arc<nova_core::memory::TensionTracker>,
+    topic_tracker: Arc<tokio::sync::RwLock<nova_core::memory::TopicTracker>>,
+) -> String {
+    use nova_core::memory::Mode;
+
+    let mode = mode_router.read().await.current_mode().await;
+    let tension = tension_tracker.current_tension().await;
+    let current_topic = topic_tracker.read().await.current_topic().await;
+
+    let topic_name = current_topic
+        .as_ref()
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| "（无进行中话题）".to_string());
+
+    let topic_status = current_topic
+        .as_ref()
+        .map(|t| match t.status {
+            nova_core::memory::TopicStatus::Started => "开始",
+            nova_core::memory::TopicStatus::Active => "活跃",
+            nova_core::memory::TopicStatus::Suspended => "挂起",
+            nova_core::memory::TopicStatus::Archived => "归档",
+        })
+        .unwrap_or("无");
+
+    let mode_str = match mode {
+        Mode::Normal => "Normal",
+        Mode::SoftIntimate => "SoftIntimate",
+        Mode::HighIntimate => "HighIntimate",
+        Mode::Cooling => "Cooling",
+    };
+
+    format!(r#"<nova_os>
+## 话题生命周期
+当前话题：{} [{}]
+
+## 用户状态
+张力值：{}/100
+模式：{}
+
+## 响应策略
+根据上述状态，决定：
+1. 回复长度（短句/中句/长句）
+2. 语气风格（简洁/温和/关怀）
+3. 是否需要触发主动机制
+</nova_os>"#, topic_name, topic_status, tension, mode_str)
+}
+
 struct DiscordHandler {
     cfg: Arc<HandleConfig>,
     // Mutex to prevent concurrent processing in the same channel
@@ -118,6 +189,16 @@ async fn process_discord_message(
         consolidate_sq,
     ));
 
+    // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
+    let tension_tracker = std::sync::Arc::new(nova_core::memory::TensionTracker::new());
+    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::TopicTracker::new()));
+    let mode_router = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::ModeRouter::new(
+        tension_tracker.clone(),
+    )));
+    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::MemoryBoard::new(
+        workspace_dir.join("MEMORY.md"),
+    )));
+
     let mut session = match session_mgr.resume_by_id(&session_id)? {
         Some(s) => s,
         None => {
@@ -165,6 +246,17 @@ async fn process_discord_message(
 
     let mut sp = bootstrap.lock().await.build_system_prompt(&tool_desc);
 
+    // v2 Phase 2: Inject <nova_os> thinking pipe hints
+    let nova_os = discord_build_nova_os_section(
+        mode_router.clone(),
+        tension_tracker.clone(),
+        topic_tracker.clone(),
+    ).await;
+    if !nova_os.is_empty() {
+        sp.push_str("\n\n---\n\n");
+        sp.push_str(&nova_os);
+    }
+
     // Context Search
     if content.chars().count() > 5 {
         let sq = SideQuery::new(
@@ -210,11 +302,15 @@ async fn process_discord_message(
     let session_clone = session.clone();
     let tools_clone = tools.clone();
     let cons = consolidator.clone();
+    let tt = topic_tracker.clone();
+    let tens = tension_tracker.clone();
+    let mr = mode_router.clone();
+    let mb = memory_board.clone();
 
     let loop_handle = tokio::spawn(async move {
         let hooks = make_hooks();
         let cons_inner = Arc::try_unwrap(cons).unwrap_or_else(|arc| (*arc).clone());
-        let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner));
+        let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner), Some(tt), Some(tens), Some(mr), Some(mb));
         let mut s = session_clone;
         s.turn_count = 0;
         let result = ql.run_turn(s.clone(), &sp, event_tx).await;
@@ -235,17 +331,20 @@ async fn process_discord_message(
             LoopEvent::TextDelta(t) => {
                 text_buffer.push_str(&t);
                 if last_update.elapsed().as_secs() >= 2 && !text_buffer.is_empty() {
-                    let builder = EditMessage::new().content(format!("{}...", text_buffer));
+                    let display = filter_nova_os(&text_buffer);
+                    let builder = EditMessage::new().content(format!("{}...", display));
                     let _ = reply_msg.edit(&ctx.http, builder).await;
                     last_update = tokio::time::Instant::now();
                 }
             }
             LoopEvent::ToolCallStart { name, .. } => {
-                let builder = EditMessage::new().content(format!("{}...\n\n🛠️ Running tool: `{}`", text_buffer, name));
+                let display = filter_nova_os(&text_buffer);
+                let builder = EditMessage::new().content(format!("{}...\n\n🛠️ Running tool: `{}`", display, name));
                 let _ = reply_msg.edit(&ctx.http, builder).await;
             }
             LoopEvent::Error(e) => {
-                let builder = EditMessage::new().content(format!("{}...\n\n❌ Error: {}", text_buffer, e));
+                let display = filter_nova_os(&text_buffer);
+                let builder = EditMessage::new().content(format!("{}...\n\n❌ Error: {}", display, e));
                 let _ = reply_msg.edit(&ctx.http, builder).await;
             }
             _ => {}
@@ -284,13 +383,14 @@ async fn process_discord_message(
     if text_buffer.is_empty() {
         text_buffer = "Done.".into();
     }
-    
-    if text_buffer.chars().count() > 1950 {
-        let trunc_text = text_buffer.chars().take(1950).collect::<String>() + "\n...(truncated)";
+
+    let display = filter_nova_os(&text_buffer);
+    if display.chars().count() > 1950 {
+        let trunc_text = display.chars().take(1950).collect::<String>() + "\n...(truncated)";
         let builder = EditMessage::new().content(trunc_text);
         let _ = reply_msg.edit(&ctx.http, builder).await;
     } else {
-        let builder = EditMessage::new().content(&text_buffer);
+        let builder = EditMessage::new().content(&display);
         let _ = reply_msg.edit(&ctx.http, builder).await;
     }
 

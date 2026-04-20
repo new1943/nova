@@ -8,6 +8,28 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, DisplayRole, Focus};
 use crate::theme::Theme;
 
+/// Filter `<nova_os>...</nova_os>` blocks from content before rendering.
+/// This prevents internal reasoning tags from being exposed to the user.
+fn filter_nova_os(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut search_start = 0;
+
+    while let Some(start) = content[search_start..].find("<nova_os>") {
+        let absolute_start = search_start + start;
+        result.push_str(&content[search_start..absolute_start]);
+
+        if let Some(end) = content[absolute_start..].find("</nova_os>") {
+            search_start = absolute_start + end + "</nova_os>".len();
+        } else {
+            // Unclosed tag — remove from start to end of string
+            break;
+        }
+    }
+
+    result.push_str(&content[search_start..]);
+    result
+}
+
 pub fn render(f: &mut Frame, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -107,7 +129,9 @@ fn render_chat_panel(f: &mut Frame, app: &mut App, area: Rect) {
                 physical_lines.push(PhysicalLine::styled("  ▍", Theme::ASSISTANT_MSG, false));
             }
         } else {
-            for line in msg.content.lines() {
+            // Filter out <nova_os>...</nova_os> internal reasoning tags
+            let filtered = filter_nova_os(&msg.content);
+            for line in filtered.lines() {
                 let indented = format!("  {}", line);
                 // Wrap this line manually into inner_width chunks
                 wrap_line_into(&indented, inner_width, Theme::TEXT, &mut physical_lines);

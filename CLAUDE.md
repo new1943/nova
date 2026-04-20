@@ -63,7 +63,7 @@ nova-ipc →──────────→ nova-tui
 5. Applies hooks at post-sampling and stop points
 6. Manages token budget and compact triggers
 
-**Tool Registration**: Tools implement the `Tool` trait and register via `ToolRegistry::register_builtin()`. Built-in tools (bash, read_file, write_file, glob, grep, browser, agentic_search) are registered in `nova-daemon/src/main.rs::make_tools()`.
+**Tool Registration**: Tools implement the `Tool` trait and register via `ToolRegistry::register_builtin()`. Built-in tools (bash, read_file, write_file, file_edit, glob, grep, browser, agentic_search) are registered in `nova-daemon/src/main.rs::make_tools()`.
 
 **IPC Protocol**: `nova-ipc` uses JSON lines over Unix Domain Socket. Request/Event enums in `nova-ipc/src/protocol.rs` define the wire format.
 
@@ -85,24 +85,35 @@ Workspace directory: `~/.nova/` containing:
 
 ## Claude Code 16 Strategy Implementation
 
-| # | Strategy | Module |
-|:--|:--|:--|
-| 1 | Query Loop | `agent/loop.rs` |
-| 2 | Token Budget | `token/budget.rs` |
-| 3 | Compact | `token/compact.rs` |
-| 4 | Forked Agent | `agent/forked.rs` |
-| 5 | PostSampling Hooks | `hooks/post_sampling.rs` |
-| 6 | StopHooks | `hooks/stop.rs` |
-| 7 | Dual-Write Memory | `memory/dual_write.rs` |
-| 8 | Tool Pool Stable Sort | `tools/registry.rs` |
-| 9 | Team | `team/` (skeleton) |
-| 10 | Subagent spawn | `subagent/` (skeleton) |
-| 11 | SideQuery | `sidequery/query.rs` |
-| 12 | autoDream | `dream/engine.rs` (skeleton) |
-| 13 | Worktree | `worktree/` (skeleton) |
-| 14 | Coordinator | `coordinator/` (skeleton) |
-| 15 | Paste Store | `paste/` (skeleton) |
-| 16 | Session JSONL | `session/` |
+| # | Strategy | Module | Status |
+|:--|:--|:--|:--|
+| 1 | Query Loop | `agent/loop.rs` | ✅ 完整（含 v2 tracker 集成） |
+| 2 | Token Budget | `token/budget.rs` | ✅ 完整 |
+| 3 | Compact | `token/compact.rs` | ✅ 完整（双层熔断 + JSON 结构化） |
+| 4 | Forked Agent | `agent/forked.rs` | ✅ 完整 |
+| 5 | PostSampling Hooks | `hooks/post_sampling.rs` | ✅ 完整 |
+| 6 | StopHooks | `hooks/stop.rs` | ✅ 完整 |
+| 7 | Dual-Write Memory | `memory/dual_write.rs` | ✅ 完整 |
+| 8 | Tool Pool Stable Sort | `tools/registry.rs` | ✅ 完整 |
+| 9 | Team | `team/` | ✅ 完整（CRUD + 持久化） |
+| 10 | Subagent spawn | `subagent/` | ✅ 完整（spawn + 并行） |
+| 11 | SideQuery | `sidequery/query.rs` | ✅ 完整 |
+| 12 | autoDream | `dream/engine.rs` | ✅ 完整（空闲检测 + 建议） |
+| 13 | Worktree | `worktree/isolate.rs` | ✅ 完整（git worktree 管理） |
+| 14 | Coordinator | `coordinator/orchestrator.rs` | ✅ 完整（4 阶段流水线） |
+| 15 | Paste Store | `paste/store.rs` | ✅ 完整（hash 去重） |
+| 16 | Session JSONL | `session/` | ✅ 完整 |
+
+## NOVA v2 新增模块
+
+| 模块 | 文件 | 说明 |
+|:---|:---|:---|
+| TopicTracker | `memory/topic_state.rs` | 话题状态机：Started → Active → Suspended → Archived |
+| TensionTracker | `memory/tension_tracker.rs` | 张力值追踪：情绪/疲劳/意图检测 |
+| ModeRouter | `memory/mode_router.rs` | 模式路由：Normal / SoftIntimate / HighIntimate / Cooling |
+| MemoryBoard | `memory/memory_board.rs` | MEMORY.md 白板管理 |
+| I/O Shield | `tools/constants.rs`, `tools/truncate.rs` | 工具输出物理截断 |
+| `<nova_os>` | `daemon/main.rs`, `discord.rs` | 思考管道注入（过滤后不暴露给用户） |
 
 ## Running the Application
 
@@ -120,3 +131,8 @@ Workspace directory: `~/.nova/` containing:
 ## Discord Integration
 
 The daemon embeds a Discord gateway as a tokio Task when `discord_enabled=true` and `DISCORD_TOKEN` is set. TUI and Discord share the same daemon session management.
+
+**v2 增强**：
+- `<nova_os>` 标签在发送消息前自动过滤，不会暴露给 Discord 用户
+- 集成 TopicTracker、TensionTracker、ModeRouter（通过 QueryLoop）
+- MemoryBoard 自动更新归档话题和偏好

@@ -16,7 +16,7 @@ use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::SideQuery;
 use nova_core::skills::SkillsLoader;
-use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgenticSearchTool};
+use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgenticSearchTool, create_shared_tracker};
 use nova_core::tools::bash::{BashTool, BashMode};
 use nova_core::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
@@ -117,6 +117,7 @@ fn make_tools(
     browser_headless: bool,
     side_query: SideQuery,
     session_manager: SessionManager,
+    file_tracker: nova_core::tools::SharedFileReadTracker,
 ) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
@@ -124,9 +125,9 @@ fn make_tools(
     };
     let mut tools = ToolRegistry::new();
     tools.register_builtin(Box::new(BashTool::new(bash_mode)));
-    tools.register_builtin(Box::new(ReadFileTool));
-    tools.register_builtin(Box::new(WriteFileTool));
-    tools.register_builtin(Box::new(FileEditTool));
+    tools.register_builtin(Box::new(ReadFileTool::new(file_tracker.clone())));
+    tools.register_builtin(Box::new(WriteFileTool::new(file_tracker.clone())));
+    tools.register_builtin(Box::new(FileEditTool::new(file_tracker.clone())));
     tools.register_builtin(Box::new(GlobTool));
     tools.register_builtin(Box::new(GrepTool));
 
@@ -190,6 +191,9 @@ async fn run_daemon() -> Result<()> {
     let server = IpcServer::bind(SOCKET_PATH.as_ref()).await?;
     info!("Listening on {}", SOCKET_PATH);
 
+    // Create shared file tracker for read-first safety
+    let file_tracker = create_shared_tracker();
+
     if config.discord_enabled {
         if let Some(token) = config.discord_token.clone() {
             let tools_dc = Arc::new(make_tools(
@@ -199,6 +203,7 @@ async fn run_daemon() -> Result<()> {
                 config.browser_headless.unwrap_or(true),
                 SideQuery::new(loop_config.api_key.clone(), loop_config.api_base_url.clone(), loop_config.model.clone()),
                 SessionManager::new(config.workspace.join("sessions")),
+                file_tracker.clone(),
             ));
             let dc_cfg = Arc::new(HandleConfig {
                 workspace_dir: config.workspace.clone(),
@@ -242,6 +247,7 @@ async fn run_daemon() -> Result<()> {
                     config.browser_headless.unwrap_or(true),
                     sq_for_tools,
                     sm_for_tools,
+                    file_tracker.clone(),
                 ));
                 tokio::spawn(async move {
                     let cfg = HandleConfig {
@@ -320,6 +326,16 @@ async fn handle_connection(
         consolidate_sq,
     ));
 
+    // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
+    let tension_tracker = std::sync::Arc::new(nova_core::memory::TensionTracker::new());
+    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::TopicTracker::new()));
+    let mode_router = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::ModeRouter::new(
+        tension_tracker.clone(),
+    )));
+    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::MemoryBoard::new(
+        workspace_dir.join("MEMORY.md"),
+    )));
+
     let mut session = match session_mgr.resume_latest()? {
         Some(s) => {
             conn.send_event(&Event::SessionRestored {
@@ -396,6 +412,17 @@ async fn handle_connection(
                 // Hot-reload system prompt from workspace files (mtime cached)
                 let mut sp = bootstrap.lock().await.build_system_prompt(&tool_desc);
 
+                // v2 Phase 2: Inject <nova_os> thinking pipe hints into system prompt
+                let nova_os = build_nova_os_section(
+                    mode_router.clone(),
+                    tension_tracker.clone(),
+                    topic_tracker.clone(),
+                ).await;
+                if !nova_os.is_empty() {
+                    sp.push_str("\n\n---\n\n");
+                    sp.push_str(&nova_os);
+                }
+
                 // Auto-search: inject relevant history session context
                 if content.chars().count() > 5 {
                     let sq = SideQuery::new(
@@ -456,6 +483,10 @@ async fn handle_connection(
                 let session_clone = session.clone();
                 let tools_clone = tools.clone();
                 let cons = consolidator.clone();
+                let tt = topic_tracker.clone();
+                let tens = tension_tracker.clone();
+                let mr = mode_router.clone();
+                let mb = memory_board.clone();
 
                 let loop_handle = tokio::spawn(async move {
                     let hooks = make_hooks();
@@ -464,6 +495,7 @@ async fn handle_connection(
                     let ql = QueryLoop::new(
                         tools_clone, hooks, lc, Some(dn), Some(sq_loop),
                         Some(cons_inner),
+                        Some(tt), Some(tens), Some(mr), Some(mb),
                     );
                     let mut s = session_clone;
                     s.turn_count = 0;
@@ -739,4 +771,55 @@ pub async fn write_session_diary(
     daily.append_session(&final_summary)?;
     info!("Session diary written: {} chars ({} map chunks)", final_summary.len(), map_results.len());
     Ok(())
+}
+
+/// v2 Phase 2: Build <nova_os> thinking pipe section for system prompt injection.
+/// Reads current mode and tension from trackers and formats them as <nova_os> XML block.
+async fn build_nova_os_section(
+    mode_router: std::sync::Arc<tokio::sync::RwLock<nova_core::memory::ModeRouter>>,
+    tension_tracker: std::sync::Arc<nova_core::memory::TensionTracker>,
+    topic_tracker: std::sync::Arc<tokio::sync::RwLock<nova_core::memory::TopicTracker>>,
+) -> String {
+    use nova_core::memory::Mode;
+
+    let mode = mode_router.read().await.current_mode().await;
+    let tension = tension_tracker.current_tension().await;
+    let current_topic = topic_tracker.read().await.current_topic().await;
+
+    let topic_name = current_topic
+        .as_ref()
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| "（无进行中话题）".to_string());
+
+    let topic_status = current_topic
+        .as_ref()
+        .map(|t| match t.status {
+            nova_core::memory::TopicStatus::Started => "开始",
+            nova_core::memory::TopicStatus::Active => "活跃",
+            nova_core::memory::TopicStatus::Suspended => "挂起",
+            nova_core::memory::TopicStatus::Archived => "归档",
+        })
+        .unwrap_or("无");
+
+    let mode_str = match mode {
+        Mode::Normal => "Normal",
+        Mode::SoftIntimate => "SoftIntimate",
+        Mode::HighIntimate => "HighIntimate",
+        Mode::Cooling => "Cooling",
+    };
+
+    format!(r#"<nova_os>
+## 话题生命周期
+当前话题：{} [{}]
+
+## 用户状态
+张力值：{}/100
+模式：{}
+
+## 响应策略
+根据上述状态，决定：
+1. 回复长度（短句/中句/长句）
+2. 语气风格（简洁/温和/关怀）
+3. 是否需要触发主动机制
+</nova_os>"#, topic_name, topic_status, tension, mode_str)
 }

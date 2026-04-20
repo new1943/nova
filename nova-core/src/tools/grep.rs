@@ -12,6 +12,34 @@ pub struct GrepTool;
 
 const MAX_RESULTS: usize = 200;
 
+/// VCS directories to exclude by default
+const VCS_DIRS: &[&str] = &["--glob", "!.git/", "--glob", "!.svn/", "--glob", "!.hg/", "--glob", "!.sl/"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum OutputMode {
+    #[default]
+    Content,
+    Files,
+    Count,
+}
+
+/// Configuration for grep execution
+#[derive(Debug, Clone)]
+struct GrepConfig<'a> {
+    pattern: &'a str,
+    path: &'a str,
+    glob: Option<&'a str>,
+    context: u32,
+    case_insensitive: bool,
+    output_mode: OutputMode,
+    head_limit: Option<usize>,
+    offset: Option<usize>,
+    file_type: Option<&'a str>,
+    before_context: u32,
+    after_context: u32,
+    cwd: Option<&'a str>,
+}
+
 impl GrepTool {
     /// Check if ripgrep is available
     async fn has_rg() -> bool {
@@ -25,24 +53,64 @@ impl GrepTool {
             .unwrap_or(false)
     }
 
-    async fn run_rg(pattern: &str, path: &str, glob: Option<&str>, context: u32, case_insensitive: bool) -> Result<String> {
+    async fn run_rg(&self, config: GrepConfig<'_>) -> Result<String> {
         let mut cmd = Command::new("rg");
-        cmd.arg("--no-heading")
-           .arg("--line-number")
-           .arg("--color=never")
-           .arg("--max-count=50");  // max matches per file
+        cmd.arg("--no-heading");
 
-        if case_insensitive {
+        match config.output_mode {
+            OutputMode::Content => {
+                cmd.arg("--line-number").arg("--color=never");
+            }
+            OutputMode::Files => {
+                cmd.arg("-l");
+            }
+            OutputMode::Count => {
+                cmd.arg("-c");
+            }
+        }
+
+        // VCS exclusions
+        for vcs in VCS_DIRS {
+            cmd.arg(vcs);
+        }
+
+        if config.case_insensitive {
             cmd.arg("-i");
         }
-        if context > 0 {
-            cmd.arg("-C").arg(context.to_string());
+
+        // Context lines
+        if config.context > 0 {
+            cmd.arg("-C").arg(config.context.to_string());
         }
-        if let Some(g) = glob {
+
+        // Before/After context
+        if config.before_context > 0 {
+            cmd.arg("-B").arg(config.before_context.to_string());
+        }
+        if config.after_context > 0 {
+            cmd.arg("-A").arg(config.after_context.to_string());
+        }
+
+        // Glob filter
+        if let Some(g) = config.glob {
             cmd.arg("--glob").arg(g);
         }
 
-        cmd.arg("--").arg(pattern).arg(path);
+        // File type filter
+        if let Some(t) = config.file_type {
+            cmd.arg("--type").arg(t);
+        }
+
+        // Head limit
+        if let Some(limit) = config.head_limit {
+            cmd.arg("--max-count").arg(limit.to_string());
+        }
+
+        if let Some(c) = config.cwd {
+            cmd.current_dir(c);
+        }
+
+        cmd.arg("--").arg(config.pattern).arg(config.path);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.output().await?;
@@ -52,17 +120,40 @@ impl GrepTool {
             return Ok("No matches found.".into());
         }
 
-        // Truncate to MAX_RESULTS lines
-        let lines: Vec<&str> = stdout.lines().collect();
-        if lines.len() > MAX_RESULTS {
-            let truncated: String = lines[..MAX_RESULTS].join("\n");
-            Ok(format!("{}\n\n... ({} more lines, showing first {})", truncated, lines.len() - MAX_RESULTS, MAX_RESULTS))
+        // Apply offset if specified (skip first N lines)
+        let final_output = if let Some(off) = config.offset {
+            let lines: Vec<&str> = stdout.lines().collect();
+            if off < lines.len() {
+                lines[off..].join("\n")
+            } else {
+                String::new()
+            }
         } else {
-            Ok(stdout.to_string())
+            stdout.to_string()
+        };
+
+        if final_output.is_empty() {
+            return Ok("No matches found.".into());
         }
+
+        // For content mode, truncate to MAX_RESULTS
+        if config.output_mode == OutputMode::Content {
+            let lines: Vec<&str> = final_output.lines().collect();
+            if lines.len() > MAX_RESULTS {
+                let truncated: String = lines[..MAX_RESULTS].join("\n");
+                return Ok(format!("{}\n\n... ({} more lines, showing first {})", truncated, lines.len() - MAX_RESULTS, MAX_RESULTS));
+            }
+        }
+
+        Ok(final_output)
     }
 
-    async fn run_grep_fallback(pattern: &str, path: &str, case_insensitive: bool) -> Result<String> {
+    async fn run_grep_fallback(
+        pattern: &str,
+        path: &str,
+        case_insensitive: bool,
+        head_limit: Option<usize>,
+    ) -> Result<String> {
         let mut cmd = Command::new("grep");
         cmd.arg("-rn").arg("--color=never");
         if case_insensitive {
@@ -79,11 +170,39 @@ impl GrepTool {
         }
 
         let lines: Vec<&str> = stdout.lines().collect();
-        if lines.len() > MAX_RESULTS {
-            let truncated: String = lines[..MAX_RESULTS].join("\n");
-            Ok(format!("{}\n\n... ({} more lines)", truncated, lines.len() - MAX_RESULTS))
+
+        // Apply head limit
+        let final_lines = if let Some(limit) = head_limit {
+            if limit < lines.len() {
+                &lines[..limit]
+            } else {
+                &lines
+            }
+        } else if lines.len() > MAX_RESULTS {
+            &lines[..MAX_RESULTS]
         } else {
-            Ok(stdout.to_string())
+            &lines
+        };
+
+        if final_lines.is_empty() {
+            return Ok("No matches found.".into());
+        }
+
+        let result = final_lines.join("\n");
+
+        if lines.len() > MAX_RESULTS || (head_limit.is_some() && head_limit.unwrap() < lines.len()) {
+            let shown = head_limit.unwrap_or(MAX_RESULTS).min(MAX_RESULTS);
+            return Ok(format!("{}\n\n... ({} more lines)", result, lines.len() - shown));
+        }
+
+        Ok(result)
+    }
+
+    fn parse_output_mode(mode: Option<&str>) -> OutputMode {
+        match mode {
+            Some("files") | Some("files_with_matches") => OutputMode::Files,
+            Some("count") => OutputMode::Count,
+            _ => OutputMode::Content,
         }
     }
 }
@@ -93,7 +212,9 @@ impl Tool for GrepTool {
     fn name(&self) -> &str { "grep" }
 
     fn description(&self) -> &str {
-        "Search file contents using regex patterns. Uses ripgrep (rg) for fast search. Supports glob filtering, context lines, and case-insensitive search."
+        "Search file contents using regex patterns. Uses ripgrep (rg) for fast search. \
+         Supports glob filtering, context lines, case-insensitive search, VCS directory exclusion, \
+         head/offset pagination, multiple output modes (content/files/count), and file type filtering."
     }
 
     fn input_schema(&self) -> Value {
@@ -119,6 +240,35 @@ impl Tool for GrepTool {
                 "case_insensitive": {
                     "type": "boolean",
                     "description": "Case insensitive search (default: false)"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files", "count"],
+                    "description": "Output mode: 'content' (default), 'files' (file names only), 'count' (line counts per file)"
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "description": "Maximum number of matches to return (default: 200)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Skip first N matches (pagination offset, default: 0)"
+                },
+                "file_type": {
+                    "type": "string",
+                    "description": "Filter by file type: 'js', 'ts', 'py', 'rs', 'go', 'java', etc. (rg --type)"
+                },
+                "before_context": {
+                    "type": "integer",
+                    "description": "Number of lines BEFORE each match (like grep -B)"
+                },
+                "after_context": {
+                    "type": "integer",
+                    "description": "Number of lines AFTER each match (like grep -A)"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the search. Results will be relative to this directory (saves tokens)."
                 }
             },
             "required": ["pattern"]
@@ -134,14 +284,28 @@ impl Tool for GrepTool {
             .and_then(|v| v.as_str())
             .unwrap_or(".");
 
-        let glob = args.get("glob").and_then(|v| v.as_str());
-        let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
-        let case_insensitive = args.get("case_insensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cwd = args.get("cwd")
+            .and_then(|v| v.as_str());
+
+        let config = GrepConfig {
+            pattern,
+            path,
+            glob: args.get("glob").and_then(|v| v.as_str()),
+            context: args.get("context").and_then(|v| v.as_u64()).unwrap_or(2) as u32,
+            case_insensitive: args.get("case_insensitive").and_then(|v| v.as_bool()).unwrap_or(false),
+            output_mode: Self::parse_output_mode(args.get("output_mode").and_then(|v| v.as_str())),
+            head_limit: args.get("head_limit").and_then(|v| v.as_u64()).map(|v| v as usize),
+            offset: args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize),
+            file_type: args.get("file_type").and_then(|v| v.as_str()),
+            before_context: args.get("before_context").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            after_context: args.get("after_context").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            cwd,
+        };
 
         if Self::has_rg().await {
-            Self::run_rg(pattern, path, glob, context, case_insensitive).await
+            self.run_rg(config).await
         } else {
-            Self::run_grep_fallback(pattern, path, case_insensitive).await
+            Self::run_grep_fallback(pattern, path, config.case_insensitive, config.head_limit).await
         }
     }
 }

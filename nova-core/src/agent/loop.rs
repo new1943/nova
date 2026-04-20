@@ -72,6 +72,11 @@ pub struct QueryLoop {
     pub daily_notes: Option<DailyNotes>,
     pub side_query: Option<SideQuery>,
     pub consolidator: Option<MemoryConsolidator>,
+    // v2 Phase 1.5+ trackers
+    pub topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::TopicTracker>>>,
+    pub tension_tracker: Option<std::sync::Arc<crate::memory::TensionTracker>>,
+    pub mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
+    pub memory_board: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::MemoryBoard>>>,
 }
 
 impl QueryLoop {
@@ -82,8 +87,15 @@ impl QueryLoop {
         daily_notes: Option<DailyNotes>,
         side_query: Option<SideQuery>,
         consolidator: Option<MemoryConsolidator>,
+        topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::TopicTracker>>>,
+        tension_tracker: Option<std::sync::Arc<crate::memory::TensionTracker>>,
+        mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
+        memory_board: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::MemoryBoard>>>,
     ) -> Self {
-        Self { config, tools, hooks, daily_notes, side_query, consolidator }
+        Self {
+            config, tools, hooks, daily_notes, side_query, consolidator,
+            topic_tracker, tension_tracker, mode_router, memory_board,
+        }
     }
 
     /// Run a full query loop turn for user input.
@@ -97,6 +109,33 @@ impl QueryLoop {
         session.reset_turns();
         let mut newly_added_messages = Vec::new();
         info!("--- Starting new query loop for user input ---");
+
+        // ── v2 Phase 1.5: Topic/Tension/Mode tracking ──────────────────────────
+        // Process user message through trackers to detect topic switches, update tension, and mode
+        if let Some(last_msg) = session.messages.last() {
+            if let Some(ref content) = last_msg.content {
+                if last_msg.role == crate::message::Role::User {
+                    // TopicTracker: detect topic transitions from signal words
+                    if let Some(ref tt) = self.topic_tracker {
+                        let transition = tt.write().await.on_user_message(content).await;
+                        if matches!(transition, crate::memory::TopicTransition::Archive) {
+                            info!("Topic archived via user signal");
+                        } else if matches!(transition, crate::memory::TopicTransition::NewTopic) {
+                            info!("New topic started via user signal");
+                        }
+                    }
+                    // TensionTracker: update emotional state from message
+                    if let Some(ref tt) = self.tension_tracker {
+                        tt.update_from_message(content).await;
+                    }
+                    // ModeRouter: update interaction mode
+                    if let Some(ref mr) = self.mode_router {
+                        let mode = mr.write().await.process(content).await;
+                        info!("Mode: {:?}", mode);
+                    }
+                }
+            }
+        }
 
         let tool_schemas = self.tools.as_api_schemas();
         let mut budget = TokenBudget::new(
@@ -126,14 +165,22 @@ impl QueryLoop {
             // token counter (which only grows). This avoids re-triggering compact every
             // turn after the first compaction since total_input_tokens is never reset.
             let estimated_tokens = estimate_message_tokens(&session.messages);
+            let budget_pct = estimated_tokens as f32 / self.config.context_window as f32;
             if estimated_tokens > 0 && budget.needs_compact(estimated_tokens) {
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
                 // T23: Run memory consolidation before compacting (space-triggered)
                 self.run_consolidation(&mut session).await;
                 // T21.1: Write diary before compacting (messages will be summarized)
                 self.write_compact_diary(&session.messages).await;
-                match compactor.compact(&session.messages, self.config.context_window).await {
-                    Ok(compacted) => session.messages = compacted,
+                // ── v2 Phase 1.5: Compact with structured result ─────────────
+                match compactor.compact_full(&session.messages, self.config.context_window, budget_pct).await {
+                    Ok((compacted, result_opt)) => {
+                        session.messages = compacted;
+                        // Update TopicTracker and MemoryBoard with compact result
+                        if let Some(result) = result_opt {
+                            self.apply_compact_result(&result).await;
+                        }
+                    }
                     Err(e) => warn!("Pre-flight compact failed: {}", e),
                 }
             }
@@ -243,8 +290,9 @@ impl QueryLoop {
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
                 // T21.1: Write diary before compacting
                 self.write_compact_diary(&session.messages).await;
-                match compactor.compact(&session.messages, self.config.context_window).await {
-                    Ok(compacted) if compacted.len() < session.messages.len() => {
+                // Context overflow means we're at >100%, use forceful mode
+                match compactor.compact_full(&session.messages, self.config.context_window, 0.96).await {
+                    Ok((compacted, _)) if compacted.len() < session.messages.len() => {
                         session.messages = compacted;
                         // Undo turn increment so retry doesn't waste a turn
                         session.turn_count = session.turn_count.saturating_sub(1);
@@ -269,6 +317,7 @@ impl QueryLoop {
 
             // Post-flight budget check + record turn
             let input_tokens = usage.input_tokens as usize;
+            let budget_pct = input_tokens as f32 / self.config.context_window as f32;
             match budget.check(input_tokens) {
                 BudgetCheck::NeedsCompact if !compaction_exhausted => {
                     let _ = event_tx.send(LoopEvent::CompactTriggered).await;
@@ -276,8 +325,9 @@ impl QueryLoop {
                     self.run_consolidation(&mut session).await;
                     // T21.1: Write diary before compacting
                     self.write_compact_diary(&session.messages).await;
-                    match compactor.compact(&session.messages, self.config.context_window).await {
-                        Ok(compacted) => {
+                    // ── v2 Phase 1.5: Compact with structured result ─────────────
+                    match compactor.compact_full(&session.messages, self.config.context_window, budget_pct).await {
+                        Ok((compacted, result_opt)) => {
                             if compacted.len() >= session.messages.len() {
                                 // Compaction reached its limit, do not attempt to auto-compact again this session
                                 compaction_exhausted = true;
@@ -286,6 +336,10 @@ impl QueryLoop {
                                 )).await;
                             }
                             session.messages = compacted;
+                            // Update TopicTracker and MemoryBoard with compact result
+                            if let Some(result) = result_opt {
+                                self.apply_compact_result(&result).await;
+                            }
                         }
                         Err(e) => warn!("Compact failed: {}", e),
                     }
@@ -332,6 +386,11 @@ impl QueryLoop {
 
             // Execute each tool call with timeout
             for tc in &tool_calls {
+                // ── v2 Phase 1.5: Reset topic inactive turns on tool use ──────
+                if let Some(ref tt) = self.topic_tracker {
+                    tt.write().await.on_tool_call().await;
+                }
+
                 let input = tc.parse_input().unwrap_or_default();
                 info!("Executing tool: `{}` with args: {}", tc.name, input);
                 let mut result = match self.tools.execute(&tc.name, input.clone(), self.config.tool_timeout).await {
@@ -378,7 +437,8 @@ impl QueryLoop {
     }
 
     // T21.1: Write diary entry before compacting messages.
-    // Uses SideQuery to generate a summary of messages that will be compressed.
+    // Writes a simple session summary to the diary.
+    // The structured topic archive info is written by apply_compact_result() after compact.
     async fn write_compact_diary(&self, messages: &[Message]) {
         let daily = match &self.daily_notes {
             Some(d) => d,
@@ -452,6 +512,41 @@ impl QueryLoop {
                 session.memory_updated_mutex = false;
             }
             Err(e) => warn!("T23: Memory consolidation failed: {}", e),
+        }
+    }
+
+    /// v2 Phase 1.5: Apply compact result to TopicTracker and MemoryBoard.
+    /// Called after successful graceful compact to archive topics and update preferences.
+    async fn apply_compact_result(&self, result: &crate::token::compact::CompactResult) {
+        // Update TopicTracker: archive the topics mentioned in compact result
+        if let Some(ref tt) = self.topic_tracker {
+            if !result.archived_topics.is_empty() {
+                tt.write().await.on_compact(&result.archived_topics).await;
+                info!("Archived {} topics from compact", result.archived_topics.len());
+            }
+        }
+
+        // Update MemoryBoard: write archived topics and preferences
+        if let Some(ref mb) = self.memory_board {
+            if let Err(e) = mb.write().await.update_from_compact(
+                &result.archived_topics,
+                &result.extracted_preferences,
+                &result.active_summary,
+            ).await {
+                warn!("Failed to update MemoryBoard: {}", e);
+            } else {
+                info!("MemoryBoard updated: {} archived, {} preferences",
+                    result.archived_topics.len(), result.extracted_preferences.len());
+            }
+        }
+
+        // Write to daily notes (topic timeline format)
+        if let Some(ref daily) = self.daily_notes {
+            if !result.archived_topics.is_empty() {
+                if let Err(e) = daily.append_compact_topics(&result.archived_topics, &result.active_summary) {
+                    warn!("Failed to write compact topics to diary: {}", e);
+                }
+            }
         }
     }
 }

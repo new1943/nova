@@ -1,7 +1,8 @@
 # NOVA 架构设计
 
-**版本**: v3.0
-**日期**: 2026-04-08
+**版本**: v3.1
+**日期**: 2026-04-20
+**状态**: Phase 1 MVP + Phase 1 v2 (物理防御层) + Phase 1.5 + Phase 2 已完成
 
 ---
 
@@ -55,26 +56,26 @@ nova/
 │       ├── workspace/
 │       │   ├── mod.rs
 │       │   └── loader.rs       # WorkspaceLoader — 9 个 .md 文件
-│       ├── team/               # 策略 9 骨架
+│       ├── team/               # 策略 9 完整
 │       │   ├── mod.rs
 │       │   ├── config.rs       # TeamManager / Team / Task
 │       │   └── mailbox.rs      # Mailbox — per-agent 消息
-│       ├── subagent/           # 策略 10 骨架
+│       ├── subagent/           # 策略 10 完整
 │       │   ├── mod.rs
 │       │   └── spawn.rs        # SubagentSpawner / SubagentConfig
-│       ├── sidequery/          # 策略 11 骨架
+│       ├── sidequery/          # 策略 11 完整
 │       │   ├── mod.rs
 │       │   └── query.rs        # SideQuery
-│       ├── dream/              # 策略 12 骨架
+│       ├── dream/              # 策略 12 完整
 │       │   ├── mod.rs
 │       │   └── engine.rs       # DreamEngine
-│       ├── worktree/           # 策略 13 骨架
+│       ├── worktree/           # 策略 13 完整
 │       │   ├── mod.rs
 │       │   └── isolate.rs      # WorktreeManager / Worktree
-│       ├── coordinator/        # 策略 14 骨架
+│       ├── coordinator/        # 策略 14 完整
 │       │   ├── mod.rs
 │       │   └── orchestrator.rs # Coordinator / CoordinatorPhase
-│       ├── paste/              # 策略 15 骨架
+│       ├── paste/              # 策略 15 完整
 │       │   ├── mod.rs
 │       │   └── store.rs        # PasteStore — hash 去重
 │       ├── heartbeat/
@@ -468,8 +469,13 @@ main → run_app
 | Message 类型 | tagged enum | struct + Role enum |
 | TokenStats | per_turn_input Vec | 简化为 total_input/output |
 | Workspace 文件 | .md 后缀 | .md 后缀（SOUL.md 等） |
-| Phase 2/3 模块 | 未创建 | 全部骨架已搭建（19 个模块） |
+| Phase 2/3 模块 | 未创建 | 全部完整实现（Team/Subagent/Dream/Worktree/Coordinator/Paste） |
 | thinking block | 未考虑 | 已支持（MiniMax M2.7 特性） |
+| I/O Shield | 未设计 | bash 20k / browser 15k 截断 |
+| Compact 双层熔断 | 未设计 | Graceful (85-95%) / Forceful (>95%) |
+| TopicTracker | 不存在 | 话题状态机已集成 loop |
+| TensionTracker | 不存在 | 张力值追踪已集成 loop |
+| ModeRouter | 不存在 | 模式路由已集成 loop，`<nova_os>` 已注入 |
 
 
 ---
