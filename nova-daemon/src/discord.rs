@@ -223,19 +223,22 @@ async fn process_discord_message(
         }
     }
 
-    let content = if content.starts_with('/') {
-        let skill_name = content.trim_start_matches('/').split_whitespace().next().unwrap_or("");
-        if let Some(skill) = skills.find_by_name(skill_name) {
-            format!("{}\n\n{}", skill.prompt, content)
+    let content = {
+        let skills = skills.lock().unwrap();
+        if content.starts_with('/') {
+            let skill_name = content.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+            if let Some(skill) = skills.find_by_name(skill_name) {
+                format!("{}\n\n{}", skill.prompt, content)
+            } else {
+                content.clone()
+            }
         } else {
-            content
-        }
-    } else {
-        let matched = skills.match_auto_trigger(&content);
-        if let Some(skill) = matched.first() {
-            format!("{}\n\n{}", skill.prompt, content)
-        } else {
-            content
+            let matched = skills.match_auto_trigger(&content);
+            if let Some(skill) = matched.first() {
+                format!("{}\n\n{}", skill.prompt, content)
+            } else {
+                content.clone()
+            }
         }
     };
 
