@@ -257,6 +257,9 @@ fn handle_ipc_event(app: &mut App, event: Event) {
         Event::Notification { message } => {
             app.push_message(DisplayRole::System, message);
         }
+        Event::Heartbeat { task_name, message } => {
+            app.status_text = format!("[Heartbeat] {}: {}", task_name, message);
+        }
         Event::SearchResults { results } => {
             if results.is_empty() {
                 app.push_message(DisplayRole::System, "No matching sessions found.".into());

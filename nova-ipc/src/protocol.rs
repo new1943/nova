@@ -9,6 +9,8 @@ pub enum Request {
     NewSession,
     SearchSessions { query: String },
     Shutdown,
+    /// Trigger a multi-phase orchestration task via Coordinator
+    Orchestrate { task: String },
 }
 
 /// Daemon → TUI events (streamed)
@@ -25,6 +27,8 @@ pub enum Event {
     SessionRestored { session_id: String, message_count: usize },
     SessionCreated { session_id: String },
     SearchResults { results: Vec<SearchResultEntry> },
+    /// Heartbeat task fired — sent from daemon to TUI
+    Heartbeat { task_name: String, message: String },
 }
 
 /// A single search result entry

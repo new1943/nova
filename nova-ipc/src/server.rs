@@ -1,7 +1,10 @@
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 use crate::protocol::{Event, Request};
 
@@ -43,16 +46,24 @@ impl Drop for IpcServer {
 
 /// Bidirectional IPC connection (JSON lines protocol)
 pub struct IpcConnection {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    reader: BufReader<OwnedReadHalf>,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+}
+
+/// Clone is not supported since BufReader<OwnedReadHalf> is !Clone.
+/// Use a separate mpsc-based heartbeat channel instead.
+impl Clone for IpcConnection {
+    fn clone(&self) -> Self {
+        panic!("IpcConnection does not support clone() — use heartbeat mpsc channel instead");
+    }
 }
 
 impl IpcConnection {
     pub fn new(stream: UnixStream) -> Self {
-        let (read, write) = stream.into_split();
+        let (read_half, write_half) = stream.into_split();
         Self {
-            reader: BufReader::new(read),
-            writer: write,
+            reader: BufReader::new(read_half),
+            writer: Arc::new(Mutex::new(write_half)),
         }
     }
 
@@ -67,11 +78,15 @@ impl IpcConnection {
     }
 
     /// Send an Event to the connection
-    pub async fn send_event(&mut self, event: &Event) -> Result<()> {
+    pub async fn send_event(&self, event: &Event) -> Result<()> {
         let mut data = serde_json::to_string(event)?;
         data.push('\n');
-        self.writer.write_all(data.as_bytes()).await?;
-        self.writer.flush().await?;
+        let mut w = self.writer.lock().await;
+        w.write_all(data.as_bytes()).await?;
+        w.flush().await?;
         Ok(())
     }
 }
+
+// Re-export OwnedReadHalf for use in main.rs heartbeat
+pub use tokio::net::unix::OwnedReadHalf;

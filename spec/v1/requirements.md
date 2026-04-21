@@ -2,7 +2,7 @@
 
 **版本**: v3.1
 **日期**: 2026-04-20
-**状态**: Phase 1 MVP ✅ + Phase 1 v2 (物理防御层) ✅ + Phase 1.5 ✅ + Phase 2 ✅ + 剩余 Phase 3 (tiktoken/E2E)
+**状态**: Phase 1 MVP ✅ + Phase 1 (物理防御层) ✅ + Phase 1.5 ✅ + Phase 2 ✅ + Phase 3 (tiktoken/E2E)
 
 > 基于 Claude Code 源码分析 + OpenClaw 源码 + Hermes Agent 源码，完整记录所有策略。
 
@@ -49,19 +49,21 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 | 1 | Query Loop | ✅ 已实现 | `nova-core/src/agent/loop.rs` |
 | 2 | Token Budget 双阈值 | ✅ 已实现 | `nova-core/src/token/budget.rs` |
 | 3 | Compact 对话压缩 | ✅ 已实现 | `nova-core/src/token/compact.rs` |
-| 4 | Forked Agent | ✅ 已实现 | `nova-core/src/agent/forked.rs` |
+| 4 | Forked Agent | ✅ 已实现 | `nova-core/src/subagent/spawn.rs`（通过 AgentTool）|
 | 5 | PostSampling Hooks | ✅ 已实现 | `nova-core/src/hooks/post_sampling.rs` |
 | 6 | StopHooks | ✅ 已实现 | `nova-core/src/hooks/stop.rs` |
-| 7 | 双写互斥记忆 | ✅ 已实现 | `nova-core/src/memory/dual_write.rs` |
+| 7 | 双写互斥记忆 | ✅ 重构 | `nova-core/src/memory/`（重构为三层 markdown 记忆）|
 | 8 | 工具池稳定排序 | ✅ 已实现 | `nova-core/src/tools/registry.rs` |
-| 9 | Team 系统 | ✅ 完整 | `nova-core/src/team/` |
-| 10 | Subagent spawn | ✅ 完整 | `nova-core/src/subagent/` |
+| 9 | Team 系统 | ✅ 已实现 | `nova-core/src/team/`（TeamTool 已注册）|
+| 10 | Subagent spawn | ✅ 已实现 | `nova-core/src/subagent/spawn.rs`（AgentTool 已注册）|
 | 11 | SideQuery | ✅ 已实现 | `nova-core/src/sidequery/` |
-| 12 | autoDream | ✅ 完整 | `nova-core/src/dream/` |
-| 13 | Worktree 隔离 | ✅ 完整 | `nova-core/src/worktree/` |
-| 14 | Coordinator 模式 | ✅ 完整 | `nova-core/src/coordinator/` |
-| 15 | Paste Store | ✅ 完整 | `nova-core/src/paste/` |
+| 12 | autoDream | ✅ 已实现 | `nova-core/src/dream/engine.rs`（DreamEngine 已实例化）|
+| 13 | Worktree 隔离 | ✅ 已实现 | `nova-core/src/worktree/`（WorktreeTool 已注册）|
+| 14 | Coordinator 模式 | ✅ 已实现 | `nova-core/src/coordinator/orchestrator.rs`（IPC Request::Orchestrate）|
+| 15 | Paste Store | ✅ 已实现（未集成）| `nova-core/src/paste/store.rs` |
 | 16 | Session History JSONL | ✅ 已实现 | `nova-core/src/session/` |
+
+> **状态说明**：✅ 已实现 = 代码完整且 daemon 实际调用；✅ 已实现（未集成）= 代码存在但 daemon 未实例化；✅ 重构 = 已替代为新实现。
 
 ### 策略 1：Query Loop（核心交互循环）
 
@@ -109,12 +111,13 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 
 - `tokio::spawn` 执行后台任务
 - 独立 16K token 预算
-- 最多 2 次重试
+- 通过 `AgentTool` 注册到 daemon
 
 ### 策略 5：PostSampling Hooks
 
 **状态**: ✅ 已实现
 
+- `HookManager::add_post_sampling_hook()`
 - `MemoryExtractHook`：每次 LLM 响应后提取关键信息到记忆
 - 在 forked agent 中异步执行，不阻塞主 loop
 
@@ -122,18 +125,19 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 
 **状态**: ✅ 已实现
 
+- `HookManager::add_stop_hook()`
 - `MemoryExtractStopHook`：turn 结束时写入记忆
 - 串行执行，阻塞主 loop
 
-### 策略 7：双写互斥记忆系统
+### 策略 7：三层记忆系统
 
-**状态**: ✅ 已实现（JSONL 版），🔧 重构为三层 markdown 记忆
+**状态**: ✅ 已实现
 
-- 主 agent 已写 → forked agent 跳过
-- 主 agent 未写 → forked agent 兜底
-- 绝不重复写入
-- 记忆类型：user / feedback / project / reference
-- 存储路径：`~/.nova/memories/<type>.jsonl`（旧）→ 迁移为三层 markdown 记忆（见 P0 新增需求）
+- `MEMORY.md`（工作记忆 Layer 1）
+- `memories/YYYY-MM-DD.md`（情景记忆 Layer 2）
+- `sessions/*.jsonl`（完整历史 Layer 3）
+- TopicTracker 管理话题状态
+- MemoryBoard 管理 MEMORY.md 白板
 
 ### 策略 8：工具池稳定排序
 
@@ -200,12 +204,12 @@ NOVA 是 OpenClaw 的 Rust 重写版。运行时加载同一套 workspace 文件
 
 ### 策略 15：Paste Store
 
-**状态**: ✅ 完整
+**状态**: ✅ 已实现（未集成）
 
 - `PasteStore`：hash 去重存储
-- 相同内容只存一份
-- 引用标签系统
-- 与 TUI 粘贴事件集成
+- 相同内容只存一份，用 `[paste:hash]` 标签引用
+- 节省 context space
+- **未集成**：daemon 未实例化 PasteStore
 
 ### 策略 16：Session History（JSONL）
 

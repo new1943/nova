@@ -11,6 +11,7 @@ pub struct TokenBudget {
     prev_prev_turn_input: usize,
 }
 
+#[derive(Debug)]
 pub enum BudgetCheck {
     Ok,
     NeedsCompact,

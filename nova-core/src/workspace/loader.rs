@@ -53,6 +53,43 @@ const MEMORY_GUIDANCE: &str = r#"## 记忆系统
 - 路径：`~/.nova/sessions/<uuid>.jsonl`
 - 通过 Agentic Session Search 自动召回相关历史"#;
 
+/// Skills self-iteration guidance injected into system prompt.
+/// This guides the LLM to proactively create/patch/delete skills.
+const SKILLS_GUIDANCE: &str = r##"## 技能系统
+
+你有一个技能自迭代系统，可以将成功经验固化为可复用技能。
+
+### 创建时机（满足任一即创建）
+- 复杂任务完成后（5+ tool calls）
+- 克服了一个 tricky error
+- 发现并验证了非平凡工作流
+- 用户纠正了你的方法且有效
+- 用户要求记住某个流程
+
+### 创建方式
+- `skill_manage(action="create", name="<skill-name>", content="# YAML frontmatter...")`
+- 技能目录：`~/.nova/skills/<name>/SKILL.md`
+
+### 更新时机
+- 使用 skill 时发现过时/错误/不完整 → 立即 patch
+- 遇到 OS 特定问题
+- 发现更好的方案
+
+### 更新方式
+- `skill_manage(action="patch", name="<skill-name>", old_string="...", new_string="...")`
+- 不需要等用户要求，发现问题立即改
+
+### 删除时机
+- Skill 不再适用
+- 有更好的替代方案
+
+### 删除方式
+- `skill_manage(action="delete", name="<skill-name>")`
+
+### 查看已有技能
+- `skills_list()` — 列出所有技能（minimal metadata）
+- `skill_view(name="<skill-name>")` — 查看完整技能内容"##;
+
 /// Cached file entry with mtime for change detection
 #[derive(Debug, Clone)]
 struct CachedFile {
@@ -129,6 +166,9 @@ impl BootstrapLoader {
 
         // Append memory guidance (always, even if MEMORY.md doesn't exist yet)
         parts.push(MEMORY_GUIDANCE.to_string());
+
+        // Append skills guidance (always, even if no skills exist yet)
+        parts.push(SKILLS_GUIDANCE.to_string());
 
         // Inject MEMORY.md actual content (Layer 1 working memory)
         let memory_content = self.load_memory();

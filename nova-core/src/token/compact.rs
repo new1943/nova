@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::debug;
 
 use crate::message::{Message, Role};
 
@@ -101,10 +102,13 @@ impl Compactor {
         let split = self.calculate_split(messages, context_window)?;
 
         if split == 0 {
+            debug!("Compact skipped: total_chars under target");
             return Ok((messages.to_vec(), None));
         }
 
         let mode = Self::decide_mode(budget_pct);
+        debug!("Compact: budget_pct={:.1}%, mode={:?}, total_msgs={}, split={}",
+            budget_pct * 100.0, mode, messages.len(), split);
 
         match mode {
             CompactMode::Graceful => {
@@ -179,6 +183,7 @@ impl Compactor {
 
     /// Forceful compact: directly drop oldest messages without LLM summarization
     fn forceful_compact(&self, messages: &[Message], split: usize) -> Vec<Message> {
+        debug!("Forceful compact: drop {} oldest messages, keep {} recent", split, messages.len() - split);
         let recent: Vec<Message> = messages[split..].to_vec();
 
         let mut new_messages = Vec::with_capacity(recent.len() + 1);
@@ -231,6 +236,8 @@ impl Compactor {
         new_messages.push(Message::user(summary_text));
         new_messages.extend_from_slice(recent);
 
+        debug!("Graceful compact: early={} msgs, recent={} msgs, summary={:?}",
+            early.len(), recent.len(), result.active_summary);
         Ok((new_messages, result))
     }
 

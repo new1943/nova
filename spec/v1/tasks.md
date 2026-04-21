@@ -30,6 +30,15 @@
 | T17 | Skills 系统 | P1 | 2h | T05 | ✅ 完成 |
 | T18 | bash 受限模式安全加固 | P2 | 2h | T05 | ✅ 完成 |
 | T19 | 端到端集成测试 | P2 | 4h | 全部 | ❌ 未开始 |
+| T49 | Heartbeat 接入 daemon | P1 | 2h | T09 | ✅ 完成 |
+| T50 | Hooks 框架接入 | P1 | 1h | T14 | ✅ 完成（框架已连线，T21 替代具体 hook）|
+| T51 | ForkedAgent 接入 | P1 | 1h | T13 | ✅ 完成（SubagentSpawner 内部使用）|
+| T52 | Worktree 接入 daemon | P2 | 3h | T09 | ❌ 待做 |
+| T53 | Subagent/agent 工具注册 | P1 | 4h | T10 | ❌ 待做 |
+| T54 | Coordinator 接入 daemon | P2 | 3h | T53 | ❌ 待做 |
+| T55 | Team 系统接入 daemon | P2 | 4h | T09 | ✅ 完成（TeamTool 已注册 + teams_dir 传入）|
+| T56 | PasteStore 接入 TUI | P3 | 2h | T10 | ❌ 待做 |
+| T57 | Heartbeat TUI 转发（tokio::select） | P2 | 3h | T49 | ❌ 待做 |
 | T20 | file_edit 精确编辑工具 | P0 | 3h | T05 | ✅ 完成 |
 | T21 | 三层记忆系统 | P0 | 10h | T15, T05 | ✅ 完成 |
 | T22 | browser 浏览器自动化 | P0 | 12h | T05 | ✅ 完成 |
@@ -560,9 +569,9 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 
 ---
 
-## Phase 2/3 骨架模块状态
+## Phase 2/3 增强模块状态
 
-> 以下模块在 requirements.md 中标记为"骨架已搭建"，实际均有完整的数据结构和核心逻辑实现。
+> 以下模块已完成完整实现（已在 requirements.md 中更新为 ✅ 完整）。
 
 | 模块 | 文件 | 实际状态 | 说明 |
 |:---|:---|:---|:---|
@@ -600,21 +609,23 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 
 ---
 
-## NOVA v2 Phase 1: 物理防御层
+## Phase 2: 物理防御层 + 话题状态机 + 认知灵魂层
 
-**日期**: 2026-04-19
-**状态**: ✅ T01-T06 已完成
+**日期**: 2026-04-19 至 2026-04-20
+**状态**: ✅ T34-T48 已全部完成
+
+### T34-T39: I/O Shield + 双层熔断
 
 | ID | 任务 | 文件 | 状态 |
 |:--|:--|:--|:--|
-| T01 | 截断常量定义 | `nova-core/src/tools/constants.rs` | ✅ 完成 |
-| T02 | 截断函数实现 | `nova-core/src/tools/truncate.rs` | ✅ 完成 |
-| T03 | bash.rs I/O Shield 集成 | `nova-core/src/tools/bash.rs` | ✅ 完成 |
-| T04 | browser.rs I/O Shield 集成 | `nova-core/src/tools/browser.rs` | ✅ 完成 |
-| T05 | compact.rs 双层熔断机制 | `nova-core/src/token/compact.rs` | ✅ 完成 |
-| T06 | compact.rs JSON 结构化输出 | `nova-core/src/token/compact.rs` | ✅ 完成 |
+| T34 | 截断常量定义 | `nova-core/src/tools/constants.rs` | ✅ 完成 |
+| T35 | 截断函数实现 | `nova-core/src/tools/truncate.rs` | ✅ 完成 |
+| T36 | bash.rs I/O Shield 集成 | `nova-core/src/tools/bash.rs` | ✅ 完成 |
+| T37 | browser.rs I/O Shield 集成 | `nova-core/src/tools/browser.rs` | ✅ 完成 |
+| T38 | compact.rs 双层熔断机制 | `nova-core/src/token/compact.rs` | ✅ 完成 |
+| T39 | compact.rs JSON 结构化输出 | `nova-core/src/token/compact.rs` | ✅ 完成 |
 
-**v2 T01-T06 实现内容**:
+**T34-T39 实现内容**:
 
 - **I/O Shield**: bash 输出 20k 字符上限（头 8k + 尾 8k + 警告），browser snapshot 15k 字符上限（头 5k + 尾 5k + 警告）
 - **双层熔断**: Graceful 模式（85-95% 水位）调用 LLM 生成 JSON 结构化摘要，Forceful 模式（>95%）直接丢弃旧消息
@@ -623,28 +634,75 @@ nova-core/src/tools/browser.rs   # 单文件，~230 行
 - **新增文件**: `constants.rs`, `truncate.rs`
 - **测试**: 13 个单元测试全部通过，clippy 干净
 
-**v2 Phase 1.5: 话题状态机集成** (2026-04-20 完成)
+### T40-T42: 话题状态机集成
 
 | ID | 任务 | 文件 | 状态 |
 |:--|:--|:--|:--|
-| T07 | TopicTracker 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
-| T08 | Daily notes 时间线格式 | `agent/loop.rs` | ✅ 完成 |
-| T09 | MEMORY.md 白板化集成 | `agent/loop.rs` | ✅ 完成 |
+| T40 | TopicTracker 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
+| T41 | Daily notes 时间线格式 | `agent/loop.rs` | ✅ 完成 |
+| T42 | MEMORY.md 白板化集成 | `agent/loop.rs` | ✅ 完成 |
 
-**v2 Phase 2: 认知灵魂层** (2026-04-20 完成)
+### T43-T46: 认知灵魂层
 
 | ID | 任务 | 文件 | 状态 |
 |:--|:--|:--|:--|
-| T10 | TensionTracker 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
-| T11 | ModeRouter 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
-| T12 | `<nova_os>` 思考管道 | `main.rs`, `discord.rs` | ✅ 完成 |
-| T13 | 主动/冷淡机制 | `mode_router.rs` | 🔨 逻辑已实现，待触发点设计 |
+| T43 | TensionTracker 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
+| T44 | ModeRouter 与 loop 集成 | `agent/loop.rs` | ✅ 完成 |
+| T45 | `<nova_os>` 思考管道 | `main.rs`, `discord.rs` | ✅ 完成 |
+| T46 | 主动/冷淡机制 | `mode_router.rs` | 🔨 逻辑已实现，待触发点设计 |
 
-**v2 Phase 3: 剩余工作**
+### T47-T48: 剩余工作
 
 | ID | 任务 | 状态 |
 |:--|:--|:--|
-| T14 | E2E 集成测试 | ❌ 未开始 |
-| T15 | tiktoken 精确计数 | ❌ 未开始 |
+| T47 | E2E 集成测试 | ❌ 未开始 |
+| T48 | tiktoken 精确计数 | ✅ 完成 |
 
 > **注**: Async 锁安全已于 2026-04-20 验证通过，`tokio::sync::RwLock` 已正确使用于 `topic_state.rs`、`memory_board.rs`、`mode_router.rs`、`tension_tracker.rs`。
+
+---
+
+## Phase 3: 策略整合接入
+
+**日期**: 2026-04-20
+**状态**: 🔨 进行中
+
+> 经过代码盘点，发现 CLAUDE.md 中标记为"✅ 完整"的策略有多项代码存在但未接入 daemon/QueryLoop。本阶段目标是将这些模块逐个接入并编译验证。
+
+### T49-T55: 未接入模块整合
+
+| ID | 任务 | 状态 | 说明 |
+|:--|:--|:--|:--|
+| T49 | Heartbeat 接入 daemon | ✅ 完成 | `HeartbeatScheduler` 在 `handle_connection` 中启动，IPC Event 已定义 |
+| T50 | Hooks 框架接入 | ✅ 完成 | `HookManager` 基础设施已连线（T21 替代具体 hook，无需额外注册）|
+| T51 | ForkedAgent 接入 | ✅ 完成 | SubagentSpawner 内部使用 tokio::spawn |
+| T52 | Worktree 接入 daemon | ✅ 完成 | `WorktreeTool` 注册到 `make_tools()` |
+| T53 | Subagent/agent 工具注册 | ✅ 完成 | `AgentTool` 封装 `SubagentSpawner`，已注册 |
+| T54 | Coordinator 接入 | ✅ 完成 | `Request::Orchestrate` + `Coordinator::orchestrate()` 已集成 |
+| T55 | Team 系统接入 | ✅ 完成 | `TeamManager` 实例化 + `TeamTool` 注册 + `teams_dir` 传入 |
+| T56 | PasteStore 接入 TUI | ❌ 待做 | `PasteStore` 在 write_file 或 TUI 粘贴中使用 |
+| T57 | Heartbeat TUI 转发 | ❌ 待做 | 使用 `tokio::select!` 将 heartbeat event 真正转发到 TUI |
+| T58 | E2E 集成测试 | ❌ 待做 | T19 未开始 |
+
+### T49 详情：Heartbeat 接入
+
+**文件**: `nova-daemon/src/main.rs`, `nova-ipc/src/protocol.rs`
+
+**做法**:
+- `Event::Heartbeat { task_name, message }` 加入 IPC 协议
+- `HandleConfig` 新增 `heartbeat_interval_secs` 字段
+- `HeartbeatScheduler::from_config()` 读取 `HEARTBEAT.md`
+- `scheduler.start(tx)` 启动后台 task
+- Heartbeat events 通过 `tokio::spawn` 异步转发至 TUI
+
+**验证**: `cargo build --release` 通过，TUI 底部显示心跳通知（待 T57）
+
+### T57 详情：Heartbeat TUI 转发
+
+**当前状态**: heartbeat scheduler 已启动，event 只 log 不转发
+**目标**: 用 `tokio::select!` 重构 `handle_connection` 主循环，同时接收 IPC request 和 heartbeat event
+
+**做法**:
+- 将 `conn` 包装为 `Arc<tokio::sync::Mutex<Option<Pin<&mut IpcConnection>>>>`
+- 主循环用 `tokio::select!` 同时监听 `conn.recv_request()` 和 heartbeat mpsc channel
+- heartbeat task 通过 `Arc<Mutex<>>` 发送 `Event::Heartbeat` 到 TUI

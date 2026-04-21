@@ -15,8 +15,10 @@ use nova_core::memory::recall::MemoryRecall;
 use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::SideQuery;
-use nova_core::skills::SkillsLoader;
-use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgenticSearchTool, create_shared_tracker};
+use nova_core::skills::{create_shared_loader, SharedSkillsLoader, SkillManageTool, SkillsListTool, SkillViewTool};
+use nova_core::heartbeat::{HeartbeatScheduler, scheduler::HeartbeatEvent};
+use nova_core::coordinator::Coordinator;
+use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgenticSearchTool, WorktreeTool, AgentTool, TeamTool, create_shared_tracker};
 use nova_core::tools::bash::{BashTool, BashMode};
 use nova_core::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
@@ -31,9 +33,10 @@ pub struct HandleConfig {
     sessions_dir: PathBuf,
     memories_dir: PathBuf,
     loop_config: QueryLoopConfig,
-    skills: Arc<SkillsLoader>,
+    skills: SharedSkillsLoader,
     run_mode: String,
     tools: Arc<ToolRegistry>,
+    heartbeat_interval_secs: u64,
 }
 
 fn budget_pct_calc(input_tokens: usize, context_window: usize) -> f32 {
@@ -43,6 +46,9 @@ fn budget_pct_calc(input_tokens: usize, context_window: usize) -> f32 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load config first to get log_level
+    let config = NovaConfig::load_default()?;
+
     let log_path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".nova")
@@ -66,8 +72,9 @@ async fn main() -> Result<()> {
         .with_line_number(false)
         .compact();
 
+    // Use config.log_level, but allow env override
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -78,7 +85,7 @@ async fn main() -> Result<()> {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
 
     match cmd {
-        "run" => run_daemon().await,
+        "run" => run_daemon(config).await,
         "stop" => {
             let mut client = nova_ipc::IpcClient::connect(SOCKET_PATH.as_ref()).await?;
             client.send_request(&Request::Shutdown).await?;
@@ -118,6 +125,13 @@ fn make_tools(
     side_query: SideQuery,
     session_manager: SessionManager,
     file_tracker: nova_core::tools::SharedFileReadTracker,
+    repo_root: Option<PathBuf>,
+    teams_dir: Option<PathBuf>,
+    api_key: String,
+    api_base_url: String,
+    model: String,
+    skills_dir: PathBuf,
+    skills: SharedSkillsLoader,
 ) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
@@ -140,6 +154,24 @@ fn make_tools(
 
     tools.register_builtin(Box::new(AgenticSearchTool::new(side_query, session_manager)));
 
+    // Agent tool — spawn subagents for parallel/background tasks
+    tools.register_builtin(Box::new(AgentTool::new(api_key, api_base_url, model)));
+
+    // Worktree tool — git worktree isolation per session
+    if let Some(root) = repo_root {
+        tools.register_builtin(Box::new(WorktreeTool::new(root)));
+    }
+
+    // Team tool — team/member/task management
+    if let Some(dir) = teams_dir {
+        tools.register_builtin(Box::new(TeamTool::new(dir)));
+    }
+
+    // Skill tools — skill management (create/edit/patch/delete/list/view)
+    tools.register_builtin(Box::new(SkillManageTool::new(skills_dir.clone(), skills.clone())));
+    tools.register_builtin(Box::new(SkillsListTool::new(skills.clone())));
+    tools.register_builtin(Box::new(SkillViewTool::new(skills_dir, skills)));
+
     tools
 }
 
@@ -154,7 +186,7 @@ pub fn tool_descriptions(tools: &ToolRegistry) -> String {
     tools.describe_all()
 }
 
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(config: NovaConfig) -> Result<()> {
     if check_pid_file() {
         anyhow::bail!("Daemon already running (PID file: {})", PID_FILE);
     }
@@ -166,14 +198,12 @@ async fn run_daemon() -> Result<()> {
     }
     let _guard = PidGuard;
 
-    let config = NovaConfig::load_default()?;
-    info!("NOVA daemon starting, workspace: {:?}, mode: {}", config.workspace, config.mode);
+    info!("NOVA daemon starting, workspace: {:?}, mode: {}, log_level: {}",
+        config.workspace, config.mode, config.log_level);
 
     let run_mode = config.mode.clone();
 
-    let mut skills_loader = SkillsLoader::new(config.workspace.join("skills"));
-    let _ = skills_loader.load_all();
-    let skills = Arc::new(skills_loader);
+    let skills = create_shared_loader(config.workspace.join("skills"))?;
 
     let loop_config = QueryLoopConfig {
         max_turns: config.max_turns,
@@ -204,6 +234,13 @@ async fn run_daemon() -> Result<()> {
                 SideQuery::new(loop_config.api_key.clone(), loop_config.api_base_url.clone(), loop_config.model.clone()),
                 SessionManager::new(config.workspace.join("sessions")),
                 file_tracker.clone(),
+                Some(config.workspace.clone()),
+                Some(config.workspace.join("teams")),
+                loop_config.api_key.clone(),
+                loop_config.api_base_url.clone(),
+                loop_config.model.clone(),
+                config.workspace.join("skills"),
+                skills.clone(),
             ));
             let dc_cfg = Arc::new(HandleConfig {
                 workspace_dir: config.workspace.clone(),
@@ -213,6 +250,7 @@ async fn run_daemon() -> Result<()> {
                 skills: skills.clone(),
                 run_mode: run_mode.clone(),
                 tools: tools_dc,
+                heartbeat_interval_secs: config.heartbeat_interval_secs,
             });
             tokio::spawn(async move {
                 if let Err(e) = discord::start(token, dc_cfg).await {
@@ -248,6 +286,13 @@ async fn run_daemon() -> Result<()> {
                     sq_for_tools,
                     sm_for_tools,
                     file_tracker.clone(),
+                    Some(workspace_dir.clone()),
+                    Some(config.workspace.join("teams")),
+                    lc.api_key.clone(),
+                    lc.api_base_url.clone(),
+                    lc.model.clone(),
+                    config.workspace.join("skills"),
+                    sk.clone(),
                 ));
                 tokio::spawn(async move {
                     let cfg = HandleConfig {
@@ -258,6 +303,7 @@ async fn run_daemon() -> Result<()> {
                         skills: sk,
                         run_mode: rm,
                         tools,
+                        heartbeat_interval_secs: config.heartbeat_interval_secs,
                     };
                     if let Err(e) = handle_connection(conn, cfg).await {
                         error!("Connection error: {}", e);
@@ -353,6 +399,22 @@ async fn handle_connection(
         }
     };
 
+    // Heartbeat: load HEARTBEAT.md and start the scheduler (background, detached).
+    // Events are logged only — TUI forwarding requires future tokio::select! refactor.
+    if let Ok(content) = std::fs::read_to_string(workspace_dir.join("HEARTBEAT.md")) {
+        let interval = std::time::Duration::from_secs(cfg.heartbeat_interval_secs);
+        let scheduler = HeartbeatScheduler::from_config(&content, interval);
+        if !scheduler.tasks().is_empty() {
+            let (tx, mut rx) = mpsc::channel::<HeartbeatEvent>(8);
+            let _handle = scheduler.start(tx);
+            tokio::spawn(async move {
+                while let Some(hb) = rx.recv().await {
+                    info!("[Heartbeat] {} — {}", hb.task_name, hb.prompt);
+                }
+            });
+        }
+    }
+
     while let Some(req) = conn.recv_request().await? {
         match req {
             Request::UserMessage { content } => {
@@ -387,20 +449,25 @@ async fn handle_connection(
                 }
 
                 // Skill injection
-                let content = if content.starts_with('/') {
-                    let skill_name = content.trim_start_matches('/').split_whitespace().next().unwrap_or("");
-                    if let Some(skill) = skills.find_by_name(skill_name) {
-                        format!("{}\n\n{}", skill.prompt, content)
+                let content = if let Ok(skills_guard) = skills.lock() {
+                    if content.starts_with('/') {
+                        let skill_name = content.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+                        if let Some(skill) = skills_guard.find_by_name(skill_name) {
+                            format!("{}\n\n{}", skill.prompt, content)
+                        } else {
+                            content.clone()
+                        }
                     } else {
-                        content
+                        let matched = skills_guard.match_auto_trigger(&content);
+                        if let Some(skill) = matched.first() {
+                            format!("{}\n\n{}", skill.prompt, content)
+                        } else {
+                            content.clone()
+                        }
                     }
                 } else {
-                    let matched = skills.match_auto_trigger(&content);
-                    if let Some(skill) = matched.first() {
-                        format!("{}\n\n{}", skill.prompt, content)
-                    } else {
-                        content
-                    }
+                    warn!("skills lock poisoned");
+                    content.clone()
                 };
 
                 let msg = nova_core::message::Message::user(&content);
@@ -616,6 +683,27 @@ async fn handle_connection(
                         message_count: s.messages.len(),
                     }).await?;
                     session = s;
+                }
+            }
+            Request::Orchestrate { task } => {
+                info!("Orchestration requested: {}", task);
+                let coordinator = Coordinator::new(
+                    loop_config.api_key.clone(),
+                    loop_config.api_base_url.clone(),
+                    loop_config.model.clone(),
+                    String::new(), // system_prompt empty
+                );
+                match coordinator.orchestrate(&task).await {
+                    Ok(result) => {
+                        conn.send_event(&Event::Notification {
+                            message: format!("[Coordinator] Output:\n{}", result.output),
+                        }).await?;
+                    }
+                    Err(e) => {
+                        conn.send_event(&Event::Error {
+                            message: format!("Orchestration failed: {}", e),
+                        }).await?;
+                    }
                 }
             }
             Request::Shutdown => {

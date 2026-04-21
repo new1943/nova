@@ -13,6 +13,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
+use tracing::debug;
 
 use crate::sidequery::SideQuery;
 
@@ -44,22 +45,26 @@ impl DreamEngine {
             .map(|e| e.filter_map(|d| d.ok()).count())
             .unwrap_or(0);
 
+        debug!("Dream check: session_count={}, need={}", session_count, 5);
+
         if session_count < 5 {
+            debug!("Dream skip: not enough sessions ({} < 5)", session_count);
             return false;
         }
 
         // Check lock file
-        if let Ok(meta) = fs::metadata(&lock_path) {
-            if let Ok(mtime) = meta.modified() {
-                let age = Utc::now()
-                    .signed_duration_since(
-                        chrono::DateTime::<Utc>::from(mtime)
-                    );
-                // If lock is fresh (<24h), skip
-                if age.num_hours() < 24 {
-                    return false;
-                }
-            }
+        let lock_age_hours = fs::metadata(&lock_path).ok().and_then(|meta| {
+            meta.modified().ok().map(|mtime| {
+                Utc::now().signed_duration_since(chrono::DateTime::<Utc>::from(mtime)).num_hours()
+            })
+        }).unwrap_or(-1);
+
+        debug!("Dream check: lock_age_hours={}, trigger={}", lock_age_hours, session_count >= 5);
+
+        // If lock is fresh (<24h), skip
+        if lock_age_hours >= 0 && lock_age_hours < 24 {
+            debug!("Dream skip: lock is fresh ({} hours < 24)", lock_age_hours);
+            return false;
         }
 
         true
@@ -159,7 +164,9 @@ Output only the complete updated MEMORY.md content, no explanation.";
             current_memory, diary_text
         );
 
+        debug!("Dream: phase 3 consolidate, memory_len={}, diary_len={}", current_memory.len(), diary_text.len());
         let updated_memory = self.side_query.query_await(system, &prompt).await?;
+        debug!("Dream: phase 3 complete, updated_memory_len={}", updated_memory.len());
 
         // Write updated MEMORY.md
         fs::write(&memory_path, &updated_memory)?;

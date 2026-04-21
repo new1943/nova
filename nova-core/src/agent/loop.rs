@@ -166,6 +166,8 @@ impl QueryLoop {
             // turn after the first compaction since total_input_tokens is never reset.
             let estimated_tokens = estimate_message_tokens(&session.messages);
             let budget_pct = estimated_tokens as f32 / self.config.context_window as f32;
+            debug!("Pre-flight budget: estimated_tokens={}, budget_pct={:.1}%, compact_threshold={:.1}%",
+                estimated_tokens, budget_pct * 100.0, self.config.budget_trigger_pct * 100.0);
             if estimated_tokens > 0 && budget.needs_compact(estimated_tokens) {
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
                 // T23: Run memory consolidation before compacting (space-triggered)
@@ -175,6 +177,7 @@ impl QueryLoop {
                 // ── v2 Phase 1.5: Compact with structured result ─────────────
                 match compactor.compact_full(&session.messages, self.config.context_window, budget_pct).await {
                     Ok((compacted, result_opt)) => {
+                        debug!("Precompact triggered: messages {} -> {}", session.messages.len(), compacted.len());
                         session.messages = compacted;
                         // Update TopicTracker and MemoryBoard with compact result
                         if let Some(result) = result_opt {
@@ -268,8 +271,12 @@ impl QueryLoop {
                 }
             }
 
+            debug!("API response: text_content_len={}, tool_calls={}, usage=input:{} output:{}",
+                text_content.len(), tool_calls.len(), usage.input_tokens, usage.output_tokens);
+
             // If the stream produced nothing at all, retry automatically
             if text_content.is_empty() && tool_calls.is_empty() && !context_overflow && usage.input_tokens == 0 {
+                warn!("Empty API response, retry={}/{}", empty_retries, MAX_EMPTY_RETRIES);
                 empty_retries += 1;
                 if empty_retries >= MAX_EMPTY_RETRIES {
                     let _ = event_tx.send(LoopEvent::Error(
@@ -287,13 +294,19 @@ impl QueryLoop {
 
             // GAP 2: context-overflow → compact and retry this turn
             if context_overflow {
+                warn!("Context overflow detected, attempting compact...");
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
                 // T21.1: Write diary before compacting
                 self.write_compact_diary(&session.messages).await;
                 // Context overflow means we're at >100%, use forceful mode
                 match compactor.compact_full(&session.messages, self.config.context_window, 0.96).await {
-                    Ok((compacted, _)) if compacted.len() < session.messages.len() => {
+                    Ok((compacted, result_opt)) if compacted.len() < session.messages.len() => {
+                        debug!("Context overflow compact: messages {} -> {}", session.messages.len(), compacted.len());
                         session.messages = compacted;
+                        // Apply compact result to TopicTracker, MemoryBoard, and daily notes
+                        if let Some(result) = result_opt {
+                            self.apply_compact_result(&result).await;
+                        }
                         // Undo turn increment so retry doesn't waste a turn
                         session.turn_count = session.turn_count.saturating_sub(1);
                         continue; // Success, retry the API request
@@ -318,8 +331,11 @@ impl QueryLoop {
             // Post-flight budget check + record turn
             let input_tokens = usage.input_tokens as usize;
             let budget_pct = input_tokens as f32 / self.config.context_window as f32;
+            debug!("Post-flight budget: input_tokens={}, budget_pct={:.1}%, check={:?}",
+                input_tokens, budget_pct * 100.0, budget.check(input_tokens));
             match budget.check(input_tokens) {
                 BudgetCheck::NeedsCompact if !compaction_exhausted => {
+                    debug!("Post-flight NeedsCompact triggered");
                     let _ = event_tx.send(LoopEvent::CompactTriggered).await;
                     // T23: Run memory consolidation before compacting
                     self.run_consolidation(&mut session).await;
@@ -328,6 +344,7 @@ impl QueryLoop {
                     // ── v2 Phase 1.5: Compact with structured result ─────────────
                     match compactor.compact_full(&session.messages, self.config.context_window, budget_pct).await {
                         Ok((compacted, result_opt)) => {
+                            debug!("Post-flight compact: messages {} -> {}", session.messages.len(), compacted.len());
                             if compacted.len() >= session.messages.len() {
                                 // Compaction reached its limit, do not attempt to auto-compact again this session
                                 compaction_exhausted = true;
@@ -348,6 +365,7 @@ impl QueryLoop {
                     // Do nothing, we already know we can't compact it further. Wait for hard overflow.
                 }
                 BudgetCheck::Diminishing => {
+                    warn!("Budget diminishing returns, breaking loop");
                     let _ = event_tx.send(LoopEvent::Error(
                         "Token budget: diminishing returns, stopping".into(),
                     )).await;
@@ -367,6 +385,7 @@ impl QueryLoop {
                     arguments: tc.parse_input().unwrap_or_default(),
                 }).collect())
             };
+            let text_len = text_content.len();
             let content = if text_content.is_empty() { None } else { Some(text_content) };
             let assistant_msg = Message::assistant(content, msg_tool_calls);
 
@@ -378,6 +397,7 @@ impl QueryLoop {
 
             // No tool calls → turn done
             if tool_calls.is_empty() {
+                debug!("Loop exit: no tool_calls, text_content_len={}", text_len);
                 // --- Strategy 6: StopHooks (serial, blocking) ---
                 self.hooks.fire_stop(&mut session).await;
                 let _ = event_tx.send(LoopEvent::TurnEnd).await;
@@ -392,11 +412,28 @@ impl QueryLoop {
                 }
 
                 let input = tc.parse_input().unwrap_or_default();
-                info!("Executing tool: `{}` with args: {}", tc.name, input);
+                let input_str = serde_json::to_string(&input).unwrap_or_default();
+                let input_preview = if input_str.len() > 200 {
+                    // Truncate at character boundary to avoid half-character corruption
+                    let mut byte_index = 0;
+                    for (char_count, (i, _)) in input_str.char_indices().enumerate() {
+                        if char_count == 200 {
+                            byte_index = i;
+                            break;
+                        }
+                    }
+                    if byte_index > 0 {
+                        format!("{}...[truncated {} chars]", &input_str[..byte_index], input_str.len() - byte_index)
+                    } else {
+                        input_str.clone()
+                    }
+                } else {
+                    input_str
+                };
+                debug!("Tool call: name={}, args={}", tc.name, input_preview);
                 let mut result = match self.tools.execute(&tc.name, input.clone(), self.config.tool_timeout).await {
                     Ok(r) => {
-                        info!("Tool `{}` completed successfully ({} bytes)", tc.name, r.len());
-                        debug!("Tool result: {}", r);
+                        debug!("Tool result: name={}, result_len={}", tc.name, r.len());
                         r
                     }
                     Err(e) => {
@@ -546,26 +583,35 @@ impl QueryLoop {
                 if let Err(e) = daily.append_compact_topics(&result.archived_topics, &result.active_summary) {
                     warn!("Failed to write compact topics to diary: {}", e);
                 }
+            } else if !result.active_summary.is_empty() {
+                // No archived topics but have active summary — still record it
+                if let Err(e) = daily.append(&result.active_summary, "Compact 活跃话题") {
+                    warn!("Failed to write compact active topic to diary: {}", e);
+                }
             }
         }
     }
 }
 
-/// Estimate the token count of current messages using a simple heuristic (~4 chars per token).
-/// This gives a rough approximation of how many input tokens the next API call will use,
-/// based on the actual message content rather than the ever-growing cumulative counter.
+/// Count the token count of current messages using tiktoken (cl100k_base encoding).
+/// Falls back to character/4 estimation if tiktoken is not available.
 fn estimate_message_tokens(messages: &[Message]) -> usize {
-    let total_chars: usize = messages.iter()
-        .map(|m| {
-            let content_len = m.content.as_ref().map(|c| c.len()).unwrap_or(0);
-            let tool_len = m.tool_calls.as_ref().map(|tcs| {
-                tcs.iter().map(|tc| tc.name.len() + tc.arguments.to_string().len()).sum::<usize>()
-            }).unwrap_or(0);
-            content_len + tool_len
-        })
-        .sum();
-    // ~4 chars per token is a common rough estimate
-    total_chars / 4
+    use crate::token::counter::count_tokens;
+
+    let mut total_tokens = 0;
+    for m in messages.iter() {
+        if let Some(ref content) = m.content {
+            total_tokens += count_tokens(content);
+        }
+        if let Some(ref tool_calls) = m.tool_calls {
+            for tc in tool_calls.iter() {
+                // Count tool name and arguments as separate strings
+                total_tokens += count_tokens(&tc.name);
+                total_tokens += count_tokens(&tc.arguments.to_string());
+            }
+        }
+    }
+    total_tokens
 }
 
 /// Convert session Messages to Anthropic API message format

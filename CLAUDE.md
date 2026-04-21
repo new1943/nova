@@ -87,7 +87,7 @@ Workspace directory: `~/.nova/` containing:
 
 | # | Strategy | Module | Status |
 |:--|:--|:--|:--|
-| 1 | Query Loop | `agent/loop.rs` | ✅ 完整（含 v2 tracker 集成） |
+| 1 | Query Loop | `agent/loop.rs` | ✅ 完整（含 tracker 集成） |
 | 2 | Token Budget | `token/budget.rs` | ✅ 完整 |
 | 3 | Compact | `token/compact.rs` | ✅ 完整（双层熔断 + JSON 结构化） |
 | 4 | Forked Agent | `agent/forked.rs` | ✅ 完整 |
@@ -104,7 +104,7 @@ Workspace directory: `~/.nova/` containing:
 | 15 | Paste Store | `paste/store.rs` | ✅ 完整（hash 去重） |
 | 16 | Session JSONL | `session/` | ✅ 完整 |
 
-## NOVA v2 新增模块
+## NOVA 新增模块
 
 | 模块 | 文件 | 说明 |
 |:---|:---|:---|
@@ -132,7 +132,7 @@ Workspace directory: `~/.nova/` containing:
 
 The daemon embeds a Discord gateway as a tokio Task when `discord_enabled=true` and `DISCORD_TOKEN` is set. TUI and Discord share the same daemon session management.
 
-**v2 增强**：
+**增强**：
 - `<nova_os>` 标签在发送消息前自动过滤，不会暴露给 Discord 用户
 - 集成 TopicTracker、TensionTracker、ModeRouter（通过 QueryLoop）
 - MemoryBoard 自动更新归档话题和偏好

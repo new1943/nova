@@ -40,6 +40,9 @@ pub struct NovaConfig {
     pub discord_enabled: bool,
     /// Discord Gateway: Bot Token (required if enabled)
     pub discord_token: Option<String>,
+    /// Log level: "info" (default) or "debug"
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 fn default_api_key() -> String { String::new() }
@@ -55,6 +58,7 @@ fn default_compact_target() -> f32 { 0.6 }
 fn default_budget_trigger() -> f32 { 0.9 }
 fn default_mode() -> String { "open".into() }
 fn default_discord_enabled() -> bool { false }
+fn default_log_level() -> String { "info".into() }
 
 impl Default for NovaConfig {
     fn default() -> Self {
@@ -76,6 +80,7 @@ impl Default for NovaConfig {
             browser_headless: None,
             discord_enabled: default_discord_enabled(),
             discord_token: None,
+            log_level: default_log_level(),
         }
     }
 }

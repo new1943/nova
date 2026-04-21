@@ -10,6 +10,9 @@ pub mod grep;
 pub mod browser;
 pub mod agentic_search;
 pub mod file_tracker;
+pub mod worktree;
+pub mod agent;
+pub mod team;
 
 pub use registry::{Tool, ToolRegistry};
 pub use bash::BashTool;
@@ -21,3 +24,9 @@ pub use grep::GrepTool;
 pub use browser::BrowserTool;
 pub use agentic_search::AgenticSearchTool;
 pub use file_tracker::{FileReadTracker, create_shared_tracker, SharedFileReadTracker};
+pub use worktree::WorktreeTool;
+pub use agent::AgentTool;
+pub use team::TeamTool;
+
+// Skill tools (implemented in skills/ module)
+pub use crate::skills::{SkillManageTool, SkillsListTool, SkillViewTool};

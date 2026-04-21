@@ -2,7 +2,7 @@
 
 **版本**: v3.1
 **日期**: 2026-04-20
-**状态**: Phase 1 MVP + Phase 1 v2 (物理防御层) + Phase 1.5 + Phase 2 已完成
+**状态**: Phase 1 MVP + Phase 1 (物理防御层) + Phase 1.5 + Phase 2 已完成
 
 ---
 
@@ -433,29 +433,29 @@ main → run_app
 
 | # | 策略 | crate | 模块路径 | 关键类型 | 状态 |
 |:--|:---|:---|:---|:---|:---|
-| 1 | Query Loop | nova-core | agent/loop.rs | `QueryLoop`, `QueryLoopConfig`, `LoopEvent` | ✅ |
-| 2 | Token Budget | nova-core | token/budget.rs | `TokenBudget`, `BudgetCheck` | ✅ |
-| 3 | Compact | nova-core | token/compact.rs | `Compactor` | ✅ |
-| 4 | Forked Agent | nova-core | agent/forked.rs | `ForkedAgent` | ✅ |
-| 5 | PostSampling | nova-core | hooks/post_sampling.rs | `MemoryExtractHook` | ✅ |
-| 6 | StopHooks | nova-core | hooks/stop.rs | `MemoryExtractStopHook` | ✅ |
-| 7 | 双写互斥 | nova-core | memory/dual_write.rs | `DualWriteMemory`, `MemoryType` | ✅ |
-| 8 | 工具池排序 | nova-core | tools/registry.rs | `ToolRegistry` | ✅ |
-| 9 | Team | nova-core | team/ | `TeamManager`, `Team`, `Mailbox` | 🔧 |
-| 10 | Subagent | nova-core | subagent/spawn.rs | `SubagentSpawner`, `SubagentConfig` | 🔧 |
-| 11 | SideQuery | nova-core | sidequery/query.rs | `SideQuery` | ✅ |
-| 12 | autoDream | nova-core | dream/engine.rs | `DreamEngine` | 🔧 |
-| 13 | Worktree | nova-core | worktree/isolate.rs | `WorktreeManager`, `Worktree` | 🔧 |
-| 14 | Coordinator | nova-core | coordinator/orchestrator.rs | `Coordinator`, `CoordinatorPhase` | 🔧 |
-| 15 | Paste Store | nova-core | paste/store.rs | `PasteStore` | 🔧 |
-| 16 | Session JSONL | nova-core | session/ | `SessionManager`, `SessionHistory` | ✅ |
-| — | Heartbeat | nova-core | heartbeat/scheduler.rs | `HeartbeatScheduler` | 🔧 |
-| — | Skills | nova-core | skills/loader.rs | `SkillsLoader`, `Skill` | 🔧 |
-| — | Sandbox | nova-core | sandbox/policy.rs | `SandboxPolicy`, `SandboxLevel` | 🔧 |
-| — | Retry | nova-core | retry/policy.rs | `RetryPolicy` | 🔧 |
-| — | IPC | nova-ipc | protocol.rs + server/client | `Request`, `Event`, `IpcServer`, `IpcClient` | ✅ |
-| — | Daemon | nova-daemon | main.rs | `run_daemon`, `handle_connection` | ✅ |
-| — | TUI | nova-tui | main/app/ui/input/theme | `App`, `render`, `handle_input`, `Theme` | ✅ |
+| 1 | Query Loop | nova-core | agent/loop.rs | `QueryLoop`, `QueryLoopConfig`, `LoopEvent` | ✅ 已接入 |
+| 2 | Token Budget | nova-core | token/budget.rs | `TokenBudget`, `BudgetCheck` | ✅ 已接入 |
+| 3 | Compact | nova-core | token/compact.rs | `Compactor` | ✅ 已接入 |
+| 4 | Forked Agent | nova-core | agent/forked.rs | `ForkedAgent` | ✅ 已接入（SubagentSpawner 内部使用）|
+| 5 | PostSampling | nova-core | hooks/post_sampling.rs | `MemoryExtractHook` | 🔧 已接入框架（T21 替代）|
+| 6 | StopHooks | nova-core | hooks/stop.rs | `MemoryExtractStopHook` | 🔧 已接入框架（T21 替代）|
+| 7 | 双写互斥 | nova-core | memory/dual_write.rs | `DualWriteMemory`, `MemoryType` | ❌ 已停用 |
+| 8 | 工具池排序 | nova-core | tools/registry.rs | `ToolRegistry` | ✅ 已接入 |
+| 9 | Team | nova-core | team/ | `TeamManager`, `Team`, `Mailbox` | 🔧 待接入 |
+| 10 | Subagent | nova-core | subagent/spawn.rs | `SubagentSpawner`, `SubagentConfig` | 🔧 部分接入 |
+| 11 | SideQuery | nova-core | sidequery/query.rs | `SideQuery` | ✅ 已接入 |
+| 12 | autoDream | nova-core | dream/engine.rs | `DreamEngine` | ✅ 已接入 |
+| 13 | Worktree | nova-core | worktree/isolate.rs | `WorktreeManager`, `Worktree` | 🔧 待接入 |
+| 14 | Coordinator | nova-core | coordinator/orchestrator.rs | `Coordinator`, `CoordinatorPhase` | 🔧 待接入 |
+| 15 | Paste Store | nova-core | paste/store.rs | `PasteStore` | 🔧 待接入 |
+| 16 | Session JSONL | nova-core | session/ | `SessionManager`, `SessionHistory` | ✅ 已接入 |
+| — | Heartbeat | nova-core | heartbeat/scheduler.rs | `HeartbeatScheduler` | ✅ 已接入（scheduler 已启动，event logged）|
+| — | Skills | nova-core | skills/loader.rs | `SkillsLoader`, `Skill` | ✅ 已接入 |
+| — | Sandbox | nova-core | sandbox/policy.rs | `SandboxPolicy`, `SandboxLevel` | ✅ 已接入 |
+| — | Retry | nova-core | retry/policy.rs | `RetryPolicy` | ✅ 已接入 |
+| — | IPC | nova-ipc | protocol.rs + server/client | `Request`, `Event`, `IpcServer`, `IpcClient` | ✅ 已接入 |
+| — | Daemon | nova-daemon | main.rs | `run_daemon`, `handle_connection` | ✅ 已接入 |
+| — | TUI | nova-tui | main/app/ui/input/theme | `App`, `render`, `handle_input`, `Theme` | ✅ 已接入 |
 
 ---
 

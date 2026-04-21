@@ -360,8 +360,123 @@ frontmatter.platforms 声明支持平台，系统根据 sys.platform 过滤。
 
 ---
 
+---
+
+## 八、内置提示词（新增）
+
+### 31. MEMORY_GUIDANCE
+
+**来源**: `prompt_builder.py:MEMORY_GUIDANCE`
+
+**内容**: 明确什么该存记忆、什么不该存
+
+**借鉴价值**: 高。已在 HERMES_PROMPT.md 归档。
+
+---
+
+### 32. SESSION_SEARCH_GUIDANCE
+
+**来源**: `prompt_builder.py:SESSION_SEARCH_GUIDANCE`
+
+**内容**: 跨 session 召回指导
+
+**借鉴价值**: 高。已在 HERMES_PROMPT.md 归档。
+
+---
+
+### 33. SKILLS_GUIDANCE
+
+**来源**: `prompt_builder.py:SKILLS_GUIDANCE`
+
+**内容**: Skill 自迭代核心指导 — 创建/更新时机
+
+**借鉴价值**: 高。已在 HERMES_PROMPT.md 归档。
+
+---
+
+### 34. TOOL_USE_ENFORCEMENT_GUIDANCE
+
+**来源**: `prompt_builder.py:TOOL_USE_ENFORCEMENT_GUIDANCE`
+
+**内容**: 强制工具使用，不准光说不做
+
+**借鉴价值**: 高。已在 HERMES_PROMPT.md 归档。
+
+---
+
+### 35. OPENAI_MODEL_EXECUTION_GUIDANCE
+
+**来源**: `prompt_builder.py:OPENAI_MODEL_EXECUTION_GUIDANCE`
+
+**内容**: 执行纪律、必做清单、验证流程
+
+**借鉴价值**: 高。已在 HERMES_PROMPT.md 归档。
+
+---
+
+### 36. PLATFORM_HINTS
+
+**来源**: `prompt_builder.py:PLATFORM_HINTS`
+
+**内容**: Discord/CLI/Cron/Telegram/Weixin 等平台适配
+
+**借鉴价值**: 高。已在 HERMES_PROMPT.md 归档。
+
+---
+
+### 37. WSL_ENVIRONMENT_HINT
+
+**来源**: `prompt_builder.py:WSL_ENVIRONMENT_HINT`
+
+**内容**: WSL 环境路径转换
+
+**借鉴价值**: 中。如果 Nova 需要支持 WSL。
+
+---
+
+### 38. CONTEXT_THREAT_PATTERNS
+
+**来源**: `prompt_builder.py:_CONTEXT_THREAT_PATTERNS`
+
+**内容**: Prompt injection 检测模式（正则 + invisible unicode）
+
+**借鉴价值**: 高。已在 HERMES_PROMPT.md 归档。
+
+---
+
+### 39. GOOGLE_MODEL_OPERATIONAL_GUIDANCE
+
+**来源**: `prompt_builder.py:GOOGLE_MODEL_OPERATIONAL_GUIDANCE`
+
+**内容**: Google 模型操作指令
+
+**借鉴价值**: 中。如果 Nova 支持 Gemini/Gemma。
+
+---
+
+### 40. DEVELOPER_ROLE_MODELS
+
+**来源**: `prompt_builder.py:DEVELOPER_ROLE_MODELS`
+
+**内容**: GPT-5/Codex 应使用 developer role
+
+**借鉴价值**: 中。如果 Nova 支持多模型。
+
+---
+
 ## 待办
 
 - [ ] 采纳高优先级策略 1-8
 - [ ] 评估中优先级策略 9-22
+- [ ] 评估提示词策略 31-40
 - [ ] 后续逐一实现
+
+---
+
+## 文档归档
+
+| 文档 | 内容 |
+|:---|:---|
+| HERMES_PROMPT.md | 全系统内置提示词（记忆、执行、平台、安全） |
+| SKILL_SELF.md | Skill 自迭代方案（工具、fuzzy_match、安全、缓存） |
+| WIKI.md | LLM Wiki 外挂（使用现有工具操作 `~/.nova/wiki/`） |
