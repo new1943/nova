@@ -4,7 +4,7 @@ use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::async_trait;
 use serenity::builder::{CreateMessage, EditMessage};
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
@@ -223,22 +223,19 @@ async fn process_discord_message(
         }
     }
 
-    let content = {
-        let skills_guard = skills.lock().map_err(|e| anyhow::anyhow!("skills lock poisoned: {}", e))?;
-        if content.starts_with('/') {
-            let skill_name = content.trim_start_matches('/').split_whitespace().next().unwrap_or("");
-            if let Some(skill) = skills_guard.find_by_name(skill_name) {
-                format!("{}\n\n{}", skill.prompt, content)
-            } else {
-                content.clone()
-            }
+    let content = if content.starts_with('/') {
+        let skill_name = content.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+        if let Some(skill) = skills.find_by_name(skill_name) {
+            format!("{}\n\n{}", skill.prompt, content)
         } else {
-            let matched = skills_guard.match_auto_trigger(&content);
-            if let Some(skill) = matched.first() {
-                format!("{}\n\n{}", skill.prompt, content)
-            } else {
-                content.clone()
-            }
+            content
+        }
+    } else {
+        let matched = skills.match_auto_trigger(&content);
+        if let Some(skill) = matched.first() {
+            format!("{}\n\n{}", skill.prompt, content)
+        } else {
+            content
         }
     };
 
@@ -298,7 +295,7 @@ async fn process_discord_message(
         }
     }
 
-    let (event_tx, _event_rx) = mpsc::channel::<LoopEvent>(64);
+    let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
     let lc = loop_config.clone();
     let dn = daily_notes.clone();
     let sq_loop = side_query.clone();
@@ -323,71 +320,72 @@ async fn process_discord_message(
         }
     });
 
-    // IMPORTANT: await loop_handle BEFORE processing events.
-    // event_tx is moved into run_turn inside loop_handle. If we process events
-    // first and event_rx returns None (channel closed because event_tx dropped),
-    // we'd exit the while loop while run_turn is still executing tools.
-    // By awaiting first, we ensure run_turn fully completes (all tools executed)
-    // before we start consuming events.
-    let (updated, new_msgs) = match loop_handle.await {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Query loop task panicked: {}", e);
-            return Ok(());
-        }
-    };
-    session = updated;
-
     let builder = CreateMessage::new().content("🤔 Thinking...");
     let mut reply_msg = msg.channel_id.send_message(&ctx.http, builder).await?;
-
-    let history = session_mgr.history_for(&session);
-    for m in &new_msgs {
-        let _ = history.append(m);
-    }
-
+    
     let mut text_buffer = String::new();
-    for m in &new_msgs {
-        // Only show content (assistant text or tool result), not tool call tracking
-        if let Some(ref content) = m.content {
-            text_buffer.push_str(content);
+    let mut last_update = tokio::time::Instant::now();
+
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            LoopEvent::TextDelta(t) => {
+                text_buffer.push_str(&t);
+                if last_update.elapsed().as_secs() >= 2 && !text_buffer.is_empty() {
+                    let display = filter_nova_os(&text_buffer);
+                    let builder = EditMessage::new().content(format!("{}...", display));
+                    let _ = reply_msg.edit(&ctx.http, builder).await;
+                    last_update = tokio::time::Instant::now();
+                }
+            }
+            LoopEvent::ToolCallStart { name, .. } => {
+                let display = filter_nova_os(&text_buffer);
+                let builder = EditMessage::new().content(format!("{}...\n\n🛠️ Running tool: `{}`", display, name));
+                let _ = reply_msg.edit(&ctx.http, builder).await;
+            }
+            LoopEvent::Error(e) => {
+                let display = filter_nova_os(&text_buffer);
+                let builder = EditMessage::new().content(format!("{}...\n\n❌ Error: {}", display, e));
+                let _ = reply_msg.edit(&ctx.http, builder).await;
+            }
+            _ => {}
         }
     }
 
-    debug!("Discord event loop ended, text_buffer_len={}", text_buffer.len());
+    if let Ok((updated, new_msgs)) = loop_handle.await {
+        session = updated;
+        let history = session_mgr.history_for(&session);
+        for m in &new_msgs {
+            let _ = history.append(m);
+        }
+
+        let memory_written = new_msgs.iter().any(|m| {
+            if let Some(tcs) = &m.tool_calls {
+                tcs.iter().any(|tc| {
+                    (tc.name == "write_file" || tc.name == "file_edit") && tc.arguments.to_string().contains("MEMORY.md")
+                })
+            } else { false }
+        });
+        if memory_written {
+            session.memory_updated_mutex = true;
+        }
+
+        session_mgr.save_meta(&session)?;
+
+        if dream_engine.should_dream() {
+            let de = dream_engine.clone();
+            let mtime = session.token_stats.memory_mtime;
+            tokio::spawn(async move {
+                let _ = de.dream(mtime).await;
+            });
+        }
+    }
 
     if text_buffer.is_empty() {
         text_buffer = "Done.".into();
     }
 
-    let memory_written = new_msgs.iter().any(|m| {
-        if let Some(tcs) = &m.tool_calls {
-            tcs.iter().any(|tc| {
-                (tc.name == "write_file" || tc.name == "file_edit") && tc.arguments.to_string().contains("MEMORY.md")
-            })
-        } else { false }
-    });
-    if memory_written {
-        session.memory_updated_mutex = true;
-    }
-
-    session_mgr.save_meta(&session)?;
-
-    if dream_engine.should_dream() {
-        debug!("Discord: dream triggered, spawning background task");
-        let de = dream_engine.clone();
-        let mtime = session.token_stats.memory_mtime;
-        tokio::spawn(async move {
-            let _ = de.dream(mtime).await;
-        });
-    } else {
-        debug!("Discord: dream skipped (conditions not met)");
-    }
-
     let display = filter_nova_os(&text_buffer);
-    let display_len = display.chars().count();
-    debug!("Final edit: text_buffer_len={}, display_len={}", text_buffer.len(), display_len);
-    if display_len > 1950 {
+    if display.chars().count() > 1950 {
         let trunc_text = display.chars().take(1950).collect::<String>() + "\n...(truncated)";
         let builder = EditMessage::new().content(trunc_text);
         let _ = reply_msg.edit(&ctx.http, builder).await;
