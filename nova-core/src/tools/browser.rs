@@ -417,16 +417,21 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         "Search the internet, visit websites, and read web pages.\n\
-        Controls Chrome directly via CDP (Chrome DevTools Protocol).\n\n\
-        WORKFLOW: 1) navigate to URL → 2) snapshot to read page → 3) interact → 4) snapshot.\n\n\
+        Controls Chrome directly via CDP.\n\n\
+        WORKFLOW:\n\
+        1) navigate to URL\n\
+        2) interact (click/type/press)\n\
+        3) CRITICAL: If your action (like pressing Enter or submitting) triggers a page load or AI streaming response, you MUST call `wait_idle` next instead of `snapshot`. `wait_idle` waits for the page to settle and returns the final snapshot automatically.\n\
+        4) For normal static reads, call `snapshot`.\n\n\
         IMPORTANT:\n\
-        - Always snapshot after navigate.\n\
-        - snapshot returns [@i:N] index refs AND CSS selectors.\n\
+        - navigate automatically returns a snapshot.\n\
+        - snapshot and wait_idle return [@i:N] index refs AND CSS selectors.\n\
         - Use either in click/type.\n\
         - Do NOT close unless done with browser.\n\n\
         ACTIONS:\n\
         - navigate: {action:'navigate', url:'https://...'}\n\
-        - snapshot: {action:'snapshot'}\n\
+        - wait_idle: {action:'wait_idle'} (wait for page generation/load to finish and auto-snapshot)\n\
+        - snapshot: {action:'snapshot'} (for static pages)\n\
         - click: {action:'click', selector:'[@i:0]'}\n\
         - type: {action:'type', selector:'input', text:'text'}\n\
         - press: {action:'press', key:'Enter'}\n\
@@ -442,7 +447,7 @@ impl Tool for BrowserTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["navigate","snapshot","click","type","press",
+                    "enum": ["navigate","snapshot","click","type","press","wait_idle",
                              "scroll_down","scroll_up","screenshot","go_back","close"]
                 },
                 "url": { "type": "string" },
@@ -578,13 +583,17 @@ impl Tool for BrowserTool {
 
                 let resolved = self.resolve_selector(session, selector).await?;
 
-                // Focus then use native setter + dispatchEvent (correct for React/Vue)
+                // Focus element then use CDP Input.insertText (works for contenteditable too)
                 session.send_cmd("Runtime.evaluate", Some(json!({
                     "expression": &format!(
-                        "(function() {{ var el = document.querySelector('{}'); if (!el) return; el.focus(); var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') || Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value'); if (setter) setter.set.call(el, '{}'); el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }})()",
-                        resolved.replace('\'', "\\'"),
-                        text.replace('\'', "\\'")
+                        "(function() {{ var el = document.querySelector('{}'); if (!el) return; el.focus(); el.click(); }})()",
+                        resolved.replace('\'', "\\'")
                     )
+                }))).await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                session.send_cmd("Input.insertText", Some(json!({
+                    "text": text
                 }))).await?;
 
                 Ok(format!("Typed: {}", text))
@@ -593,11 +602,41 @@ impl Tool for BrowserTool {
                 let key = args.get("key").and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("press requires 'key'"))?;
 
+                let (code, text_val, vkey) = match key {
+                    "Enter" => ("Enter", "\r", 13),
+                    "Backspace" => ("Backspace", "", 8),
+                    "Tab" => ("Tab", "\t", 9),
+                    "Escape" => ("Escape", "", 27),
+                    "ArrowUp" => ("ArrowUp", "", 38),
+                    "ArrowDown" => ("ArrowDown", "", 40),
+                    "ArrowLeft" => ("ArrowLeft", "", 37),
+                    "ArrowRight" => ("ArrowRight", "", 39),
+                    _ => (key, key, 0),
+                };
+
                 session.send_cmd("Input.dispatchKeyEvent", Some(json!({
-                    "type": "keyDown", "text": key, "key": key
+                    "type": "rawKeyDown",
+                    "key": key,
+                    "code": code,
+                    "text": text_val,
+                    "windowsVirtualKeyCode": vkey
                 }))).await?;
+                
+                if !text_val.is_empty() {
+                    session.send_cmd("Input.dispatchKeyEvent", Some(json!({
+                        "type": "char",
+                        "key": key,
+                        "code": code,
+                        "text": text_val,
+                        "windowsVirtualKeyCode": vkey
+                    }))).await?;
+                }
+
                 session.send_cmd("Input.dispatchKeyEvent", Some(json!({
-                    "type": "keyUp", "text": key, "key": key
+                    "type": "keyUp",
+                    "key": key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vkey
                 }))).await?;
 
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -659,6 +698,44 @@ impl Tool for BrowserTool {
 
                 std::fs::write(&path, decoded)?;
                 Ok(format!("Screenshot saved: {}", path.display()))
+            }
+            "wait_idle" => {
+                let js = r#"
+                    new Promise((resolve) => {
+                        let timeout = null;
+                        let maxTimeout = setTimeout(() => {
+                            observer.disconnect();
+                            resolve('Max timeout reached (25s)');
+                        }, 25000);
+
+                        const observer = new MutationObserver(() => {
+                            if (timeout) clearTimeout(timeout);
+                            timeout = setTimeout(() => {
+                                clearTimeout(maxTimeout);
+                                observer.disconnect();
+                                resolve('DOM idle');
+                            }, 2000);
+                        });
+
+                        observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+
+                        timeout = setTimeout(() => {
+                            clearTimeout(maxTimeout);
+                            observer.disconnect();
+                            resolve('DOM idle (no initial mutations)');
+                        }, 2000);
+                    })
+                "#;
+                
+                let _res: Value = session.send_cmd("Runtime.evaluate", Some(json!({
+                    "expression": js,
+                    "awaitPromise": true,
+                    "returnByValue": true
+                }))).await?;
+
+                let snap = self.get_snapshot(session).await?;
+                let count = self.count_interactives(session).await?;
+                Ok(format!("Waited for page idle.\n[{} interactive elements]\n\n{}", count, snap))
             }
             "go_back" => {
                 session.send_cmd("Page.goBack", None).await.ok();
