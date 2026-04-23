@@ -133,6 +133,22 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Clear a session's messages and reset its stats, useful for Discord where session ID is tied to channel
+    pub fn clear_session(&self, session: &mut Session) -> Result<()> {
+        let history = self.history_for(session);
+        history.clear()?;
+        
+        session.messages.clear();
+        session.turn_count = 0;
+        session.token_stats = TokenStats::default();
+        session.last_memory_sweep_index = 0;
+        session.memory_updated_mutex = false;
+        
+        self.save_meta(session)?;
+        Ok(())
+    }
+
+
     /// Find and resume a specific session by ID
     pub fn resume_by_id(&self, session_id: &str) -> Result<Option<Session>> {
         let meta_path = self.sessions_dir.join(format!("{}.meta.json", session_id));

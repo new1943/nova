@@ -29,6 +29,14 @@ impl SessionHistory {
         Ok(())
     }
 
+    /// Clear the JSONL file
+    pub fn clear(&self) -> Result<()> {
+        if self.path.exists() {
+            fs::File::create(&self.path)?; // Truncates the file
+        }
+        Ok(())
+    }
+
     /// Load all messages from JSONL file
     pub fn load_all(&self) -> Result<Vec<Message>> {
         if !self.path.exists() {

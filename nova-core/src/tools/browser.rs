@@ -1,118 +1,25 @@
-//! Browser tool — Direct CDP WebSocket control of Chrome.
+//! Browser tool — High-level CDP via chromiumoxide
 //!
 //! 架构：
-//! - 用 tokio-tungstenite 直接连 Chrome CDP WebSocket
-//! - 不需要 Node.js / Playwright server
-//! - Chrome 开着就直接连，没开就启动
-//! - 使用正确的 CDP 命令，触发 React/Vue controlled components
+//! - 基于 chromiumoxide 库封装
+//! - 自动关联已存在的 Chrome，复用用户目录避免 Anti-Bot 拦截
+//! - 稳定的 DOM 等待与输入控制
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tracing::{info, warn};
-use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
+
+use chromiumoxide::browser::Browser;
+use chromiumoxide::page::Page;
+use futures_util::StreamExt;
 
 use crate::tools::registry::Tool;
 use crate::tools::truncate::truncate_browser;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// CDP JSON-RPC types
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize)]
-struct CdpRequest {
-    id: u64,
-    method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdpResponse {
-    id: u64,
-    #[serde(rename = "result")]
-    result: Option<Value>,
-    #[serde(rename = "error")]
-    error: Option<CdpError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdpError {
-    code: i64,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct TargetInfo {
-    id: String,
-    #[serde(rename = "webSocketDebuggerUrl")]
-    web_socket_debugger_url: Option<String>,
-    #[serde(rename = "type")]
-    target_type: String,
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// CDP Session
-// ──────────────────────────────────────────────────────────────────────────────
-
-struct CdpSession {
-    ws: WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    _chrome_child: Option<tokio::process::Child>,
-}
-
-impl CdpSession {
-    /// Send CDP command, return result.
-    async fn send_cmd(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
-        let id = rand_id();
-        let req = CdpRequest {
-            id,
-            method: method.to_string(),
-            params,
-        };
-        let msg = serde_json::to_string(&req)?;
-        self.ws.send(Message::Text(msg)).await
-            .map_err(|e| anyhow!("send error: {}", e))?;
-
-        loop {
-            let opt = tokio::time::timeout(Duration::from_secs(30), self.ws.next()).await;
-            let msg = match opt {
-                Ok(Some(Ok(m))) => m,
-                Ok(Some(Err(e))) => anyhow::bail!("recv error: {}", e),
-                Ok(None) => anyhow::bail!("stream ended"),
-                Err(_) => anyhow::bail!("timeout waiting for CDP response"),
-            };
-
-            match msg {
-                Message::Text(text) => {
-                    if let Ok(resp) = serde_json::from_str::<CdpResponse>(&text) {
-                        if resp.id == id {
-                            if let Some(err) = resp.error {
-                                anyhow::bail!("CDP error {}: {}", err.code, err.message);
-                            }
-                            return Ok(resp.result.unwrap_or(json!({})));
-                        }
-                    }
-                }
-                Message::Ping(data) => {
-                    self.ws.send(Message::Pong(data)).await.ok();
-                }
-                _ => {}
-            }
-        }
-    }
-
-    async fn enable(&mut self, domain: &str) -> Result<()> {
-        self.send_cmd(&format!("{}.enable", domain), None).await?;
-        Ok(())
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Snapshot JS
@@ -125,7 +32,7 @@ const SNAPSHOT_COMPACT_JS: &str = r#"
     result.push('URL: ' + location.href);
     result.push('');
 
-    var links = Array.slice.call(document.querySelectorAll('a[href]')).slice(0, 50);
+    var links = Array.prototype.slice.call(document.querySelectorAll('a[href]')).slice(0, 50);
     if (links.length) {
         result.push('--- Links ---');
         links.forEach(function(a, i) {
@@ -135,9 +42,15 @@ const SNAPSHOT_COMPACT_JS: &str = r#"
         result.push('');
     }
 
-    var inputs = Array.slice.call(document.querySelectorAll(
-        'input,textarea,select,button,[role="button"],[contenteditable]'
-    )).slice(0, 40);
+    var textInputs = Array.prototype.slice.call(document.querySelectorAll(
+        'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="checkbox"]):not([type="radio"]), textarea, [contenteditable], [role="textbox"], [role="search"]'
+    ));
+    var otherInteractives = Array.prototype.slice.call(document.querySelectorAll(
+        'button, select, input[type="button"], input[type="submit"], input[type="checkbox"], input[type="radio"], [role="button"], [role="switch"], [role="checkbox"], [role="menuitem"]'
+    ));
+    var inputs = textInputs.concat(otherInteractives).filter(function(item, pos, self) {
+        return self.indexOf(item) === pos;
+    }).slice(0, 80);
     if (inputs.length) {
         result.push('--- Interactive Elements ---');
         inputs.forEach(function(el, i) {
@@ -145,17 +58,18 @@ const SNAPSHOT_COMPACT_JS: &str = r#"
             var type = el.type || '';
             var name = el.name || '';
             var id = el.id || '';
-            var ph = el.placeholder || '';
+            var aria = el.getAttribute('aria-label') || el.title || '';
+            var ph = el.placeholder || aria || '';
             var text = (el.textContent || '').trim().substring(0, 50);
             var val = (el.value || '').substring(0, 30);
 
             var sel;
             if (id) sel = '#' + CSS.escape(id);
             else if (name) sel = tag + '[name="' + name + '"]';
-            else if (ph) sel = tag + '[placeholder="' + ph.substring(0, 40) + '"]';
+            else if (el.placeholder) sel = tag + '[placeholder="' + el.placeholder.substring(0, 40) + '"]';
             else {
                 var parent = el.parentElement;
-                var siblings = parent ? Array.slice.call(parent.querySelectorAll(':scope > ' + tag)) : [];
+                var siblings = parent ? Array.prototype.slice.call(parent.querySelectorAll(':scope > ' + tag)) : [];
                 var idx = siblings.indexOf(el);
                 sel = tag + ':nth-child(' + (idx + 1) + ')';
             }
@@ -163,13 +77,19 @@ const SNAPSHOT_COMPACT_JS: &str = r#"
             var desc = '[@i:' + i + '] [' + tag + '] ';
             if (type) desc += 'type=' + type + ' ';
             if (name) desc += 'name="' + name + '" ';
-            if (ph) desc += 'placeholder="' + ph + '" ';
+            if (ph) desc += 'placeholder/aria="' + ph + '" ';
             if (text) desc += 'text="' + text + '" ';
             if (val) desc += 'value="' + val + '" ';
             desc += '\u2192 selector: ' + sel;
             result.push(desc);
         });
+        result.push('');
     }
+
+    result.push('--- Visible Text Content ---');
+    var bodyText = document.body.innerText || '';
+    // Just include a healthy chunk of the text. Truncation handles the rest if it's too huge.
+    result.push(bodyText.substring(0, 8000));
 
     return result.join('\n');
 })()
@@ -182,14 +102,8 @@ const SNAPSHOT_COMPACT_JS: &str = r#"
 pub struct BrowserTool {
     chrome_path: Option<String>,
     user_data_dir: String,
-    _headless: bool,
-    session: Arc<Mutex<Option<CdpSession>>>,
-}
-
-fn rand_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::SeqCst)
+    headless: bool,
+    session: Arc<Mutex<Option<(Browser, Page, Option<tokio::process::Child>)>>>,
 }
 
 impl BrowserTool {
@@ -209,7 +123,7 @@ impl BrowserTool {
         Self {
             chrome_path,
             user_data_dir: profile_dir,
-            _headless: headless,
+            headless,
             session: Arc::new(Mutex::new(None)),
         }
     }
@@ -228,81 +142,26 @@ impl BrowserTool {
             .map(|s| s.to_string())
     }
 
-    /// Get page WebSocket URL from /json endpoint.
-    async fn get_page_ws_url(&self, port: u16) -> Result<String> {
-        let url = format!("http://127.0.0.1:{}/json", port);
-        let output = Command::new("curl")
-            .args(["--max-time", "2", &url])
-            .output()
-            .await?;
-        if !output.status.success() {
-            anyhow::bail!("curl failed");
-        }
-        let body = String::from_utf8_lossy(&output.stdout);
-        if body.is_empty() {
-            anyhow::bail!("empty response");
-        }
-        let targets: Vec<TargetInfo> = serde_json::from_str(&body)
-            .map_err(|e| anyhow!("failed to parse: {}", e))?;
-
-        for target in targets {
-            if target.target_type == "page" {
-                if let Some(ws_url) = target.web_socket_debugger_url {
-                    return Ok(ws_url);
-                }
-            }
-        }
-        anyhow::bail!("No page target found");
-    }
-
-    /// Wait for Chrome CDP port to have a page target.
-    async fn wait_for_page(&self, port: u16) -> Result<String> {
-        for _ in 0..100 {
-            if let Ok(url) = self.get_page_ws_url(port).await {
-                return Ok(url);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        anyhow::bail!("No page target after 10s")
-    }
-
-    /// Connect WebSocket with retries.
-    async fn connect_ws(&self, url: &str) -> Result<WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>> {
-        info!("WS connecting to: {}", url);
-        for attempt in 0..5 {
-            match connect_async(url).await {
-                Ok((ws, _)) => {
-                    info!("WS connected");
-                    return Ok(ws);
-                }
-                Err(e) if attempt < 4 => {
-                    info!("WS attempt {} failed: {}, retrying...", attempt + 1, e);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-                Err(e) => anyhow::bail!("WS connect failed after 5 attempts: {}", e),
-            }
-        }
-        unreachable!()
-    }
-
     /// Launch Chrome with debug port.
     async fn launch_chrome(&self, chrome: &str, port: u16) -> Result<tokio::process::Child> {
-        Command::new(chrome)
-            .args([
-                &format!("--remote-debugging-port={}", port),
-                &format!("--user-data-dir={}", self.user_data_dir),
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-default-apps",
-                "--disable-extensions",
-                "--disable-popup-blocking",
-            ])
-            .spawn()
-            .map_err(|e| anyhow!("Failed to launch Chrome: {}", e))
+        let mut cmd = Command::new(chrome);
+        cmd.args([
+            &format!("--remote-debugging-port={}", port),
+            &format!("--user-data-dir={}", self.user_data_dir),
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-popup-blocking",
+        ]);
+        if self.headless {
+            cmd.arg("--headless=new");
+        }
+        cmd.spawn().map_err(|e| anyhow!("Failed to launch Chrome: {}", e))
     }
 
-    /// Start CDP session.
-    async fn start_session(&self) -> Result<CdpSession> {
+    /// Start CDP session using chromiumoxide
+    async fn start_session(&self) -> Result<(Browser, Page, Option<tokio::process::Child>)> {
         let chrome = self
             .chrome_path
             .clone()
@@ -313,38 +172,75 @@ impl BrowserTool {
 
         let port = 9222u16;
 
-        // Step 1: Try to get page WebSocket URL (Chrome already running)
-        match self.get_page_ws_url(port).await {
-            Ok(page_url) => {
-                // Chrome is running, connect to existing page
-                info!("Chrome already running, connecting to page...");
-                let ws = self.connect_ws(&page_url).await?;
-                let mut session = CdpSession { ws, _chrome_child: None };
-                session.enable("Page").await?;
-                session.enable("Runtime").await?;
-                session.enable("DOM").await?;
-                info!("CDP session ready (existing Chrome)");
-                return Ok(session);
+        // Try to get browser websocket URL to see if it's already running
+        let (ws_url, child) = match self.get_browser_ws_url(port).await {
+            Ok(url) => {
+                info!("Chrome already running, connecting to browser...");
+                (url, None)
             }
             Err(_) => {
-                // Chrome not running, launch it
                 info!("Chrome not running, launching...");
                 let child = self.launch_chrome(&chrome, port).await?;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let page_url = self.wait_for_page(port).await?;
-                let ws = self.connect_ws(&page_url).await?;
-                let mut session = CdpSession { ws, _chrome_child: Some(child) };
-                session.enable("Page").await?;
-                session.enable("Runtime").await?;
-                session.enable("DOM").await?;
-                info!("CDP session ready (new Chrome)");
-                return Ok(session);
+                // Wait up to 5 seconds for chrome to start
+                let mut url = String::new();
+                for _ in 0..50 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if let Ok(u) = self.get_browser_ws_url(port).await {
+                        url = u;
+                        break;
+                    }
+                }
+                if url.is_empty() {
+                    anyhow::bail!("Failed to get browser ws url after 5s");
+                }
+                (url, Some(child))
             }
+        };
+
+        // Connect using chromiumoxide
+        let (browser, mut handler) = Browser::connect(&ws_url).await
+            .map_err(|e| anyhow!("Failed to connect chromiumoxide: {}", e))?;
+
+        // Must spawn the handler
+        tokio::spawn(async move {
+            while let Some(h) = handler.next().await {
+                if h.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Get or create page
+        let pages = browser.pages().await.map_err(|e| anyhow!("Failed to list pages: {}", e))?;
+        let page = if pages.is_empty() {
+            browser.new_page("about:blank").await.map_err(|e| anyhow!("Failed to create page: {}", e))?
+        } else {
+            pages[0].clone()
+        };
+
+        Ok((browser, page, child))
+    }
+
+    async fn get_browser_ws_url(&self, port: u16) -> Result<String> {
+        let url = format!("http://127.0.0.1:{}/json/version", port);
+        let output = Command::new("curl")
+            .args(["--max-time", "2", "-s", &url])
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!("curl failed");
         }
+        let body = String::from_utf8_lossy(&output.stdout);
+        let info: serde_json::Value = serde_json::from_str(&body)?;
+        
+        if let Some(ws_url) = info.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+            return Ok(ws_url.to_string());
+        }
+        anyhow::bail!("No browser webSocketDebuggerUrl found");
     }
 
     /// Resolve [@i:N] or [@link:N] to CSS selector.
-    async fn resolve_selector(&self, session: &mut CdpSession, selector: &str) -> Result<String> {
+    async fn resolve_selector(&self, page: &Page, selector: &str) -> Result<String> {
         if !selector.starts_with("[@") {
             return Ok(selector.to_string());
         }
@@ -359,55 +255,104 @@ impl BrowserTool {
 
         let js = if kind == "i" {
             format!(r#"(function() {{
-                var els = Array.slice.call(document.querySelectorAll(
-                    'input,textarea,select,button,[role="button"],[contenteditable]'
-                ));
+                var textInputs = Array.prototype.slice.call(document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="checkbox"]):not([type="radio"]), textarea, [contenteditable], [role="textbox"], [role="search"]'));
+                var others = Array.prototype.slice.call(document.querySelectorAll('button, select, input[type="button"], input[type="submit"], input[type="checkbox"], input[type="radio"], [role="button"], [role="switch"], [role="checkbox"], [role="menuitem"]'));
+                var els = textInputs.concat(others).filter(function(item, pos, self) {{ return self.indexOf(item) === pos; }});
                 if ({n} >= els.length) return null;
                 var el = els[{n}];
                 if (!el) return null;
-                if (el.id) return '#' + CSS.escape(el.id);
-                if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
-                if (el.placeholder) return el.tagName.toLowerCase()
-                    + '[placeholder="' + el.placeholder.substring(0,40) + '"]';
-                var parent = el.parentElement;
-                var siblings = parent ? Array.slice.call(
-                    parent.querySelectorAll(':scope > ' + el.tagName.toLowerCase())
-                ) : [];
-                var idx = siblings.indexOf(el);
-                return el.tagName.toLowerCase() + ':nth-child(' + (idx + 1) + ')';
+
+                var path = [];
+                var current = el;
+                while (current && current.nodeType === 1) {{
+                    if (current.id) {{
+                        path.unshift('#' + CSS.escape(current.id));
+                        break;
+                    }}
+                    var tagName = current.tagName.toLowerCase();
+                    var parent = current.parentElement;
+                    if (!parent) {{
+                        path.unshift(tagName);
+                        break;
+                    }}
+                    var siblings = parent.children;
+                    var sameTagSiblings = [];
+                    for (var i = 0; i < siblings.length; i++) {{
+                        if (siblings[i].tagName.toLowerCase() === tagName) {{
+                            sameTagSiblings.push(siblings[i]);
+                        }}
+                    }}
+                    if (sameTagSiblings.length > 1) {{
+                        var idx = sameTagSiblings.indexOf(current);
+                        path.unshift(tagName + ':nth-of-type(' + (idx + 1) + ')');
+                    }} else {{
+                        path.unshift(tagName);
+                    }}
+                    current = parent;
+                }}
+                return path.join(' > ');
             }})()"#, n = n)
         } else if kind == "link" {
             format!(r#"(function() {{
-                var links = Array.slice.call(document.querySelectorAll('a[href]'));
+                var links = Array.prototype.slice.call(document.querySelectorAll('a[href]'));
                 if ({n} >= links.length) return null;
                 var a = links[{n}];
                 if (!a) return null;
-                if (a.id) return '#' + CSS.escape(a.id);
-                var parent = a.parentElement;
-                var siblings = parent ? Array.slice.call(
-                    parent.querySelectorAll(':scope > a')
-                ) : [];
-                var idx = siblings.indexOf(a);
-                return 'a:nth-child(' + (idx + 1) + ')';
+                
+                var path = [];
+                var current = a;
+                while (current && current.nodeType === 1) {{
+                    if (current.id) {{
+                        path.unshift('#' + CSS.escape(current.id));
+                        break;
+                    }}
+                    var tagName = current.tagName.toLowerCase();
+                    var parent = current.parentElement;
+                    if (!parent) {{
+                        path.unshift(tagName);
+                        break;
+                    }}
+                    var siblings = parent.children;
+                    var sameTagSiblings = [];
+                    for (var i = 0; i < siblings.length; i++) {{
+                        if (siblings[i].tagName.toLowerCase() === tagName) {{
+                            sameTagSiblings.push(siblings[i]);
+                        }}
+                    }}
+                    if (sameTagSiblings.length > 1) {{
+                        var idx = sameTagSiblings.indexOf(current);
+                        path.unshift(tagName + ':nth-of-type(' + (idx + 1) + ')');
+                    }} else {{
+                        path.unshift(tagName);
+                    }}
+                    current = parent;
+                }}
+                return path.join(' > ');
             }})()"#, n = n)
         } else {
             return Ok(selector.to_string());
         };
 
-        let result: Value = session.send_cmd("Runtime.evaluate", Some(json!({
-            "expression": js,
-            "returnByValue": true
-        }))).await?;
-
-        let resolved = result.get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let result = page.evaluate(js).await?;
+        let resolved = result.into_value::<Option<String>>()?.unwrap_or_default();
 
         if resolved.is_empty() || resolved == "null" {
             return Err(anyhow!("Element {} not found", selector));
         }
-        Ok(resolved.to_string())
+        Ok(resolved)
+    }
+
+    async fn get_snapshot(&self, page: &Page) -> Result<String> {
+        let result = page.evaluate(SNAPSHOT_COMPACT_JS).await?;
+        let snap = result.into_value::<String>()?;
+        Ok(truncate_browser(&snap))
+    }
+
+    async fn count_interactives(&self, page: &Page) -> Result<usize> {
+        let js = r#"(function() { return document.querySelectorAll('input,textarea,select,button,[role="button"],[contenteditable],[role="textbox"],[role="search"]').length; })()"#;
+        let result = page.evaluate(js).await?;
+        let count = result.into_value::<usize>()?;
+        Ok(count)
     }
 }
 
@@ -466,7 +411,7 @@ impl Tool for BrowserTool {
 
         if action == "close" {
             let mut guard = self.session.lock().await;
-            *guard = None;
+            *guard = None; // Drop browser and child
             return Ok("Browser closed".into());
         }
 
@@ -482,21 +427,23 @@ impl Tool for BrowserTool {
         }
 
         let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or_else(|| anyhow!("No session"))?;
+        let (_, page, _) = guard.as_mut().ok_or_else(|| anyhow!("No session"))?;
 
         let result: Result<String> = match action {
             "navigate" => {
                 let url = args.get("url").and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("navigate requires 'url'"))?;
 
-                let _: Value = session.send_cmd("Page.navigate", Some(json!({ "url": url }))).await?;
+                page.goto(url).await?;
+                page.wait_for_navigation().await?;
 
-                // Wait for load
-                self.wait_for_load(session).await?;
-
-                let (title, current_url) = self.get_page_info(session).await?;
-                let snap = self.get_snapshot(session).await?;
-                let count = self.count_interactives(session).await?;
+                let title_result = page.evaluate("document.title").await?;
+                let title = title_result.into_value::<String>().unwrap_or_default();
+                let url_result = page.evaluate("location.href").await?;
+                let current_url = url_result.into_value::<String>().unwrap_or_default();
+                
+                let snap = self.get_snapshot(page).await?;
+                let count = self.count_interactives(page).await?;
 
                 let blocked_patterns = [
                     "access denied", "blocked", "bot detected", "verification required",
@@ -516,61 +463,21 @@ impl Tool for BrowserTool {
             "snapshot" => {
                 let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
                 if full {
-                    let result: Value = session.send_cmd("Runtime.evaluate", Some(json!({
-                        "expression": "document.documentElement.outerHTML",
-                        "returnByValue": true
-                    }))).await?;
-                    let content = result.get("result")
-                        .and_then(|r| r.get("value"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    return Ok(format!("[full page]\n\n{}", truncate_browser(content)));
+                    let result = page.evaluate("document.documentElement.outerHTML").await?;
+                    let content = result.into_value::<String>().unwrap_or_default();
+                    return Ok(format!("[full page]\n\n{}", truncate_browser(&content)));
                 }
-                let snap = self.get_snapshot(session).await?;
-                let count = self.count_interactives(session).await?;
+                let snap = self.get_snapshot(page).await?;
+                let count = self.count_interactives(page).await?;
                 Ok(format!("[{} interactive elements]\n\n{}", count, snap))
             }
             "click" => {
                 let selector = args.get("selector").and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("click requires 'selector'"))?;
-                let resolved = self.resolve_selector(session, selector).await?;
+                let resolved = self.resolve_selector(page, selector).await?;
 
-                // Get element center
-                let result: Value = session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": &format!(
-                        "(function() {{ var el = document.querySelector('{}'); if (!el) return null; var r = el.getBoundingClientRect(); return {{ x: r.left + r.width/2, y: r.top + r.height/2 }}; }})()",
-                        resolved.replace('\'', "\\'")
-                    ),
-                    "returnByValue": true
-                }))).await?;
-
-                let point = result.get("result")
-                    .and_then(|r| r.get("value"))
-                    .ok_or_else(|| anyhow!("Could not get element position"))?;
-                let x = point.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let y = point.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-                // Scroll into view
-                session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": &format!(
-                        "document.querySelector('{}').scrollIntoViewIfNeeded()",
-                        resolved.replace('\'', "\\'")
-                    )
-                }))).await.ok();
-
-                tokio::time::sleep(Duration::from_millis(200)).await;
-
-                // Click
-                session.send_cmd("Input.dispatchMouseEvent", Some(json!({
-                    "type": "mousePressed",
-                    "x": x, "y": y,
-                    "button": "left", "clickCount": 1
-                }))).await?;
-                session.send_cmd("Input.dispatchMouseEvent", Some(json!({
-                    "type": "mouseReleased",
-                    "x": x, "y": y,
-                    "button": "left", "clickCount": 1
-                }))).await?;
+                let el = page.find_element(&resolved).await?;
+                el.click().await?;
 
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 Ok("Clicked".into())
@@ -581,122 +488,74 @@ impl Tool for BrowserTool {
                 let text = args.get("text").and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("type requires 'text'"))?;
 
-                let resolved = self.resolve_selector(session, selector).await?;
+                let resolved = self.resolve_selector(page, selector).await?;
 
-                // Focus element then use CDP Input.insertText (works for contenteditable too)
-                session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": &format!(
-                        "(function() {{ var el = document.querySelector('{}'); if (!el) return; el.focus(); el.click(); }})()",
-                        resolved.replace('\'', "\\'")
-                    )
-                }))).await?;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                session.send_cmd("Input.insertText", Some(json!({
-                    "text": text
-                }))).await?;
+                let el = page.find_element(&resolved).await?;
+                el.click().await?; // focus it first
+                
+                // Chromiumoxide native typing (simulates real keystrokes)
+                el.type_str(text).await?;
 
                 Ok(format!("Typed: {}", text))
             }
             "press" => {
                 let key = args.get("key").and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("press requires 'key'"))?;
-
-                let (code, text_val, vkey) = match key {
-                    "Enter" => ("Enter", "\r", 13),
-                    "Backspace" => ("Backspace", "", 8),
-                    "Tab" => ("Tab", "\t", 9),
-                    "Escape" => ("Escape", "", 27),
-                    "ArrowUp" => ("ArrowUp", "", 38),
-                    "ArrowDown" => ("ArrowDown", "", 40),
-                    "ArrowLeft" => ("ArrowLeft", "", 37),
-                    "ArrowRight" => ("ArrowRight", "", 39),
-                    _ => (key, key, 0),
-                };
-
-                session.send_cmd("Input.dispatchKeyEvent", Some(json!({
-                    "type": "rawKeyDown",
-                    "key": key,
-                    "code": code,
-                    "text": text_val,
-                    "windowsVirtualKeyCode": vkey
-                }))).await?;
                 
-                if !text_val.is_empty() {
-                    session.send_cmd("Input.dispatchKeyEvent", Some(json!({
-                        "type": "char",
-                        "key": key,
-                        "code": code,
-                        "text": text_val,
-                        "windowsVirtualKeyCode": vkey
-                    }))).await?;
-                }
+                // Just use evaluate with modern KeyboardEvent synthesis since raw CDP keys can be tedious 
+                // However, the best way for forms is sometimes raw CDP or specific enter logic.
+                use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+                
+                let key_down = DispatchKeyEventParams::builder()
+                    .r#type(DispatchKeyEventType::KeyDown)
+                    .text(key.to_string())
+                    .key(key.to_string())
+                    .build()
+                    .unwrap();
+                page.execute(key_down).await?;
 
-                session.send_cmd("Input.dispatchKeyEvent", Some(json!({
-                    "type": "keyUp",
-                    "key": key,
-                    "code": code,
-                    "windowsVirtualKeyCode": vkey
-                }))).await?;
+                let key_up = DispatchKeyEventParams::builder()
+                    .r#type(DispatchKeyEventType::KeyUp)
+                    .text(key.to_string())
+                    .key(key.to_string())
+                    .build()
+                    .unwrap();
+                page.execute(key_up).await?;
 
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 Ok(format!("Pressed: {}", key))
             }
             "scroll_down" => {
-                session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": "window.scrollBy(0, 600)"
-                }))).await?;
+                page.evaluate("window.scrollBy(0, 600)").await?;
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
-                let preview: String = session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": r#"(function() { return Array.slice.call(document.querySelectorAll('h1,h2,h3,h4,p,li,a,button,input,span')).slice(0,6).map(function(e) { return e.textContent.trim().substring(0,80); }).filter(function(t) { return t.length > 3; }).join('\n'); })()"#,
-                    "returnByValue": true
-                }))).await?
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
+                let preview = page.evaluate(r#"(function() { return Array.prototype.slice.call(document.querySelectorAll('h1,h2,h3,h4,p,li,a,button,input,span')).slice(0,6).map(function(e) { return e.textContent.trim().substring(0,80); }).filter(function(t) { return t.length > 3; }).join('\n'); })()"#).await?.into_value::<String>().unwrap_or_default();
                 Ok(format!("Scrolled down\n\nVisible:\n{}", preview))
             }
             "scroll_up" => {
-                session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": "window.scrollBy(0, -600)"
-                }))).await?;
+                page.evaluate("window.scrollBy(0, -600)").await?;
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
-                let preview: String = session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": r#"(function() { return Array.slice.call(document.querySelectorAll('h1,h2,h3,h4,p,li,a,button,input,span')).slice(0,6).map(function(e) { return e.textContent.trim().substring(0,80); }).filter(function(t) { return t.length > 3; }).join('\n'); })()"#,
-                    "returnByValue": true
-                }))).await?
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
+                let preview = page.evaluate(r#"(function() { return Array.prototype.slice.call(document.querySelectorAll('h1,h2,h3,h4,p,li,a,button,input,span')).slice(0,6).map(function(e) { return e.textContent.trim().substring(0,80); }).filter(function(t) { return t.length > 3; }).join('\n'); })()"#).await?.into_value::<String>().unwrap_or_default();
                 Ok(format!("Scrolled up\n\nVisible:\n{}", preview))
             }
             "screenshot" => {
-                let result: Value = session.send_cmd("Page.captureScreenshot", Some(json!({
-                    "format": "png"
-                }))).await?;
-
-                let data = result.get("data")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("No screenshot data"))?;
-
                 let dir = dirs::home_dir().unwrap_or_default().join(".nova/browser-screenshots");
                 std::fs::create_dir_all(&dir)?;
                 let path = dir.join(format!("{}.png", chrono::Utc::now().format("%Y%m%d_%H%M%S")));
 
-                let decoded = base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    data
-                ).map_err(|e| anyhow!("base64 error: {}", e))?;
+                let data = page.pdf(chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams::default()).await?;
+                // Wait, chromiumoxide natively supports save_screenshot
+                use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+                use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotParams;
+                
+                let screenshot_params = CaptureScreenshotParams::builder()
+                    .format(CaptureScreenshotFormat::Png)
+                    .build();
 
-                std::fs::write(&path, decoded)?;
+                // It provides save_screenshot directly
+                page.save_screenshot(screenshot_params, &path).await?;
+
                 Ok(format!("Screenshot saved: {}", path.display()))
             }
             "wait_idle" => {
@@ -704,11 +563,11 @@ impl Tool for BrowserTool {
                     new Promise((resolve) => {
                         let timeout = null;
                         let maxTimeout = setTimeout(() => {
-                            observer.disconnect();
+                            if (typeof observer !== 'undefined') observer.disconnect();
                             resolve('Max timeout reached (25s)');
                         }, 25000);
 
-                        const observer = new MutationObserver(() => {
+                        let observer = new MutationObserver(() => {
                             if (timeout) clearTimeout(timeout);
                             timeout = setTimeout(() => {
                                 clearTimeout(maxTimeout);
@@ -727,20 +586,17 @@ impl Tool for BrowserTool {
                     })
                 "#;
                 
-                let _res: Value = session.send_cmd("Runtime.evaluate", Some(json!({
-                    "expression": js,
-                    "awaitPromise": true,
-                    "returnByValue": true
-                }))).await?;
-
-                let snap = self.get_snapshot(session).await?;
-                let count = self.count_interactives(session).await?;
+                page.evaluate(js).await?;
+                let snap = self.get_snapshot(page).await?;
+                let count = self.count_interactives(page).await?;
                 Ok(format!("Waited for page idle.\n[{} interactive elements]\n\n{}", count, snap))
             }
             "go_back" => {
-                session.send_cmd("Page.goBack", None).await.ok();
+                page.evaluate("window.history.back()").await?;
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let (title, url) = self.get_page_info(session).await?;
+                
+                let title = page.evaluate("document.title").await?.into_value::<String>().unwrap_or_default();
+                let url = page.evaluate("location.href").await?.into_value::<String>().unwrap_or_default();
                 Ok(format!("Went back to: {}\nTitle: {}", url, title))
             }
             other => Err(anyhow!("Unknown action: '{}'", other)),
@@ -756,75 +612,5 @@ impl Tool for BrowserTool {
                 Err(e)
             }
         }
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-impl BrowserTool {
-    async fn wait_for_load(&self, session: &mut CdpSession) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("Load timeout");
-            }
-            let opt = tokio::time::timeout(Duration::from_secs(1), session.ws.next()).await;
-            if let Ok(Some(Ok(Message::Text(text)))) = opt {
-                if let Ok(evt) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if evt.get("method").and_then(|m| m.as_str()) == Some("Page.loadEventFired") {
-                        return Ok(());
-                    }
-                }
-            }
-            // Also check if we got a navigation-related response
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    async fn get_page_info(&self, session: &mut CdpSession) -> Result<(String, String)> {
-        let result: Value = session.send_cmd("Runtime.evaluate", Some(json!({
-            "expression": "JSON.stringify({title: document.title, url: location.href})",
-            "returnByValue": true
-        }))).await?;
-
-        let s = result.get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(r#"{"title":"","url":""}"#);
-
-        let info: serde_json::Value = serde_json::from_str(s)
-            .unwrap_or_else(|_| json!({"title": "", "url": ""}));
-        let title = info.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        Ok((title, url))
-    }
-
-    async fn get_snapshot(&self, session: &mut CdpSession) -> Result<String> {
-        let result: Value = session.send_cmd("Runtime.evaluate", Some(json!({
-            "expression": SNAPSHOT_COMPACT_JS,
-            "returnByValue": true
-        }))).await?;
-
-        let snap = result.get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        Ok(truncate_browser(snap))
-    }
-
-    async fn count_interactives(&self, session: &mut CdpSession) -> Result<usize> {
-        let result: Value = session.send_cmd("Runtime.evaluate", Some(json!({
-            "expression": "String(document.querySelectorAll('input,textarea,select,button,[role=\"button\"],[contenteditable],a[href]').length)",
-            "returnByValue": true
-        }))).await?;
-
-        let s = result.get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("0");
-        Ok(s.trim().parse().unwrap_or(0))
     }
 }

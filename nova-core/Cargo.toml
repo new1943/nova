@@ -24,3 +24,6 @@ tiktoken-rs = "0.5"
 once_cell = "1"
 strsim = "0.11"
 yaml = "0.3"
+chromiumoxide = "0.9.1"
+futures = "0.3.32"
+

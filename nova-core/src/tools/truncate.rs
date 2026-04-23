@@ -16,16 +16,28 @@ pub fn truncate_output(
         return output.to_string();
     }
 
-    let head = &output[..head_chars.min(output.len())];
-    let tail_start = output.len().saturating_sub(tail_chars);
-    let tail = if tail_start > head_chars {
+    let mut head_idx = head_chars.min(output.len());
+    while head_idx > 0 && !output.is_char_boundary(head_idx) {
+        head_idx -= 1;
+    }
+    let head = &output[..head_idx];
+
+    let mut tail_start = output.len().saturating_sub(tail_chars);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1; // Move forward to start at a valid char
+    }
+
+    let tail = if tail_start > head_idx {
         &output[tail_start..]
     } else {
-        // If head + tail would overlap, just return the first max_chars
-        return output[..max_chars].to_string();
+        let mut max_idx = max_chars.min(output.len());
+        while max_idx > 0 && !output.is_char_boundary(max_idx) {
+            max_idx -= 1;
+        }
+        return output[..max_idx].to_string();
     };
 
-    let omitted = output.len() - head_chars - tail_chars;
+    let omitted = output.len() - head_idx - (output.len() - tail_start);
     let warning = warning.replace("{n}", &omitted.to_string());
 
     format!("{}{}{}", head, warning, tail)

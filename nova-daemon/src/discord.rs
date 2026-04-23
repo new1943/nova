@@ -242,6 +242,30 @@ async fn process_discord_message(
         }
     };
 
+    if content.trim() == "/new" {
+        if session.messages.len() > 2 {
+            let summary_session = session.clone();
+            let dn = daily_notes.clone();
+            let sq = side_query.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::write_session_diary(&dn, &sq, &summary_session).await {
+                    warn!("Failed to write session diary: {}", e);
+                }
+            });
+        }
+        
+        if let Err(e) = session_mgr.clear_session(&mut session) {
+            let builder = CreateMessage::new().content(format!("❌ Failed to clear session: {}", e));
+            let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+            return Ok(());
+        }
+        
+        let builder = CreateMessage::new().content("✨ Started a new session. Context cleared.");
+        let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+        return Ok(());
+    }
+
+
     let user_msg = nova_core::message::Message::user(&content);
     session_mgr.append_message(&mut session, user_msg)?;
 

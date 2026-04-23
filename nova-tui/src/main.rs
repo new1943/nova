@@ -78,18 +78,38 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
     let (req_tx, mut req_rx) = mpsc::channel::<Request>(16);
 
     // IPC reader task
+    let event_tx_clone = event_tx.clone();
     tokio::spawn(async move {
+        let mut current_client = client;
         loop {
-            tokio::select! {
+            let disconnected = tokio::select! {
                 Some(req) = req_rx.recv() => {
-                    if client.send_request(&req).await.is_err() { break; }
+                    if current_client.send_request(&req).await.is_err() {
+                        true
+                    } else {
+                        false
+                    }
                 }
-                result = client.recv_event() => {
+                result = current_client.recv_event() => {
                     match result {
                         Ok(Some(event)) => {
-                            if event_tx.send(event).await.is_err() { break; }
+                            if event_tx_clone.send(event).await.is_err() { break; }
+                            false
                         }
-                        Ok(None) | Err(_) => break,
+                        Ok(None) | Err(_) => true,
+                    }
+                }
+            };
+
+            if disconnected {
+                let _ = event_tx_clone.send(Event::Error { message: "Daemon disconnected. Trying to reconnect...".into() }).await;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if let Ok(c) = IpcClient::connect(SOCKET_PATH.as_ref()).await {
+                        current_client = c;
+                        let _ = event_tx_clone.send(Event::Notification { message: "Reconnected to daemon.".into() }).await;
+                        let _ = current_client.send_request(&Request::ResumeSession).await;
+                        break;
                     }
                 }
             }
@@ -121,13 +141,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                 InputAction::Submit => {
                     if !app.input.is_empty() {
                         let text = app.take_input();
-                        match text.as_str() {
+                        match text.trim() {
                             "/quit" | "/exit" => app.should_quit = true,
                             "/new" => {
                                 app.messages.clear();
                                 app.commands.clear();
                                 app.status_text = "New session...".into();
-                                let _ = req_tx.send(Request::NewSession).await;
+                                let _ = req_tx.try_send(Request::NewSession);
                             }
                             _ if text.starts_with("/search ") => {
                                 let query = text.trim_start_matches("/search ").to_string();
@@ -136,18 +156,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                                     format!("Searching: {}...", query),
                                 );
                                 app.status_text = "Searching sessions...".into();
-                                let _ = req_tx
-                                    .send(Request::SearchSessions { query })
-                                    .await;
+                                let _ = req_tx.try_send(Request::SearchSessions { query });
                             }
                             _ => {
                                 // Show user message immediately in chat
                                 app.push_message(DisplayRole::User, text.clone());
                                 app.status_text = "Thinking...".into();
                                 app.streaming = true;
-                                let _ = req_tx
-                                    .send(Request::UserMessage { content: text })
-                                    .await;
+                                let _ = req_tx.try_send(Request::UserMessage { content: text });
                             }
                         }
                     }
