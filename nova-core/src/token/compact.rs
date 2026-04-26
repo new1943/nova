@@ -7,46 +7,46 @@ use crate::message::{Message, Role};
 /// Compact mode — dual-layer circuit breaker
 #[derive(Debug, Clone, Copy)]
 pub enum CompactMode {
-    /// 85% ~ 95%: Call LLM for structured JSON summary
+    /// 85% ~ 95%: Truncate with [压缩] marker, preserve recent messages
     Graceful,
-    /// >95%: Directly drop oldest messages
+    /// >95%: Directly drop oldest messages with [强制截断] marker
     Forceful,
 }
 
-/// Compact result from structured JSON extraction
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Compact result — [V4 DEPRECATED]
+/// LLM summarization has been moved to MemoryKeeper.
+/// This struct is kept for API compatibility but all fields will be empty.
+#[derive(Debug, Clone, Default)]
 pub struct CompactResult {
-    /// 已归档的话题列表
+    /// [DEPRECATED] 已归档的话题列表 — now handled by MemoryKeeper
     pub archived_topics: Vec<String>,
-    /// 提取的用户偏好
+    /// [DEPRECATED] 提取的用户偏好 — now handled by MemoryKeeper
     pub extracted_preferences: Vec<String>,
-    /// 当前活跃话题摘要
+    /// [DEPRECATED] 当前活跃话题摘要 — now handled by MemoryKeeper
     pub active_summary: String,
 }
 
-/// Compact engine — Strategy 3: compress early messages into summary
+/// Compact engine — [V4 DEPRECATED LLM summarization]
 ///
 /// - Triggered when token budget > 90%
 /// - Dual-layer circuit breaker: Graceful (85-95%) vs Forceful (>95%)
 /// - Preserves system prompt + recent messages
 /// - Re-entrancy guard: won't trigger while already running
 /// - Protects tool_call + tool_result pairs from being split
+///
+/// [V4 CHANGE] No longer calls LLM for structured summary.
+/// Memory extraction is delegated to MemoryKeeper via ShadowEvent bus.
 pub struct Compactor {
     target_pct: f32,
     running: AtomicBool,
-    api_key: String,
-    api_base_url: String,
-    model: String,
 }
 
 impl Compactor {
-    pub fn new(target_pct: f32, api_key: String, api_base_url: String, model: String) -> Self {
+    #[allow(dead_code)]
+    pub fn new(target_pct: f32) -> Self {
         Self {
             target_pct,
             running: AtomicBool::new(false),
-            api_key,
-            api_base_url,
-            model,
         }
     }
 
@@ -112,8 +112,8 @@ impl Compactor {
 
         match mode {
             CompactMode::Graceful => {
-                let result = self.graceful_compact_full(messages, split).await?;
-                Ok((result.0, Some(result.1)))
+                // [V4 DEPRECATED] CompactResult fields are now empty - memory extraction moved to MemoryKeeper
+                Ok((self.graceful_compact(messages, split), Some(CompactResult::default())))
             }
             CompactMode::Forceful => {
                 Ok((self.forceful_compact(messages, split), None))
@@ -195,53 +195,23 @@ impl Compactor {
         new_messages
     }
 
-    /// Graceful compact: call LLM for structured JSON summary, then write to memory
-    async fn graceful_compact_full(&self, messages: &[Message], split: usize) -> Result<(Vec<Message>, CompactResult)> {
-        let early = &messages[..split];
-        let recent = &messages[split..];
+    /// Graceful compact: truncate oldest messages with [已压缩] marker.
+    /// [V4 DEPRECATED] LLM summarization removed - memory extraction now handled by MemoryKeeper.
+    fn graceful_compact(&self, messages: &[Message], split: usize) -> Vec<Message> {
+        debug!("Graceful compact: drop {} oldest messages, keep {} recent", split, messages.len() - split);
+        let recent: Vec<Message> = messages[split..].to_vec();
 
-        // Call LLM for structured JSON summary
-        let json_output = self.llm_structured_summary(early).await?;
+        let mut new_messages = Vec::with_capacity(recent.len() + 1);
+        new_messages.push(Message::system(
+            "[上下文已压缩，早期消息已丢弃。详情见 MEMORY.md]",
+        ));
+        new_messages.extend_from_slice(&recent);
 
-        // Clean JSON: remove markdown fences
-        let cleaned = Self::clean_json(&json_output);
-
-        // Parse JSON (with fallback to forceful if parsing fails)
-        let result: CompactResult = match serde_json::from_str(&cleaned) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Compact JSON parse failed: {}, falling back to forceful", e);
-                return Ok((self.forceful_compact(messages, split), CompactResult {
-                    archived_topics: Vec::new(),
-                    extracted_preferences: Vec::new(),
-                    active_summary: String::new(),
-                }));
-            }
-        };
-
-        // Build new message list
-        let mut new_messages = Vec::with_capacity(recent.len() + 2);
-
-        // Insert archived topics as system message
-        if !result.archived_topics.is_empty() {
-            let archived_text = format!(
-                "[话题已归档：{}。]",
-                result.archived_topics.join("、")
-            );
-            new_messages.push(Message::system(archived_text));
-        }
-
-        // Insert summary
-        let summary_text = format!("[对话摘要] {}", result.active_summary);
-        new_messages.push(Message::user(summary_text));
-        new_messages.extend_from_slice(recent);
-
-        debug!("Graceful compact: early={} msgs, recent={} msgs, summary={:?}",
-            early.len(), recent.len(), result.active_summary);
-        Ok((new_messages, result))
+        new_messages
     }
 
-    /// Clean LLM output: remove markdown code block fences
+    /// [DEPRECATED] Only kept for test compatibility
+    #[allow(dead_code)]
     fn clean_json(raw: &str) -> String {
         let trimmed = raw.trim();
 
@@ -260,109 +230,6 @@ impl Compactor {
         }
 
         trimmed.to_string()
-    }
-
-    /// Call LLM to generate structured JSON summary
-    async fn llm_structured_summary(&self, messages: &[Message]) -> Result<String> {
-        let conversation = self.format_messages_for_summary(messages);
-
-        let system = r#"你正在执行记忆整理。请分析历史对话，输出严谨JSON：
-
-{
-  "archived_topics": ["话题名1", "话题名2"],
-  "extracted_preferences": ["偏好1", "偏好2"],
-  "active_summary": "当前话题的一句话描述"
-}
-
-要求：
-- archived_topics：已完结或明显不再讨论的话题
-- extracted_preferences：极其确定的用户偏好和事实，切勿臆测
-- active_summary：当前仍在继续的话题摘要
-只输出JSON，不要其他文字。"#;
-
-        let api = nova_api::client::ApiClient::new(
-            self.api_key.clone(),
-            self.api_base_url.clone(),
-        );
-
-        let req = nova_api::types::ApiRequest {
-            model: self.model.clone(),
-            max_tokens: 500,
-            system: system.to_string(),
-            messages: vec![nova_api::types::ApiMessage::User {
-                content: nova_api::types::Content::Text(conversation),
-            }],
-            tools: vec![],
-            stream: false,
-        };
-
-        let resp = api.complete(&req).await?;
-
-        // Extract text from response
-        for block in &resp.content {
-            if let nova_api::types::ContentBlock::Text { text } = block {
-                return Ok(text.clone());
-            }
-        }
-
-        anyhow::bail!("No text in LLM response")
-    }
-
-    /// Format messages for summary generation
-    fn format_messages_for_summary(&self, messages: &[Message]) -> String {
-        let mut conversation = String::new();
-        for msg in messages {
-            let role = match msg.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::Tool => "Tool",
-                Role::System => "System",
-            };
-            if let Some(ref content) = msg.content {
-                conversation.push_str(&format!("{}: {}\n", role, content));
-            }
-        }
-
-        // Truncate if too long for the summary request
-        if conversation.chars().count() > 4000 {
-            let truncated: String = conversation.chars().take(4000).collect();
-            format!("{}...(truncated)", truncated)
-        } else {
-            conversation
-        }
-    }
-
-    /// Call LLM to summarize early messages (≤50 chars target) — legacy fallback
-    #[allow(dead_code)]
-    async fn summarize(&self, messages: &[Message]) -> Result<String> {
-        let conversation = self.format_messages_for_summary(messages);
-
-        let api = nova_api::client::ApiClient::new(
-            self.api_key.clone(),
-            self.api_base_url.clone(),
-        );
-
-        let req = nova_api::types::ApiRequest {
-            model: self.model.clone(),
-            max_tokens: 200,
-            system: "Summarize the following conversation in ≤50 Chinese characters. Be concise.".into(),
-            messages: vec![nova_api::types::ApiMessage::User {
-                content: nova_api::types::Content::Text(conversation),
-            }],
-            tools: vec![],
-            stream: false,
-        };
-
-        let resp = api.complete(&req).await?;
-
-        // Extract text from response
-        for block in &resp.content {
-            if let nova_api::types::ContentBlock::Text { text } = block {
-                return Ok(text.clone());
-            }
-        }
-
-        Ok("对话摘要不可用".into())
     }
 }
 

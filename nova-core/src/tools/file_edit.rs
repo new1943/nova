@@ -20,13 +20,7 @@ impl FileEditTool {
         Self { tracker }
     }
 
-    fn check_path(&self, path: &str) -> Result<()> {
-        let nova_dir = dirs::home_dir()
-            .map(|h| h.join(".nova").to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !nova_dir.is_empty() && path.contains(&nova_dir) {
-            anyhow::bail!("Cannot edit files in ~/.nova/ directory");
-        }
+    fn check_path(&self, _path: &str) -> Result<()> {
         Ok(())
     }
 
@@ -121,8 +115,19 @@ impl Tool for FileEditTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let file_path = Path::new(file_path_str);
-        self.check_path(file_path_str)?;
+        // Expand ~ to home directory
+        let file_path_str = if file_path_str.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                file_path_str.replacen("~", &home.to_string_lossy(), 1)
+            } else {
+                file_path_str.to_string()
+            }
+        } else {
+            file_path_str.to_string()
+        };
+
+        let file_path = Path::new(&file_path_str);
+        self.check_path(&file_path_str)?;
 
         // Read-first check
         {
@@ -132,7 +137,7 @@ impl Tool for FileEditTool {
             }
 
             // Check for concurrent modification
-            if let Ok(metadata) = fs::metadata(file_path) {
+            if let Ok(metadata) = fs::metadata(&file_path_str) {
                 if let Ok(current_mtime) = metadata.modified() {
                     if tracker.was_modified_since_read(file_path, current_mtime) {
                         anyhow::bail!(
@@ -155,7 +160,7 @@ impl Tool for FileEditTool {
         }
 
         // Read file
-        let content = fs::read_to_string(file_path_str)
+        let content = fs::read_to_string(&file_path_str)
             .map_err(|e| anyhow::anyhow!("Cannot read '{}': {}", file_path_str, e))?;
 
         let original_content = content.clone();
@@ -194,7 +199,7 @@ impl Tool for FileEditTool {
         Self::atomic_write(file_path, &new_content)?;
 
         // Generate structured patch
-        let patch = Self::generate_diff(&original_content, &new_content, file_path_str);
+        let patch = Self::generate_diff(&original_content, &new_content, &file_path_str);
 
         let replacements = if replace_all { match_count } else { 1 };
 

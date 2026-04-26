@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serenity::prelude::*;
+use serenity::model::application::Interaction;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::async_trait;
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
 use nova_core::agent::{QueryLoop, LoopEvent};
+use nova_core::models::ShadowEvent;
 use nova_core::memory::consolidate::MemoryConsolidator;
 use nova_core::memory::daily::DailyNotes;
 use nova_core::memory::dream::DreamEngine;
@@ -95,12 +97,24 @@ struct DiscordHandler {
     cfg: Arc<HandleConfig>,
     // Mutex to prevent concurrent processing in the same channel
     active_channels: Arc<Mutex<std::collections::HashSet<String>>>,
+    // Application ID set after Ready event
+    app_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!("Discord Gateway connected as {}", ready.user.name);
+
+        // Register global commands after Ready (application_id is now available)
+        let app_id = ready.application.id.get();
+        self.app_id.store(app_id, std::sync::atomic::Ordering::SeqCst);
+
+        let http = ctx.http.clone();
+        let commands = register_global_commands();
+        if let Err(e) = http.create_global_commands(&commands).await {
+            warn!("Failed to register global commands: {}", e);
+        }
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -136,6 +150,67 @@ impl EventHandler for DiscordHandler {
             active.remove(&session_id);
         });
     }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Interaction::Command(cmd) = interaction else { return; };
+
+        let channel_id = cmd.channel_id;
+        let session_id = channel_id.to_string();
+
+        match cmd.data.name.as_str() {
+            "new" => {
+                let cfg = self.cfg.clone();
+                let active_channels = self.active_channels.clone();
+
+                let mut active = active_channels.lock().await;
+                if active.contains(&session_id) {
+                    let builder = CreateMessage::new().content("⏳ Please wait for the previous turn to complete...");
+                    let _ = channel_id.send_message(&ctx.http, builder).await;
+                    return;
+                }
+                active.insert(session_id.clone());
+                drop(active);
+
+                let _ = cmd.defer(&ctx.http).await;
+
+                tokio::spawn(async move {
+                    if let Err(e) = handle_new_command(cfg, ctx.clone(), channel_id).await {
+                        error!("Error handling /new command: {}", e);
+                    }
+                    let mut active = active_channels.lock().await;
+                    active.remove(&session_id);
+                });
+            }
+            "reset" => {
+                let cfg = self.cfg.clone();
+                let active_channels = self.active_channels.clone();
+
+                let mut active = active_channels.lock().await;
+                if active.contains(&session_id) {
+                    let builder = CreateMessage::new().content("⏳ Please wait for the previous turn to complete...");
+                    let _ = channel_id.send_message(&ctx.http, builder).await;
+                    return;
+                }
+                active.insert(session_id.clone());
+                drop(active);
+
+                let _ = cmd.defer(&ctx.http).await;
+
+                tokio::spawn(async move {
+                    if let Err(e) = handle_reset_command(cfg, ctx.clone(), channel_id).await {
+                        error!("Error handling /reset command: {}", e);
+                    }
+                    let mut active = active_channels.lock().await;
+                    active.remove(&session_id);
+                });
+            }
+            _ => {
+                let builder = serenity::builder::CreateInteractionResponseFollowup::new()
+                    .content("Unknown command");
+                let _ = cmd.create_followup(&ctx.http, builder).await;
+            }
+        }
+    }
 }
 
 async fn process_discord_message(
@@ -151,7 +226,8 @@ async fn process_discord_message(
     let mut loop_config = cfg.loop_config.clone();
     let skills = cfg.skills.clone();
     let tools = cfg.tools.clone();
-    
+    let dispatcher_tx = cfg.dispatcher_tx.clone();
+
     let session_mgr = SessionManager::new(sessions_dir.clone());
     let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir.clone())));
     let tool_desc = tool_descriptions(&tools);
@@ -273,16 +349,17 @@ async fn process_discord_message(
 
     let mut sp = bootstrap.lock().await.build_system_prompt(&tool_desc);
 
-    // v2 Phase 2: Inject <nova_os> thinking pipe hints
-    let nova_os = discord_build_nova_os_section(
-        mode_router.clone(),
-        tension_tracker.clone(),
-        topic_tracker.clone(),
-    ).await;
-    if !nova_os.is_empty() {
-        sp.push_str("\n\n---\n\n");
-        sp.push_str(&nova_os);
-    }
+    // [V4 DEPRECATED] v2 Phase 2: Inject <nova_os> thinking pipe hints
+    // <nova_os> is deprecated - state machine interception now handles this in Rust side
+    // let nova_os = discord_build_nova_os_section(
+    //     mode_router.clone(),
+    //     tension_tracker.clone(),
+    //     topic_tracker.clone(),
+    // ).await;
+    // if !nova_os.is_empty() {
+    //     sp.push_str("\n\n---\n\n");
+    //     sp.push_str(&nova_os);
+    // }
 
     // Context Search
     if content.chars().count() > 5 {
@@ -323,6 +400,8 @@ async fn process_discord_message(
     }
 
     let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
+    // [V4 Task 3.2] Get shadow event sender for QueryLoop
+    let shadow_tx = dispatcher_tx.channel();
     let lc = loop_config.clone();
     let dn = daily_notes.clone();
     let sq_loop = side_query.clone();
@@ -337,14 +416,18 @@ async fn process_discord_message(
     let loop_handle = tokio::spawn(async move {
         let hooks = make_hooks();
         let cons_inner = Arc::try_unwrap(cons).unwrap_or_else(|arc| (*arc).clone());
-        let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner), Some(tt), Some(tens), Some(mr), Some(mb));
+        let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner), Some(tt), Some(tens), /* mr disabled */ Some(mb), Some(shadow_tx));
         let mut s = session_clone;
         s.turn_count = 0;
-        let result = ql.run_turn(s.clone(), &sp, event_tx).await;
-        match result {
-            Ok((updated_s, new_msgs)) => (updated_s, new_msgs),
-            Err(_) => (s, vec![]),
-        }
+        
+        let session_id_str = s.session_id.clone();
+        nova_core::tools::CURRENT_CHANNEL_ID.scope(session_id_str, async move {
+            let result = ql.run_turn(s.clone(), &sp, event_tx).await;
+            match result {
+                Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
+                Err(_) => (s, vec![], None),
+            }
+        }).await
     });
 
     let builder = CreateMessage::new().content("🤔 Thinking...");
@@ -378,8 +461,17 @@ async fn process_discord_message(
         }
     }
 
-    if let Ok((updated, new_msgs)) = loop_handle.await {
+    if let Ok((updated, new_msgs, preflight_result)) = loop_handle.await {
         session = updated;
+
+        // T3.2: TopicShift → ShadowEvent::TopicArchived
+        if preflight_result.as_ref().map(|p| p.topic_shift).unwrap_or(false) {
+            info!("Topic shift detected, emitting TopicArchived event");
+            dispatcher_tx.emit(ShadowEvent::TopicArchived {
+                transcript: session.messages.clone(),
+            });
+        }
+
         let history = session_mgr.history_for(&session);
         for m in &new_msgs {
             let _ = history.append(m);
@@ -425,11 +517,14 @@ async fn process_discord_message(
 }
 
 pub async fn start(token: String, cfg: Arc<HandleConfig>) -> Result<()> {
-    let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::DIRECT_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
-    
+    let intents = GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT;
+
     let handler = DiscordHandler {
         cfg,
         active_channels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        app_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     let mut client = Client::builder(&token, intents)
@@ -438,5 +533,87 @@ pub async fn start(token: String, cfg: Arc<HandleConfig>) -> Result<()> {
 
     info!("Starting Discord Gateway...");
     client.start().await?;
+    Ok(())
+}
+
+fn register_global_commands() -> Vec<serenity::builder::CreateCommand> {
+    vec![
+        serenity::builder::CreateCommand::new("new")
+            .description("Start a new session, clearing all conversation history"),
+        serenity::builder::CreateCommand::new("reset")
+            .description("Reset the current session to initial state"),
+    ]
+}
+
+async fn handle_new_command(
+    cfg: Arc<HandleConfig>,
+    ctx: Context,
+    channel_id: serenity::model::id::ChannelId,
+) -> Result<()> {
+    let sessions_dir = cfg.sessions_dir.clone();
+    let session_mgr = SessionManager::new(sessions_dir);
+    let session_id = channel_id.to_string();
+
+    let mut session = match session_mgr.resume_by_id(&session_id)? {
+        Some(s) => s,
+        None => {
+            let mut s = session_mgr.create(cfg.loop_config.max_turns)?;
+            s.session_id = session_id.clone();
+            s
+        }
+    };
+
+    if session.messages.len() > 2 {
+        let daily_notes = DailyNotes::new(cfg.memories_dir.clone());
+        let side_query = SideQuery::new(
+            cfg.loop_config.api_key.clone(),
+            cfg.loop_config.api_base_url.clone(),
+            cfg.loop_config.model.clone(),
+        );
+        let session_clone = session.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::write_session_diary(&daily_notes, &side_query, &session_clone).await {
+                warn!("Failed to write session diary: {}", e);
+            }
+        });
+    }
+
+    if let Err(e) = session_mgr.clear_session(&mut session) {
+        let builder = CreateMessage::new().content(format!("❌ Failed to clear session: {}", e));
+        let _ = channel_id.send_message(&ctx.http, builder).await;
+        return Ok(());
+    }
+
+    let builder = CreateMessage::new().content("✨ Started a new session. Context cleared.");
+    let _ = channel_id.send_message(&ctx.http, builder).await;
+    Ok(())
+}
+
+async fn handle_reset_command(
+    cfg: Arc<HandleConfig>,
+    ctx: Context,
+    channel_id: serenity::model::id::ChannelId,
+) -> Result<()> {
+    let sessions_dir = cfg.sessions_dir.clone();
+    let session_mgr = SessionManager::new(sessions_dir);
+    let session_id = channel_id.to_string();
+
+    let mut session = match session_mgr.resume_by_id(&session_id)? {
+        Some(s) => s,
+        None => {
+            let mut s = session_mgr.create(cfg.loop_config.max_turns)?;
+            s.session_id = session_id.clone();
+            s
+        }
+    };
+
+    if let Err(e) = session_mgr.clear_session(&mut session) {
+        let builder = CreateMessage::new().content(format!("❌ Failed to reset session: {}", e));
+        let _ = channel_id.send_message(&ctx.http, builder).await;
+        return Ok(());
+    }
+
+    let builder = CreateMessage::new().content("🔄 Session reset to initial state.");
+    let _ = channel_id.send_message(&ctx.http, builder).await;
     Ok(())
 }

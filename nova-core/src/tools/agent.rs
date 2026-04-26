@@ -1,8 +1,11 @@
+use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::models::ShadowEvent;
 use crate::subagent::{SubagentConfig, SubagentSpawner, SubagentType};
 use crate::tools::Tool;
 
@@ -13,16 +16,28 @@ pub struct AgentTool {
     api_base_url: String,
     model: String,
     default_system_prompt: String,
+    /// [V4 Fix] Channel for SubAgent TaskProgress events → Dispatcher → TaskManager
+    shadow_tx: Option<mpsc::Sender<ShadowEvent>>,
 }
 
 impl AgentTool {
-    pub fn new(api_key: String, api_base_url: String, model: String) -> Self {
+    pub fn new(
+        api_key: String,
+        api_base_url: String,
+        model: String,
+    ) -> Self {
         Self {
             api_key,
             api_base_url,
             model,
             default_system_prompt: String::new(),
+            shadow_tx: None,
         }
+    }
+
+    pub fn with_shadow_tx(mut self, tx: mpsc::Sender<ShadowEvent>) -> Self {
+        self.shadow_tx = Some(tx);
+        self
     }
 
     pub fn with_system_prompt(mut self, prompt: String) -> Self {
@@ -102,6 +117,8 @@ impl Tool for AgentTool {
             api_base_url: self.api_base_url.clone(),
             model: self.model.clone(),
             max_input_tokens: 16_000,
+            shadow_tx: None, // [V4 Fix] Can be wired to ShadowEvent bus
+            tools: None, // [V4 Task 4.3] Future: enable tools for Full phases
         };
 
         let handle = SubagentSpawner::spawn(config, task.to_string());

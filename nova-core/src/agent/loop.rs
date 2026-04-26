@@ -13,6 +13,7 @@ use crate::hooks::HookManager;
 use crate::memory::consolidate::MemoryConsolidator;
 use crate::memory::daily::DailyNotes;
 use crate::message::{Message, Role, ToolCall};
+use crate::models::ShadowEvent;
 use crate::session::manager::Session;
 use crate::sidequery::SideQuery;
 use crate::token::budget::{BudgetCheck, TokenBudget};
@@ -45,6 +46,9 @@ pub struct QueryLoopConfig {
     pub compact_target_pct: f32,
     /// Memories directory for diary writing (Layer 2 episodic memory)
     pub memories_dir: Option<std::path::PathBuf>,
+    /// Optional pre-flight checker for state machine interception
+    /// If None, pre-flight check is skipped (legacy mode)
+    pub preflight_checker: Option<crate::agent::preflight::PreFlightChecker>,
 }
 
 impl Default for QueryLoopConfig {
@@ -60,6 +64,7 @@ impl Default for QueryLoopConfig {
             budget_trigger_pct: 0.9,
             compact_target_pct: 0.6,
             memories_dir: None,
+            preflight_checker: None,
         }
     }
 }
@@ -75,8 +80,14 @@ pub struct QueryLoop {
     // v2 Phase 1.5+ trackers
     pub topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::TopicTracker>>>,
     pub tension_tracker: Option<std::sync::Arc<crate::memory::TensionTracker>>,
-    pub mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
+    // [V4] ModeRouter disabled — nova_os deprecated
+    // pub mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
     pub memory_board: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::MemoryBoard>>>,
+    // [V4 Phase 4.1] Cached complexity from previous turn for tool filtering
+    // Use tokio::sync::Mutex (Send-safe, async-aware)
+    cached_complexity: tokio::sync::Mutex<Option<crate::agent::preflight::Complexity>>,
+    // [V4 Task 3.2] Optional channel for emitting ShadowEvent::TopicArchived
+    shadow_tx: Option<mpsc::Sender<ShadowEvent>>,
 }
 
 impl QueryLoop {
@@ -89,26 +100,53 @@ impl QueryLoop {
         consolidator: Option<MemoryConsolidator>,
         topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::TopicTracker>>>,
         tension_tracker: Option<std::sync::Arc<crate::memory::TensionTracker>>,
-        mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
+        // [V4] ModeRouter disabled
+        // mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
         memory_board: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::MemoryBoard>>>,
+        shadow_tx: Option<mpsc::Sender<ShadowEvent>>,
     ) -> Self {
         Self {
             config, tools, hooks, daily_notes, side_query, consolidator,
-            topic_tracker, tension_tracker, mode_router, memory_board,
+            topic_tracker, tension_tracker, /* mode_router, */ memory_board,
+            cached_complexity: tokio::sync::Mutex::new(None),
+            shadow_tx,
         }
     }
 
     /// Run a full query loop turn for user input.
+    /// Returns (session, new_messages, preflight_result) where preflight_result
+    /// is the classification for THIS turn's input — caller should store it
+    /// and emit ShadowEvent::TopicArchived at the START of the NEXT turn.
     pub async fn run_turn(
         &self,
         mut session: Session,
         system_prompt: &str,
         event_tx: mpsc::Sender<LoopEvent>,
-    ) -> Result<(Session, Vec<Message>)> {
+    ) -> Result<(Session, Vec<Message>, Option<crate::agent::preflight::PreFlightCheckResult>)> {
         // Reset turn counter — max_turns limits loop depth per user message, not per session
         session.reset_turns();
         let mut newly_added_messages = Vec::new();
         info!("--- Starting new query loop for user input ---");
+
+        // ── [V4 Phase 3.1] Pre-flight check — blocking wait, result used immediately ─
+        // Extract user input from the last message for pre-flight classification
+        let preflight_user_input = session.messages.last()
+            .and_then(|m| m.content.as_ref().cloned())
+            .unwrap_or_default();
+        let preflight_recent_msgs = session.messages.iter().rev().take(10).cloned().collect::<Vec<_>>();
+
+        // [V4 Fix] Block on preflight result (30s timeout), use it immediately for tool filtering
+        let preflight_result = if let Some(ref checker) = self.config.preflight_checker {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                checker.check(&preflight_user_input, &preflight_recent_msgs),
+            ).await.unwrap_or_else(|_| crate::agent::preflight::PreFlightCheckResult::default());
+            info!("[V4] Preflight: complexity={:?}, topic_shift={}, reason={}", result.complexity, result.topic_shift, result.reason);
+            info!("[V4] Preflight thinking: {}", result.thinking);
+            Some(result)
+        } else {
+            None
+        };
 
         // ── v2 Phase 1.5: Topic/Tension/Mode tracking ──────────────────────────
         // Process user message through trackers to detect topic switches, update tension, and mode
@@ -128,25 +166,55 @@ impl QueryLoop {
                     if let Some(ref tt) = self.tension_tracker {
                         tt.update_from_message(content).await;
                     }
-                    // ModeRouter: update interaction mode
-                    if let Some(ref mr) = self.mode_router {
-                        let mode = mr.write().await.process(content).await;
-                        info!("Mode: {:?}", mode);
-                    }
+                    // [V4] ModeRouter disabled — nova_os deprecated
+                    // if let Some(ref mr) = self.mode_router {
+                    //     let mode = mr.write().await.process(content).await;
+                    //     info!("Mode: {:?}", mode);
+                    // }
                 }
             }
         }
 
-        let tool_schemas = self.tools.as_api_schemas();
+        // [V6] Hard Gate: 根据 complexity 物理隔离工具，LLM 无法绕过
+        use crate::agent::preflight::Complexity;
+        let tool_schemas = match preflight_result.as_ref().map(|r| r.complexity) {
+            Some(Complexity::High) => {
+                info!("[V6] Hard gate: High → only delegate_complex_project + cancel");
+                self.tools.as_api_schemas_filtered(|name| {
+                    name == "delegate_complex_project" || name == "cancel_delegated_project"
+                })
+            }
+            Some(Complexity::Medium) => {
+                info!("[V6] Hard gate: Medium → only delegate_task + cancel");
+                self.tools.as_api_schemas_filtered(|name| {
+                    name == "delegate_task" || name == "cancel_delegated_project"
+                })
+            }
+            _ => {
+                // Low 或无 preflight 结果: 所有工具可见
+                self.tools.as_api_schemas()
+            }
+        };
+
+        // [V5] 注入 <preflight> 标签到 system prompt
+        let preflight_injection = if let Some(ref result) = preflight_result {
+            format!(
+                "\n\n<preflight>\ncomplexity: {:?}\ntopic_shift: {}\nreason: {}\n</preflight>",
+                result.complexity, result.topic_shift, result.reason
+            )
+        } else {
+            String::new()
+        };
+        // Cache for next turn (fallback if preflight doesn't complete in time)
+        if let Some(ref result) = preflight_result {
+            *self.cached_complexity.lock().await = Some(result.complexity);
+        }
         let mut budget = TokenBudget::new(
             self.config.context_window,
             self.config.budget_trigger_pct,
         );
         let compactor = Compactor::new(
             self.config.compact_target_pct,
-            self.config.api_key.clone(),
-            self.config.api_base_url.clone(),
-            self.config.model.clone(),
         );
         let mut empty_retries: u32 = 0;
         let mut compaction_exhausted = false;
@@ -176,13 +244,10 @@ impl QueryLoop {
                 self.write_compact_diary(&session.messages).await;
                 // ── v2 Phase 1.5: Compact with structured result ─────────────
                 match compactor.compact_full(&session.messages, self.config.context_window, budget_pct).await {
-                    Ok((compacted, result_opt)) => {
+                    Ok((compacted, _result_opt)) => {
                         debug!("Precompact triggered: messages {} -> {}", session.messages.len(), compacted.len());
                         session.messages = compacted;
-                        // Update TopicTracker and MemoryBoard with compact result
-                        if let Some(result) = result_opt {
-                            self.apply_compact_result(&result).await;
-                        }
+                        // [V4 DEPRECATED] Memory extraction moved to MemoryKeeper via ShadowEvent bus
                     }
                     Err(e) => warn!("Pre-flight compact failed: {}", e),
                 }
@@ -191,10 +256,13 @@ impl QueryLoop {
             // Build request
             let api_messages = build_api_messages(&session.messages);
             info!("Sending API request to {} ({} messages, estimated {} tokens)", self.config.model, api_messages.len(), estimated_tokens);
+            // [V6] 注入 <preflight> 标签 + hard gate 工具过滤
+            let effective_system = format!("{}{}", system_prompt, preflight_injection);
+
             let req = ApiRequest {
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
-                system: system_prompt.to_string(),
+                system: effective_system,
                 messages: api_messages,
                 tools: tool_schemas.clone(),
                 stream: true,
@@ -300,13 +368,10 @@ impl QueryLoop {
                 self.write_compact_diary(&session.messages).await;
                 // Context overflow means we're at >100%, use forceful mode
                 match compactor.compact_full(&session.messages, self.config.context_window, 0.96).await {
-                    Ok((compacted, result_opt)) if compacted.len() < session.messages.len() => {
+                    Ok((compacted, _result_opt)) if compacted.len() < session.messages.len() => {
                         debug!("Context overflow compact: messages {} -> {}", session.messages.len(), compacted.len());
                         session.messages = compacted;
-                        // Apply compact result to TopicTracker, MemoryBoard, and daily notes
-                        if let Some(result) = result_opt {
-                            self.apply_compact_result(&result).await;
-                        }
+                        // [V4 DEPRECATED] Memory extraction moved to MemoryKeeper via ShadowEvent bus
                         // Undo turn increment so retry doesn't waste a turn
                         session.turn_count = session.turn_count.saturating_sub(1);
                         continue; // Success, retry the API request
@@ -343,7 +408,7 @@ impl QueryLoop {
                     self.write_compact_diary(&session.messages).await;
                     // ── v2 Phase 1.5: Compact with structured result ─────────────
                     match compactor.compact_full(&session.messages, self.config.context_window, budget_pct).await {
-                        Ok((compacted, result_opt)) => {
+                        Ok((compacted, _result_opt)) => {
                             debug!("Post-flight compact: messages {} -> {}", session.messages.len(), compacted.len());
                             if compacted.len() >= session.messages.len() {
                                 // Compaction reached its limit, do not attempt to auto-compact again this session
@@ -353,10 +418,7 @@ impl QueryLoop {
                                 )).await;
                             }
                             session.messages = compacted;
-                            // Update TopicTracker and MemoryBoard with compact result
-                            if let Some(result) = result_opt {
-                                self.apply_compact_result(&result).await;
-                            }
+                            // [V4 DEPRECATED] Memory extraction moved to MemoryKeeper via ShadowEvent bus
                         }
                         Err(e) => warn!("Compact failed: {}", e),
                     }
@@ -382,7 +444,7 @@ impl QueryLoop {
                 Some(tool_calls.iter().map(|tc| ToolCall {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
-                    arguments: tc.parse_input().unwrap_or_default(),
+                    arguments: tc.parse_input().unwrap_or_else(|_| serde_json::json!({})),
                 }).collect())
             };
             let text_len = text_content.len();
@@ -411,8 +473,8 @@ impl QueryLoop {
                     tt.write().await.on_tool_call().await;
                 }
 
-                let input = tc.parse_input().unwrap_or_default();
-                let input_str = serde_json::to_string(&input).unwrap_or_default();
+                let input = tc.parse_input().unwrap_or_else(|_| serde_json::json!({}));
+                let input_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
                 let input_preview = if input_str.len() > 200 {
                     // Truncate at character boundary to avoid half-character corruption
                     let mut byte_index = 0;
@@ -431,6 +493,8 @@ impl QueryLoop {
                     input_str
                 };
                 debug!("Tool call: name={}, args={}", tc.name, input_preview);
+
+                // [V6] Hard gate 已在 tool_schemas 层面完成过滤，此处正常执行
                 let mut result = match self.tools.execute(&tc.name, input.clone(), self.config.tool_timeout).await {
                     Ok(r) => {
                         debug!("Tool result: name={}, result_len={}", tc.name, r.len());
@@ -468,14 +532,32 @@ impl QueryLoop {
                 newly_added_messages.push(tool_msg.clone());
                 session.add_message(tool_msg);
             }
+
+            // [V6] 委派工具执行后立即结束循环，不再发第二轮 API 请求
+            // LLM 的第一轮文字回复已经告知用户，无需再来一轮
+            let delegated = tool_calls.iter().any(|tc| {
+                tc.name == "delegate_task" || tc.name == "delegate_complex_project"
+            });
+            if delegated {
+                // 如果 LLM 没有生成任何文字（直接调了工具），补一条默认通知
+                if text_len == 0 {
+                    let fallback = "好的，任务已派发给后台处理，完成后会自动通知您。";
+                    let _ = event_tx.send(LoopEvent::TextDelta(fallback.to_string())).await;
+                }
+                info!("[V6] Delegation tool executed, ending query loop (no second round-trip)");
+                self.hooks.fire_stop(&mut session).await;
+                let _ = event_tx.send(LoopEvent::TurnEnd).await;
+                break;
+            }
         }
 
-        Ok((session, newly_added_messages))
+        // [V4 Phase 3.1] Preflight result already captured at start of turn
+        // [V4 Phase 4.1] Cached for next turn already done above
+        Ok((session, newly_added_messages, preflight_result))
     }
 
     // T21.1: Write diary entry before compacting messages.
     // Writes a simple session summary to the diary.
-    // The structured topic archive info is written by apply_compact_result() after compact.
     async fn write_compact_diary(&self, messages: &[Message]) {
         let daily = match &self.daily_notes {
             Some(d) => d,
@@ -552,45 +634,8 @@ impl QueryLoop {
         }
     }
 
-    /// v2 Phase 1.5: Apply compact result to TopicTracker and MemoryBoard.
-    /// Called after successful graceful compact to archive topics and update preferences.
-    async fn apply_compact_result(&self, result: &crate::token::compact::CompactResult) {
-        // Update TopicTracker: archive the topics mentioned in compact result
-        if let Some(ref tt) = self.topic_tracker {
-            if !result.archived_topics.is_empty() {
-                tt.write().await.on_compact(&result.archived_topics).await;
-                info!("Archived {} topics from compact", result.archived_topics.len());
-            }
-        }
-
-        // Update MemoryBoard: write archived topics and preferences
-        if let Some(ref mb) = self.memory_board {
-            if let Err(e) = mb.write().await.update_from_compact(
-                &result.archived_topics,
-                &result.extracted_preferences,
-                &result.active_summary,
-            ).await {
-                warn!("Failed to update MemoryBoard: {}", e);
-            } else {
-                info!("MemoryBoard updated: {} archived, {} preferences",
-                    result.archived_topics.len(), result.extracted_preferences.len());
-            }
-        }
-
-        // Write to daily notes (topic timeline format)
-        if let Some(ref daily) = self.daily_notes {
-            if !result.archived_topics.is_empty() {
-                if let Err(e) = daily.append_compact_topics(&result.archived_topics, &result.active_summary) {
-                    warn!("Failed to write compact topics to diary: {}", e);
-                }
-            } else if !result.active_summary.is_empty() {
-                // No archived topics but have active summary — still record it
-                if let Err(e) = daily.append(&result.active_summary, "Compact 活跃话题") {
-                    warn!("Failed to write compact active topic to diary: {}", e);
-                }
-            }
-        }
-    }
+    // [V4 DEPRECATED] apply_compact_result removed
+    // Memory extraction is now handled by MemoryKeeper via ShadowEvent bus (Phase 2)
 }
 
 /// Count the token count of current messages using tiktoken (cl100k_base encoding).
@@ -636,10 +681,15 @@ fn build_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                 }
                 if let Some(ref tcs) = msg.tool_calls {
                     for tc in tcs {
+                        let input = if tc.arguments.is_null() {
+                            serde_json::json!({})
+                        } else {
+                            tc.arguments.clone()
+                        };
                         blocks.push(ContentBlock::ToolUse {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
-                            input: tc.arguments.clone(),
+                            input,
                         });
                     }
                 }

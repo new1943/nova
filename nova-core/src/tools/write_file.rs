@@ -19,13 +19,7 @@ impl WriteFileTool {
         Self { tracker }
     }
 
-    fn check_path(&self, path: &str) -> Result<()> {
-        let nova_dir = dirs::home_dir()
-            .map(|h| h.join(".nova").to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !nova_dir.is_empty() && path.contains(&nova_dir) {
-            anyhow::bail!("Cannot write to ~/.nova/ directory");
-        }
+    fn check_path(&self, _path: &str) -> Result<()> {
         Ok(())
     }
 
@@ -110,8 +104,8 @@ impl Tool for WriteFileTool {
         let file_path = Path::new(path);
         self.check_path(path)?;
 
-        // Read-first check (unless skipped)
-        if !skip_read_check {
+        // Read-first check (unless skipped or file doesn't exist yet)
+        if !skip_read_check && file_path.exists() {
             let tracker = self.tracker.lock().await;
             if !tracker.was_read(file_path) {
                 anyhow::bail!("File '{}' must be read before writing. Use read_file tool first.", path);

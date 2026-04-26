@@ -1,7 +1,9 @@
 use anyhow::Result;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::subagent::{SubagentConfig, SubagentSpawner, SubagentType};
+use crate::tools::registry::ToolRegistry;
 
 /// Four-phase orchestration pipeline
 #[derive(Debug, Clone, PartialEq)]
@@ -30,11 +32,22 @@ pub struct Coordinator {
     api_base_url: String,
     model: String,
     system_prompt: String,
+    /// [V4 Fix] Channel for SubAgent TaskProgress events → Dispatcher → TaskManager
+    shadow_tx: Option<tokio::sync::mpsc::Sender<crate::models::ShadowEvent>>,
+    /// [V4 Fix] ToolRegistry for SubAgent tool execution
+    tools: Option<Arc<ToolRegistry>>,
 }
 
 impl Coordinator {
-    pub fn new(api_key: String, api_base_url: String, model: String, system_prompt: String) -> Self {
-        Self { api_key, api_base_url, model, system_prompt }
+    pub fn new(
+        api_key: String,
+        api_base_url: String,
+        model: String,
+        system_prompt: String,
+        shadow_tx: Option<tokio::sync::mpsc::Sender<crate::models::ShadowEvent>>,
+        tools: Option<Arc<ToolRegistry>>,
+    ) -> Self {
+        Self { api_key, api_base_url, model, system_prompt, shadow_tx, tools }
     }
 
     /// Run the full four-phase pipeline for a task
@@ -74,6 +87,8 @@ impl Coordinator {
                 api_base_url: self.api_base_url.clone(),
                 model: self.model.clone(),
                 max_input_tokens: 16_000,
+                shadow_tx: self.shadow_tx.clone(), // [V4 Fix] Wired to ShadowEvent bus
+                tools: self.tools.clone(), // [V4 Fix] Enable tools for SubAgent
             };
 
             let handle = SubagentSpawner::spawn(config, phase_prompt);

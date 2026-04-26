@@ -10,85 +10,21 @@ const MIN_FILE_BUDGET: usize = 64;
 const HEAD_RATIO: f64 = 0.7;
 const TAIL_RATIO: f64 = 0.2;
 
+/// 内置 Agent 行为宪法 — 不可被用户篡改
+/// [V5] 通过 include_str! 编译嵌入，保证不可运行时篡改
+const BUILTIN_AGENTS: &str = include_str!("../../prompts/AGENTS.md");
+
 /// Bootstrap files to load, in injection order.
+/// [V4 spec] Only SOUL.md, IDENTITY.md, USER.md are allowed.
+/// AGENTS.md, STATE.md, TASKS.md are deprecated and must not be loaded.
 const BOOTSTRAP_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
-    "AGENTS.md",
     "USER.md",
-    "STATE.md",
-    "TASKS.md",
 ];
 
 /// MEMORY.md is loaded separately — it's the working memory layer (Layer 1).
 const MEMORY_FILE: &str = "MEMORY.md";
-
-/// Memory system guidance injected into system prompt.
-/// This guides the LLM to actively maintain MEMORY.md.
-const MEMORY_GUIDANCE: &str = r#"## 记忆系统
-
-你有一个三层记忆系统：
-
-### 层1：MEMORY.md（工作记忆，始终可见）
-- 路径：`~/.nova/MEMORY.md`
-- 内容：用户偏好、项目状态、重要决策、参考资料
-- 分类：`## 用户` / `## 项目` / `## 反馈` / `## 参考`
-- 维护方式：
-  - 用户说"记住..." → 用 file_edit 立即更新对应区块
-  - 重要决策后 → 更新 `## 项目` 区块
-  - 收到反馈 → 更新 `## 反馈` 区块
-  - 保持 <200 行，精炼表达
-- 写入时机：
-  - 用户显式要求："记住这个"、"以后都用..."
-  - 重要反馈："偏好 XXX"、"不要做 YYY"
-  - 项目关键节点：方案选型、架构决策、重大变更
-  - 不要每句话都记，只记值得长期保留的
-
-### 层2：情景记忆（自动写入，不需你操心）
-- 路径：`~/.nova/memories/YYYY-MM-DD.md`
-- 系统自动在 Compact 前和 Session 结束时写入
-- 你可以 `/search <关键词>` 手动召回相关记忆
-
-### 层3：历史 Session（完整细节）
-- 路径：`~/.nova/sessions/<uuid>.jsonl`
-- 通过 Agentic Session Search 自动召回相关历史"#;
-
-/// Skills self-iteration guidance injected into system prompt.
-/// This guides the LLM to proactively create/patch/delete skills.
-const SKILLS_GUIDANCE: &str = r##"## 技能系统
-
-你有一个技能自迭代系统，可以将成功经验固化为可复用技能。
-
-### 创建时机（满足任一即创建）
-- 复杂任务完成后（5+ tool calls）
-- 克服了一个 tricky error
-- 发现并验证了非平凡工作流
-- 用户纠正了你的方法且有效
-- 用户要求记住某个流程
-
-### 创建方式
-- `skill_manage(action="create", name="<skill-name>", content="# YAML frontmatter...")`
-- 技能目录：`~/.nova/skills/<name>/SKILL.md`
-
-### 更新时机
-- 使用 skill 时发现过时/错误/不完整 → 立即 patch
-- 遇到 OS 特定问题
-- 发现更好的方案
-
-### 更新方式
-- `skill_manage(action="patch", name="<skill-name>", old_string="...", new_string="...")`
-- 不需要等用户要求，发现问题立即改
-
-### 删除时机
-- Skill 不再适用
-- 有更好的替代方案
-
-### 删除方式
-- `skill_manage(action="delete", name="<skill-name>")`
-
-### 查看已有技能
-- `skills_list()` — 列出所有技能（minimal metadata）
-- `skill_view(name="<skill-name>")` — 查看完整技能内容"##;
 
 /// Cached file entry with mtime for change detection
 #[derive(Debug, Clone)]
@@ -134,43 +70,53 @@ impl BootstrapLoader {
 
     /// Build the full system prompt. Call this before every API request.
     /// Files are re-read only when their mtime changes.
+    ///
+    /// [V5] 组装顺序：
+    /// 第一层: SOUL.md, IDENTITY.md
+    /// 第二层: BUILTIN_AGENTS（内置行为宪法，include_str! 嵌入）
+    /// 第三层: 工具描述
+    /// 第四层: USER.md, HEARTBEAT.md, MEMORY.md
     pub fn build_system_prompt(&mut self, tool_descriptions: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut total_chars: usize = 0;
 
-        for &name in BOOTSTRAP_FILES {
+        // 第一层：SOUL.md, IDENTITY.md
+        for &name in &["SOUL.md", "IDENTITY.md"] {
             let content = self.load_with_cache(name);
             if content.is_empty() {
                 continue;
             }
-
             let budget = MAX_PER_FILE_CHARS.min(MAX_TOTAL_CHARS.saturating_sub(total_chars));
             if budget < MIN_FILE_BUDGET {
                 break;
             }
-
             let truncated = truncate_bootstrap(&content, budget);
             total_chars += truncated.chars().count();
             parts.push(truncated);
         }
 
-        // HEARTBEAT.md as independent section (not in bootstrap pipeline)
-        let heartbeat = self.load_with_cache("HEARTBEAT.md");
-        if !heartbeat.is_empty() {
-            let hb_budget = MAX_PER_FILE_CHARS.min(MAX_TOTAL_CHARS.saturating_sub(total_chars));
-            if hb_budget >= MIN_FILE_BUDGET {
-                let section = format!("## Heartbeats\n\n{}", truncate_bootstrap(&heartbeat, hb_budget));
-                parts.push(section);
+        // 第二层：内置 Agent 行为宪法（包含记忆规范、技能规范、派发规则、安全红线）
+        parts.push(BUILTIN_AGENTS.to_string());
+
+        // 第三层：工具描述
+        if !tool_descriptions.is_empty() {
+            parts.push(tool_descriptions.to_string());
+        }
+
+        // 第四层：USER.md, HEARTBEAT.md, MEMORY.md
+        for &name in &["USER.md", "HEARTBEAT.md"] {
+            let content = self.load_with_cache(name);
+            if !content.is_empty() {
+                let budget = MAX_PER_FILE_CHARS.min(MAX_TOTAL_CHARS.saturating_sub(total_chars));
+                if budget >= MIN_FILE_BUDGET {
+                    let truncated = truncate_bootstrap(&content, budget);
+                    total_chars += truncated.chars().count();
+                    parts.push(truncated);
+                }
             }
         }
 
-        // Append memory guidance (always, even if MEMORY.md doesn't exist yet)
-        parts.push(MEMORY_GUIDANCE.to_string());
-
-        // Append skills guidance (always, even if no skills exist yet)
-        parts.push(SKILLS_GUIDANCE.to_string());
-
-        // Inject MEMORY.md actual content (Layer 1 working memory)
+        // MEMORY.md 单独注入（带专用截断，10_000 chars）
         let memory_content = self.load_memory();
         if !memory_content.is_empty() {
             let mem_budget = MAX_TOTAL_CHARS.saturating_sub(total_chars).min(10_000);
@@ -181,11 +127,6 @@ impl BootstrapLoader {
                     truncated
                 ));
             }
-        }
-
-        // Tool descriptions always appended
-        if !tool_descriptions.is_empty() {
-            parts.push(tool_descriptions.to_string());
         }
 
         parts.join("\n\n---\n\n")

@@ -47,21 +47,32 @@ impl Tool for ReadFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' field"))?;
 
-        let file_path = Path::new(path);
+        // Expand ~ to home directory
+        let path = if path.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                path.replacen("~", &home.to_string_lossy(), 1)
+            } else {
+                path.to_string()
+            }
+        } else {
+            path.to_string()
+        };
+
+        let file_path = Path::new(&path);
 
         // Check for blocked device files
         if is_blocked_device(file_path) {
             anyhow::bail!("Cannot read device file: {}", path);
         }
 
-        let metadata = fs::metadata(path)
+        let metadata = fs::metadata(&path)
             .map_err(|e| anyhow::anyhow!("Cannot read '{}': {}", path, e))?;
 
         if metadata.len() > MAX_FILE_SIZE {
             anyhow::bail!("File too large ({} bytes, max {}). Use line range.", metadata.len(), MAX_FILE_SIZE);
         }
 
-        let content = fs::read_to_string(path)?;
+        let content = fs::read_to_string(&path)?;
         let mtime = metadata.modified()
             .unwrap_or(SystemTime::UNIX_EPOCH);
 

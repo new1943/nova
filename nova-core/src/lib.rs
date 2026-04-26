@@ -1,5 +1,6 @@
 pub mod config;
 pub mod message;
+pub mod models;
 pub mod agent;
 pub mod session;
 pub mod tools;

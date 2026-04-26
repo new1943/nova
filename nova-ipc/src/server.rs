@@ -51,10 +51,10 @@ pub struct IpcConnection {
 }
 
 /// Clone is not supported since BufReader<OwnedReadHalf> is !Clone.
-/// Use a separate mpsc-based heartbeat channel instead.
+/// Use clone_writer() to get a shared reference to the writer for sending events.
 impl Clone for IpcConnection {
     fn clone(&self) -> Self {
-        panic!("IpcConnection does not support clone() — use heartbeat mpsc channel instead");
+        panic!("IpcConnection does not support clone() — use clone_writer() instead");
     }
 }
 
@@ -65,6 +65,12 @@ impl IpcConnection {
             reader: BufReader::new(read_half),
             writer: Arc::new(Mutex::new(write_half)),
         }
+    }
+
+    /// Clone the writer as an Arc<Mutex<OwnedWriteHalf>>.
+    /// Use this to share the writer with other tasks for sending events.
+    pub fn clone_writer(&self) -> Arc<Mutex<OwnedWriteHalf>> {
+        self.writer.clone()
     }
 
     /// Read a Request from the connection

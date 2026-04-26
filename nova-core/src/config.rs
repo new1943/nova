@@ -40,6 +40,9 @@ pub struct NovaConfig {
     pub discord_enabled: bool,
     /// Discord Gateway: Bot Token (required if enabled)
     pub discord_token: Option<String>,
+    /// Discord: Default channel ID for proactive pushes (e.g. ProjectCompleted).
+    /// Used when the channel_id in the event is "coordinator".
+    pub discord_channel_id: Option<u64>,
     /// Log level: "info" (default) or "debug"
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -80,6 +83,7 @@ impl Default for NovaConfig {
             browser_headless: None,
             discord_enabled: default_discord_enabled(),
             discord_token: None,
+            discord_channel_id: None,
             log_level: default_log_level(),
         }
     }

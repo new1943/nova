@@ -4,6 +4,7 @@ use nova_api::types::ToolSchema;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::debug;
 
 /// Tool trait — all tools must implement this
 #[async_trait]
@@ -52,6 +53,29 @@ impl ToolRegistry {
             .iter()
             .chain(self.mcp_order.iter())
             .filter_map(|name| self.tools.get(name))
+            .map(|t| ToolSchema {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+            })
+            .collect()
+    }
+
+    /// Export tool schemas filtered by name predicate.
+    /// Used for complexity-based tool interception (Task 4.1).
+    pub fn as_api_schemas_filtered<F>(&self, filter: F) -> Vec<ToolSchema>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let names: Vec<&String> = self.builtin_order
+            .iter()
+            .chain(self.mcp_order.iter())
+            .filter(|name| filter(name))
+            .collect();
+        debug!("[V4] Tool filtering: {} tools allowed: {:?}", names.len(), names);
+        names
+            .iter()
+            .filter_map(|name| self.tools.get(*name))
             .map(|t| ToolSchema {
                 name: t.name().to_string(),
                 description: t.description().to_string(),

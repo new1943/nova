@@ -29,6 +29,8 @@ pub enum Event {
     SearchResults { results: Vec<SearchResultEntry> },
     /// Heartbeat task fired — sent from daemon to TUI
     Heartbeat { task_name: String, message: String },
+    /// [V4 Fix] Background project completed notification from Coordinator
+    ProjectCompleted { project_id: String, report: String },
 }
 
 /// A single search result entry

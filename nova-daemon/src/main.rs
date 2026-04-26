@@ -1,12 +1,15 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, broadcast, Mutex};
 use tracing::{info, error, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use nova_core::agent::{QueryLoop, QueryLoopConfig, LoopEvent};
+use nova_core::agent::preflight::PreFlightChecker;
 use nova_core::config::NovaConfig;
+use nova_core::models::ShadowEvent;
 use nova_core::hooks::HookManager;
 use nova_core::memory::consolidate::MemoryConsolidator;
 use nova_core::memory::daily::DailyNotes;
@@ -14,7 +17,7 @@ use nova_core::memory::dream::DreamEngine;
 use nova_core::memory::recall::MemoryRecall;
 use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
-use nova_core::sidequery::SideQuery;
+use nova_core::sidequery::{SideQuery, MemoryKeeper};
 use nova_core::skills::{create_shared_loader, SharedSkillsLoader, SkillManageTool, SkillsListTool, SkillViewTool};
 use nova_core::heartbeat::{HeartbeatScheduler, scheduler::HeartbeatEvent};
 use nova_core::coordinator::Coordinator;
@@ -27,6 +30,15 @@ const SOCKET_PATH: &str = "/tmp/nova.sock";
 const PID_FILE: &str = "/tmp/nova.pid";
 
 mod discord;
+mod dispatcher;
+mod task_manager;
+
+/// [V4 Task 6.2] Discord proactive push message
+#[derive(Clone)]
+struct DiscordPush {
+    channel_id: String,
+    content: String,
+}
 
 pub struct HandleConfig {
     workspace_dir: PathBuf,
@@ -37,6 +49,14 @@ pub struct HandleConfig {
     run_mode: String,
     tools: Arc<ToolRegistry>,
     heartbeat_interval_secs: u64,
+    /// Arc-wrapped dispatcher sender so it can be shared across HandleConfigs
+    /// without move semantics. Clone of Arc<DispatcherSender> is cheap (just ref count).
+    dispatcher_tx: Arc<dispatcher::DispatcherSender>,
+    /// [V4 Task 6.2] Optional channel for Discord proactive push.
+    /// When Some, DiscordHandler listens and sends messages to specified channels.
+    discord_push_tx: Option<std::sync::Arc<tokio::sync::mpsc::Sender<DiscordPush>>>,
+    /// [V4 Fix] Broadcast sender for IPC push events to TUI
+    ipc_push_tx: Option<std::sync::Arc<tokio::sync::broadcast::Sender<nova_ipc::Event>>>,
 }
 
 fn budget_pct_calc(input_tokens: usize, context_window: usize) -> f32 {
@@ -74,7 +94,10 @@ async fn main() -> Result<()> {
 
     // Use config.log_level, but allow env override
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+        .unwrap_or_else(|_| EnvFilter::new(&config.log_level))
+        // Suppress verbose CDP/WebSocket parsing errors from chromiumoxide
+        .add_directive("chromiumoxide=warn".parse().unwrap())
+        .add_directive("tungstenite=warn".parse().unwrap());
 
     tracing_subscriber::registry()
         .with(filter)
@@ -117,6 +140,38 @@ fn check_pid_file() -> bool {
     } else { false }
 }
 
+/// [V4 Fix] Create a ToolRegistry for Coordinator's SubAgents.
+/// Contains ONLY subagent-appropriate tools: bash, read_file, write_file, file_edit, glob, grep, browser.
+/// Does NOT include delegate_complex_project (avoids circular dependency).
+///
+/// [V5] SubAgent BrowserTool 使用独立 Chrome Profile，避免与主 Agent 的 CDP session 冲突
+fn make_subagent_tools(
+    browser_chrome_path: Option<String>,
+    _browser_profile_dir: Option<String>, // 忽略，主 Agent 的 profile 不适用于 SubAgent
+    browser_headless: bool,
+    file_tracker: nova_core::tools::SharedFileReadTracker,
+) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    tools.register_builtin(Box::new(BashTool::new(BashMode::Open)));
+    tools.register_builtin(Box::new(ReadFileTool::new(file_tracker.clone())));
+    tools.register_builtin(Box::new(WriteFileTool::new(file_tracker.clone())));
+    tools.register_builtin(Box::new(FileEditTool::new(file_tracker.clone())));
+    tools.register_builtin(Box::new(GlobTool));
+    tools.register_builtin(Box::new(GrepTool));
+    // [V5] SubAgent 使用独立 Chrome Profile
+    let subagent_profile = format!(
+        "{}/.nova/chrome-subagent-{}",
+        dirs::home_dir().unwrap().display(),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    tools.register_builtin(Box::new(BrowserTool::new(
+        browser_chrome_path,
+        Some(subagent_profile),
+        browser_headless,
+    )));
+    tools
+}
+
 fn make_tools(
     mode: &str,
     browser_chrome_path: Option<String>,
@@ -132,6 +187,9 @@ fn make_tools(
     model: String,
     skills_dir: PathBuf,
     skills: SharedSkillsLoader,
+    dispatcher_tx: Arc<dispatcher::DispatcherSender>,
+    shadow_tx: tokio::sync::mpsc::Sender<nova_core::models::ShadowEvent>,
+    subagent_tools: Option<Arc<ToolRegistry>>,
 ) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
@@ -155,7 +213,8 @@ fn make_tools(
     tools.register_builtin(Box::new(AgenticSearchTool::new(side_query, session_manager)));
 
     // Agent tool — spawn subagents for parallel/background tasks
-    tools.register_builtin(Box::new(AgentTool::new(api_key, api_base_url, model)));
+    // [V4 Fix] Pass shadow_tx so SubAgents can emit TaskProgress events
+    tools.register_builtin(Box::new(AgentTool::new(api_key.clone(), api_base_url.clone(), model.clone()).with_shadow_tx(shadow_tx.clone())));
 
     // Worktree tool — git worktree isolation per session
     if let Some(root) = repo_root {
@@ -171,6 +230,39 @@ fn make_tools(
     tools.register_builtin(Box::new(SkillManageTool::new(skills_dir.clone(), skills.clone())));
     tools.register_builtin(Box::new(SkillsListTool::new(skills.clone())));
     tools.register_builtin(Box::new(SkillViewTool::new(skills_dir, skills)));
+
+    // [V4 Phase 4.2] delegate_complex_project — for complex project delegation
+    // [V4 Fix] Pass shadow_tx so Coordinator's SubAgents emit TaskProgress events
+    // Also inject subagent_tools so Coordinator's SubAgents can execute tools
+    let delegate_tool = nova_core::tools::DelegateComplexProjectTool::new(
+        dispatcher_tx.clone(),
+        shadow_tx.clone(),
+        api_key.clone(),
+        api_base_url.clone(),
+        model.clone(),
+    );
+    let delegate_tool = if let Some(ref st) = subagent_tools {
+        delegate_tool.with_tools(st.clone())
+    } else {
+        delegate_tool
+    };
+    tools.register_builtin(Box::new(delegate_tool));
+    tools.register_builtin(Box::new(nova_core::tools::CancelDelegatedProjectTool::new()));
+
+    // [FIXBUG-002] delegate_task — for Medium complexity single-task delegation
+    let delegate_task_tool = nova_core::tools::DelegateTaskTool::new(
+        dispatcher_tx.clone(),
+        shadow_tx.clone(),
+        api_key.clone(),
+        api_base_url.clone(),
+        model.clone(),
+    );
+    let delegate_task_tool = if let Some(st) = subagent_tools {
+        delegate_task_tool.with_tools(st)
+    } else {
+        delegate_task_tool
+    };
+    tools.register_builtin(Box::new(delegate_task_tool));
 
     tools
 }
@@ -201,11 +293,17 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
     info!("NOVA daemon starting, workspace: {:?}, mode: {}, log_level: {}",
         config.workspace, config.mode, config.log_level);
 
+    // [V5] 检测旧 AGENTS.md 并提示迁移
+    let old_agents_path = config.workspace.join("AGENTS.md");
+    if old_agents_path.exists() {
+        info!("检测到旧的 AGENTS.md 文件（位于 ~/.nova/AGENTS.md），该文件已被内置版本替代，可安全删除");
+    }
+
     let run_mode = config.mode.clone();
 
     let skills = create_shared_loader(config.workspace.join("skills"))?;
 
-    let loop_config = QueryLoopConfig {
+    let mut loop_config = QueryLoopConfig {
         max_turns: config.max_turns,
         tool_timeout: std::time::Duration::from_secs(config.tool_timeout_secs),
         model: config.model.clone(),
@@ -216,6 +314,7 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
         budget_trigger_pct: config.budget_trigger_pct,
         compact_target_pct: config.compact_target_pct,
         memories_dir: None,
+        preflight_checker: None, // [V4 Phase 3.1] Set up after Dispatcher creation
     };
 
     let server = IpcServer::bind(SOCKET_PATH.as_ref()).await?;
@@ -224,8 +323,62 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
     // Create shared file tracker for read-first safety
     let file_tracker = create_shared_tracker();
 
+    // [V4 Phase 2.4] Create MemoryKeeper for async memory extraction
+    let memory_keeper = Arc::new(MemoryKeeper::new(
+        config.workspace.clone(),
+        SideQuery::new(
+            loop_config.api_key.clone(),
+            loop_config.api_base_url.clone(),
+            loop_config.model.clone(),
+        ),
+    ));
+
+    // [V4 Task 6.2] Create Discord push channel (before Dispatcher so it can be passed in)
+    // This channel forwards ProjectCompleted events to Discord push listener
+    let (discord_push_tx, discord_push_rx) = if config.discord_enabled {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DiscordPush>(32);
+        (Some(std::sync::Arc::new(tx)), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // [V4 Fix] Create IPC push channel for ProjectCompleted → TUI
+    // Using broadcast channel so all TUI connections receive the notification
+    let ipc_push_tx = tokio::sync::broadcast::channel::<nova_ipc::Event>(32).0;
+
+    // [V4 Phase 2.2] Spawn the ShadowEvent dispatcher loop (with MemoryKeeper and optionally Discord push)
+    let dispatcher_tx = {
+        let mut d = dispatcher::Dispatcher::new(config.workspace.clone())
+            .with_memory_keeper(memory_keeper);
+        if let Some(ref tx) = discord_push_tx {
+            d = d.with_discord_push_tx(tx.clone());
+        }
+        d = d.with_ipc_push_tx(Arc::new(ipc_push_tx.clone()));
+        d.spawn()
+    };
+    info!("ShadowEvent dispatcher spawned with MemoryKeeper");
+
+    // [V4 Phase 3.1] Set up PreFlightChecker now that we have api credentials
+    // (was deferred until after Dispatcher creation per comment above)
+    loop_config.preflight_checker = Some(PreFlightChecker::new(
+        loop_config.api_key.clone(),
+        loop_config.api_base_url.clone(),
+        loop_config.model.clone(),
+    ));
+    info!("[V4] PreFlightChecker initialized");
+
     if config.discord_enabled {
         if let Some(token) = config.discord_token.clone() {
+            let mut discord_push_rx = discord_push_rx.unwrap(); // Safe: we checked config.discord_enabled
+
+            // [V4 Fix] Create subagent tools for Coordinator's SubAgents
+            let tools_subagent = Arc::new(make_subagent_tools(
+                config.browser_chrome_path.clone(),
+                config.browser_profile_dir.clone(),
+                config.browser_headless.unwrap_or(true),
+                file_tracker.clone(),
+            ));
+
             let tools_dc = Arc::new(make_tools(
                 &run_mode,
                 config.browser_chrome_path.clone(),
@@ -241,6 +394,9 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 loop_config.model.clone(),
                 config.workspace.join("skills"),
                 skills.clone(),
+                dispatcher_tx.clone(),
+                dispatcher_tx.channel(),
+                Some(tools_subagent),
             ));
             let dc_cfg = Arc::new(HandleConfig {
                 workspace_dir: config.workspace.clone(),
@@ -251,7 +407,39 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 run_mode: run_mode.clone(),
                 tools: tools_dc,
                 heartbeat_interval_secs: config.heartbeat_interval_secs,
+                dispatcher_tx: dispatcher_tx.clone(),
+                discord_push_tx: discord_push_tx.clone(),
+                ipc_push_tx: None, // Discord doesn't use IPC push
             });
+
+            // [V4 Task 6.2] Spawn Discord proactive push listener
+            // Uses a standalone Http client to send messages to Discord channels
+            let http = serenity::http::Http::new(&token);
+            // [V4 GAP Fix] Map "coordinator" symbolic channel to configured discord_channel_id
+            let discord_channel_id = config.discord_channel_id;
+            tokio::spawn(async move {
+                while let Some(push) = discord_push_rx.recv().await {
+                    // [V4 GAP Fix] Resolve symbolic channel "coordinator" to configured channel ID
+                    let resolved_channel_id = if push.channel_id == "coordinator" {
+                        discord_channel_id
+                    } else {
+                        push.channel_id.parse::<u64>().ok()
+                    };
+
+                    if let Some(channel_id_val) = resolved_channel_id {
+                        let channel_id = serenity::model::id::ChannelId::new(channel_id_val);
+                        let builder = serenity::builder::CreateMessage::new()
+                            .content(push.content);
+                        match channel_id.send_message(&http, builder).await {
+                            Ok(_) => info!("[V4] Discord push sent to channel {}", channel_id),
+                            Err(e) => warn!("[V4] Discord push failed: {}", e),
+                        }
+                    } else {
+                        warn!("[V4] Invalid Discord channel ID: {} (tried 'coordinator' mapping)", push.channel_id);
+                    }
+                }
+            });
+
             tokio::spawn(async move {
                 if let Err(e) = discord::start(token, dc_cfg).await {
                     error!("Discord gateway crashed: {}", e);
@@ -278,6 +466,14 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 );
                 let sm_for_tools = SessionManager::new(sd.clone());
 
+                // [V4 Fix] Create subagent tools for Coordinator's SubAgents
+                let tools_subagent = Arc::new(make_subagent_tools(
+                    config.browser_chrome_path.clone(),
+                    config.browser_profile_dir.clone(),
+                    config.browser_headless.unwrap_or(true),
+                    file_tracker.clone(),
+                ));
+
                 let tools = Arc::new(make_tools(
                     &run_mode,
                     config.browser_chrome_path.clone(),
@@ -293,7 +489,13 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                     lc.model.clone(),
                     config.workspace.join("skills"),
                     sk.clone(),
+                    dispatcher_tx.clone(),
+                    dispatcher_tx.channel(),
+                    Some(tools_subagent),
                 ));
+                // Shadow dispatcher_tx for each connection so it can be moved into the async block
+                let dispatcher_tx = dispatcher_tx.clone();
+                let ipc_push_tx_clone = ipc_push_tx.clone();
                 tokio::spawn(async move {
                     let cfg = HandleConfig {
                         workspace_dir,
@@ -304,6 +506,9 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                         run_mode: rm,
                         tools,
                         heartbeat_interval_secs: config.heartbeat_interval_secs,
+                        dispatcher_tx: dispatcher_tx.clone(),
+                        discord_push_tx: None, // IPC connections don't use Discord push
+                        ipc_push_tx: Some(Arc::new(ipc_push_tx_clone)), // [V4 Fix] Broadcast to TUI
                     };
                     if let Err(e) = handle_connection(conn, cfg).await {
                         error!("Connection error: {}", e);
@@ -326,6 +531,8 @@ async fn handle_connection(
     let skills = cfg.skills;
     let _run_mode = cfg.run_mode;
     let tools = cfg.tools;
+    let dispatcher_tx = cfg.dispatcher_tx.clone();
+    let ipc_push_tx = cfg.ipc_push_tx.clone();
     let session_mgr = SessionManager::new(sessions_dir.clone());
 
     // BootstrapLoader: hot-reloads workspace files with mtime caching
@@ -399,6 +606,43 @@ async fn handle_connection(
         }
     };
 
+    // [V4 Fix] Create IPC push receiver for ProjectCompleted notifications
+    let mut ipc_push_rx = if let Some(ref tx) = ipc_push_tx {
+        Some(tx.subscribe())
+    } else {
+        None
+    };
+
+    // [V4 Fix] Spawn IPC push forwarder: listens to broadcast and sends to conn
+    let writer = conn.clone_writer();
+    if let Some(mut rx) = ipc_push_rx {
+        tokio::spawn(async move {
+            info!("[IPC Push] Forwarder started, waiting for ProjectCompleted events");
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        info!("[IPC Push] Forwarding event to TUI: {:?}", event);
+                        let mut data = serde_json::to_string(&event).unwrap();
+                        data.push('\n');
+                        let mut w = writer.lock().await;
+                        if w.write_all(data.as_bytes()).await.is_err() {
+                            warn!("[IPC Push] Write failed, connection closed");
+                            break; // Connection closed
+                        }
+                        w.flush().await.ok();
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("[IPC Push] Broadcast channel closed, forwarder stopping");
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("[IPC Push] Forwarder lagged {} messages", n);
+                    }
+                }
+            }
+        });
+    }
+
     // Heartbeat: load HEARTBEAT.md and start the scheduler (background, detached).
     // Events are logged only — TUI forwarding requires future tokio::select! refactor.
     if let Ok(content) = std::fs::read_to_string(workspace_dir.join("HEARTBEAT.md")) {
@@ -425,6 +669,16 @@ async fn handle_connection(
                 // This captures the "implicit context switch" when user returns after a break.
                 {
                     let idle_secs = (chrono::Utc::now() - session.updated_at).num_seconds();
+
+                    // [V4 Task 6.1] SystemIdle — emit when idle >= 60 seconds
+                    if idle_secs >= 60 {
+                        info!("[V4] SystemIdle detected ({}s idle), emitting event", idle_secs);
+                        dispatcher_tx.emit(ShadowEvent::SystemIdle {
+                            duration_secs: idle_secs as u64,
+                            transcript: session.messages.clone(),
+                        });
+                    }
+
                     let has_unswept = session.last_memory_sweep_index < session.messages.len();
                     if idle_secs > 900 && has_unswept {
                         info!(
@@ -479,16 +733,17 @@ async fn handle_connection(
                 // Hot-reload system prompt from workspace files (mtime cached)
                 let mut sp = bootstrap.lock().await.build_system_prompt(&tool_desc);
 
-                // v2 Phase 2: Inject <nova_os> thinking pipe hints into system prompt
-                let nova_os = build_nova_os_section(
-                    mode_router.clone(),
-                    tension_tracker.clone(),
-                    topic_tracker.clone(),
-                ).await;
-                if !nova_os.is_empty() {
-                    sp.push_str("\n\n---\n\n");
-                    sp.push_str(&nova_os);
-                }
+                // [V4 DEPRECATED] v2 Phase 2: Inject <nova_os> thinking pipe hints into system prompt
+                // <nova_os> is deprecated - state machine interception now handles this in Rust side
+                // let nova_os = build_nova_os_section(
+                //     mode_router.clone(),
+                //     tension_tracker.clone(),
+                //     topic_tracker.clone(),
+                // ).await;
+                // if !nova_os.is_empty() {
+                //     sp.push_str("\n\n---\n\n");
+                //     sp.push_str(&nova_os);
+                // }
 
                 // Auto-search: inject relevant history session context
                 if content.chars().count() > 5 {
@@ -543,6 +798,8 @@ async fn handle_connection(
                 }
 
                 let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
+                // [V4 Task 3.2] Get shadow event sender for QueryLoop
+                let shadow_tx = dispatcher_tx.channel();
                 let lc = loop_config.clone();
                 let ctx_window = lc.context_window;
                 let dn = daily_notes.clone();
@@ -562,15 +819,20 @@ async fn handle_connection(
                     let ql = QueryLoop::new(
                         tools_clone, hooks, lc, Some(dn), Some(sq_loop),
                         Some(cons_inner),
-                        Some(tt), Some(tens), Some(mr), Some(mb),
+                        Some(tt), Some(tens), /* mr disabled */ Some(mb),
+                        Some(shadow_tx),
                     );
                     let mut s = session_clone;
                     s.turn_count = 0;
-                    let result = ql.run_turn(s.clone(), &sp, event_tx).await;
-                    match result {
-                        Ok((updated_s, new_msgs)) => (updated_s, new_msgs),
-                        Err(_) => (s, vec![]),
-                    }
+                    
+                    let session_id_str = s.session_id.clone();
+                    nova_core::tools::CURRENT_CHANNEL_ID.scope(session_id_str, async move {
+                        let result = ql.run_turn(s.clone(), &sp, event_tx).await;
+                        match result {
+                            Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
+                            Err(_) => (s, vec![], None),
+                        }
+                    }).await
                 });
 
                 while let Some(event) = event_rx.recv().await {
@@ -590,8 +852,17 @@ async fn handle_connection(
                     conn.send_event(&ipc_event).await.ok();
                 }
 
-                if let Ok((updated, new_msgs)) = loop_handle.await {
+                if let Ok((updated, new_msgs, preflight_result)) = loop_handle.await {
                     session = updated;
+
+                    // T3.2: TopicShift → ShadowEvent::TopicArchived
+                    if preflight_result.as_ref().map(|p| p.topic_shift).unwrap_or(false) {
+                        info!("Topic shift detected, emitting TopicArchived event");
+                        dispatcher_tx.emit(ShadowEvent::TopicArchived {
+                            transcript: session.messages.clone(),
+                        });
+                    }
+
                     let history = session_mgr.history_for(&session);
                     // Append ONLY newly added messages instead of relying on `[old_len..]`
                     // since compaction might reduce the total length in memory!
@@ -687,11 +958,15 @@ async fn handle_connection(
             }
             Request::Orchestrate { task } => {
                 info!("Orchestration requested: {}", task);
+                // [V4 Fix] Pass shadow_tx so Coordinator's SubAgents emit TaskProgress events
+                // Note: tools=None here since this is a direct API path, not through DelegateComplexProjectTool
                 let coordinator = Coordinator::new(
                     loop_config.api_key.clone(),
                     loop_config.api_base_url.clone(),
                     loop_config.model.clone(),
                     String::new(), // system_prompt empty
+                    Some(dispatcher_tx.channel()),
+                    None, // [V4 Fix] No tools for direct Orchestrate API
                 );
                 match coordinator.orchestrate(&task).await {
                     Ok(result) => {

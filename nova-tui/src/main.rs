@@ -295,5 +295,10 @@ fn handle_ipc_event(app: &mut App, event: Event) {
             }
             app.status_text = "Ready".into();
         }
+        // [V4 Fix] Handle ProjectCompleted notification from Coordinator
+        Event::ProjectCompleted { project_id, report } => {
+            app.push_message(DisplayRole::System, format!("✅ Project Completed (ID: {})\n\n{}", project_id, report));
+            app.status_text = "Project completed".into();
+        }
     }
 }

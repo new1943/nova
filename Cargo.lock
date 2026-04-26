@@ -1288,11 +1288,13 @@ dependencies = [
  "dirs",
  "nova-core",
  "nova-ipc",
+ "regex",
  "serde_json",
  "serenity",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

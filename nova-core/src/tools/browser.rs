@@ -106,6 +106,19 @@ pub struct BrowserTool {
     session: Arc<Mutex<Option<(Browser, Page, Option<tokio::process::Child>)>>>,
 }
 
+impl Drop for BrowserTool {
+    fn drop(&mut self) {
+        // Session is already being dropped (Arc<Mutex<Option<...>>>)
+        // Child process will be killed when Option<Child> is dropped
+        // Clean up profile directory for SubAgent instances
+        if self.user_data_dir.contains("chrome-subagent") {
+            if let Err(e) = std::fs::remove_dir_all(&self.user_data_dir) {
+                tracing::debug!("Failed to remove SubAgent Chrome profile dir: {}", e);
+            }
+        }
+    }
+}
+
 impl BrowserTool {
     pub fn new(
         chrome_path: Option<String>,
@@ -150,9 +163,7 @@ impl BrowserTool {
             &format!("--user-data-dir={}", self.user_data_dir),
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-default-apps",
-            "--disable-extensions",
-            "--disable-popup-blocking",
+            "--ignore-certificate-errors",
         ]);
         if self.headless {
             cmd.arg("--headless=new");
@@ -493,8 +504,11 @@ impl Tool for BrowserTool {
                 let el = page.find_element(&resolved).await?;
                 el.click().await?; // focus it first
                 
-                // Chromiumoxide native typing (simulates real keystrokes)
-                el.type_str(text).await?;
+                // [FIXBUG] type_str 不能很好支持中文字符（CJK），会报 Key not found
+                // 改用 Input.insertText 模拟 IME 输入法，原生支持全部 Unicode
+                use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+                let insert = InsertTextParams::new(text.to_string());
+                page.execute(insert).await?;
 
                 Ok(format!("Typed: {}", text))
             }
@@ -502,25 +516,31 @@ impl Tool for BrowserTool {
                 let key = args.get("key").and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("press requires 'key'"))?;
                 
-                // Just use evaluate with modern KeyboardEvent synthesis since raw CDP keys can be tedious 
-                // However, the best way for forms is sometimes raw CDP or specific enter logic.
                 use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
                 
-                let key_down = DispatchKeyEventParams::builder()
+                // [FIXBUG] 修正特殊按键的 text 参数。Enter 键的 text 应该是 "\r" 而不是 "Enter"
+                let text_val = match key {
+                    "Enter" => "\r",
+                    "Tab" => "\t",
+                    "Backspace" | "Escape" | "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => "",
+                    _ => key,
+                };
+                
+                let mut key_down_builder = DispatchKeyEventParams::builder()
                     .r#type(DispatchKeyEventType::KeyDown)
-                    .text(key.to_string())
-                    .key(key.to_string())
-                    .build()
-                    .unwrap();
-                page.execute(key_down).await?;
+                    .key(key.to_string());
+                if !text_val.is_empty() {
+                    key_down_builder = key_down_builder.text(text_val.to_string());
+                }
+                page.execute(key_down_builder.build().unwrap()).await?;
 
-                let key_up = DispatchKeyEventParams::builder()
+                let mut key_up_builder = DispatchKeyEventParams::builder()
                     .r#type(DispatchKeyEventType::KeyUp)
-                    .text(key.to_string())
-                    .key(key.to_string())
-                    .build()
-                    .unwrap();
-                page.execute(key_up).await?;
+                    .key(key.to_string());
+                if !text_val.is_empty() {
+                    key_up_builder = key_up_builder.text(text_val.to_string());
+                }
+                page.execute(key_up_builder.build().unwrap()).await?;
 
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 Ok(format!("Pressed: {}", key))
