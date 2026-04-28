@@ -161,29 +161,48 @@ impl Dispatcher {
                 }
             }
             ShadowEvent::ProjectCompleted { project_id, report, channel_id } => {
-                info!("Dispatcher: ProjectCompleted (project={}) → Discord/IPC", project_id);
-                // [V4 Task 6.2] Push to Discord if channel is configured
-                if let Some(tx) = discord_push_tx {
-                    let push = DiscordPush {
-                        channel_id: channel_id.clone(),
-                        content: format!("✅ Project Completed\n\n{}", report),
-                    };
-                    if tx.try_send(push).is_err() {
-                        warn!("Discord push channel full or closed, dropping ProjectCompleted for project {}", project_id);
-                    }
-                } else {
-                    warn!("Discord push not configured, dropping ProjectCompleted for project {}", project_id);
-                }
-                // [V4 Fix] Also push to IPC for TUI notification (broadcast to all connections)
+                info!("Dispatcher: ProjectCompleted (project={}) → IPC/Discord", project_id);
+                
+                let mut ipc_success = false;
+                // [V4 Fix] Push to IPC for TUI notification (broadcast to all connections)
                 if let Some(tx) = ipc_push_tx {
                     let event = IpcEvent::ProjectCompleted {
                         project_id: project_id.clone(),
                         report: report.clone(),
                     };
-                    if tx.send(event).is_err() {
-                        warn!("IPC push has no active receivers, dropping ProjectCompleted for project {}", project_id);
+                    if tx.receiver_count() > 0 {
+                        if tx.send(event).is_ok() {
+                            ipc_success = true;
+                            info!("IPC push sent ProjectCompleted for project {}", project_id);
+                        } else {
+                            warn!("IPC push failed (no active receivers)");
+                        }
                     } else {
-                        info!("IPC push sent ProjectCompleted for project {}", project_id);
+                        warn!("IPC push failed (0 receivers active)");
+                    }
+                }
+
+                // [V4 Task 6.2] Push to Discord if channel is configured
+                // Fallback to Discord if IPC failed, OR if it explicitly has a numeric Discord channel ID
+                if !ipc_success || channel_id.parse::<u64>().is_ok() || channel_id == "coordinator" {
+                    if let Some(tx) = discord_push_tx {
+                        // If channel_id is empty, fallback to "coordinator" mapping
+                        let target_channel = if channel_id.is_empty() {
+                            "coordinator".to_string()
+                        } else {
+                            channel_id.clone()
+                        };
+                        let push = DiscordPush {
+                            channel_id: target_channel,
+                            content: format!("✅ Project Completed\n\n{}", report),
+                        };
+                        if tx.try_send(push).is_err() {
+                            warn!("Discord push channel full or closed, dropping ProjectCompleted for project {}", project_id);
+                        } else {
+                            info!("Discord push fallback sent for project {}", project_id);
+                        }
+                    } else {
+                        warn!("Discord push not configured, dropping ProjectCompleted for project {}", project_id);
                     }
                 }
             }

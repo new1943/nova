@@ -17,3 +17,8 @@ rebel.xml
 
 # macOS
 **/.DS_Store
+
+
+.vscode
+.kiro
+.claude

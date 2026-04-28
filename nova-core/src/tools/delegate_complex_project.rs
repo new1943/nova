@@ -16,6 +16,7 @@ use tokio::task::AbortHandle;
 use crate::coordinator::orchestrator::Coordinator;
 use crate::models::{ShadowEvent, ShadowEventEmitter};
 use crate::tools::registry::ToolRegistry;
+use crate::task::TaskLogger;
 use super::registry::Tool;
 
 // Global registry of running background projects
@@ -35,6 +36,8 @@ pub struct DelegateComplexProjectTool {
     system_prompt: String,
     /// [V4 Fix] ToolRegistry for Coordinator's SubAgent tool execution
     tools: Option<Arc<ToolRegistry>>,
+    /// [V2 Task System] Workspace directory for tasks.md
+    workspace_dir: Option<std::path::PathBuf>,
 }
 
 impl DelegateComplexProjectTool {
@@ -53,7 +56,13 @@ impl DelegateComplexProjectTool {
             model,
             system_prompt: String::new(),
             tools: None,
+            workspace_dir: None,
         }
+    }
+
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     pub fn with_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
@@ -113,30 +122,57 @@ impl Tool for DelegateComplexProjectTool {
         let system_prompt = self.system_prompt.clone();
         let tools = self.tools.clone();
         let project_goal_clone = project_goal.to_string();
-        
+        let workspace_dir = self.workspace_dir.clone();
+
         let channel_id = crate::tools::CURRENT_CHANNEL_ID
             .try_with(|id| id.clone())
             .unwrap_or_else(|_| "coordinator".to_string());
         let channel_id_clone = channel_id.clone();
-        
+
         let project_id = uuid::Uuid::new_v4().to_string();
         let project_id_clone = project_id.clone();
 
+        // [V2 Task System] Log task start to tasks.md
+        if let Some(ref ws) = workspace_dir {
+            let _ = TaskLogger::append_task(ws, &project_id, project_goal).await;
+        }
+
         // [V4 Fix] Spawn Coordinator 4-phase pipeline in background
         let join_handle = tokio::spawn(async move {
+            // [V6 Fix] 动态加载真实的 system_prompt，防止子 Agent (特别是 Verification) 因为缺少日期信息而产生幻觉
+            let actual_system_prompt = if let Some(ref ws) = workspace_dir {
+                let mut loader = crate::workspace::BootstrapLoader::new(ws.clone());
+                let tool_desc = tools.as_ref().map(|t| t.describe_all()).unwrap_or_default();
+                loader.build_system_prompt(&tool_desc)
+            } else {
+                system_prompt
+            };
+
             let coordinator = Coordinator::new(
                 api_key,
                 api_base_url,
                 model,
-                system_prompt,
+                actual_system_prompt,
                 Some(shadow_tx),
                 tools,
             );
 
             let res = coordinator.orchestrate(&task).await;
-            
+
             // Clean up registry upon completion
             RUNNING_PROJECTS.lock().await.remove(&project_id_clone);
+
+            // [V2 Task System] Update task status in tasks.md
+            if let Some(ref ws) = workspace_dir {
+                match &res {
+                    Ok(_) => {
+                        let _ = TaskLogger::update_status_v2(ws, &project_id_clone, "Completed", None).await;
+                    }
+                    Err(e) => {
+                        let _ = TaskLogger::update_status_v2(ws, &project_id_clone, "Failed", Some(&e.to_string())).await;
+                    }
+                }
+            }
 
             match res {
                 Ok(result) => {

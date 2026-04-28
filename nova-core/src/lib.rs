@@ -19,3 +19,4 @@ pub mod coordinator;
 pub mod paste;
 pub mod sandbox;
 pub mod retry;
+pub mod task;

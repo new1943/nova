@@ -205,6 +205,17 @@ impl QueryLoop {
         } else {
             String::new()
         };
+
+        // [V2 Task System] 注入当前任务上下文
+        let tasks_context = if let Some(ref memories_dir) = self.config.memories_dir {
+            match crate::task::TaskLogger::read_context(memories_dir).await {
+                Ok(ctx) => ctx,
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
         // Cache for next turn (fallback if preflight doesn't complete in time)
         if let Some(ref result) = preflight_result {
             *self.cached_complexity.lock().await = Some(result.complexity);
@@ -257,7 +268,7 @@ impl QueryLoop {
             let api_messages = build_api_messages(&session.messages);
             info!("Sending API request to {} ({} messages, estimated {} tokens)", self.config.model, api_messages.len(), estimated_tokens);
             // [V6] 注入 <preflight> 标签 + hard gate 工具过滤
-            let effective_system = format!("{}{}", system_prompt, preflight_injection);
+            let effective_system = format!("{}\n{}\n{}", system_prompt, preflight_injection, tasks_context);
 
             let req = ApiRequest {
                 model: self.config.model.clone(),
@@ -494,15 +505,24 @@ impl QueryLoop {
                 };
                 debug!("Tool call: name={}, args={}", tc.name, input_preview);
 
-                // [V6] Hard gate 已在 tool_schemas 层面完成过滤，此处正常执行
-                let mut result = match self.tools.execute(&tc.name, input.clone(), self.config.tool_timeout).await {
-                    Ok(r) => {
-                        debug!("Tool result: name={}, result_len={}", tc.name, r.len());
-                        r
-                    }
-                    Err(e) => {
-                        error!("Tool `{}` failed: {}", tc.name, e);
-                        format!("{{\"error\": \"{}\"}}", e)
+                // [V6] Hard gate 校验：只有在 tool_schemas 中的工具才允许执行
+                let is_allowed = tool_schemas.iter().any(|s| s.name == tc.name);
+                
+                let mut result = if !is_allowed {
+                    let allowed_names: Vec<&str> = tool_schemas.iter().map(|s| s.name.as_str()).collect();
+                    let msg = format!("[V6 Hard Gate] Tool `{}` is blocked by current complexity gate. Only allowed tools: {:?}", tc.name, allowed_names);
+                    warn!("{}", msg);
+                    format!("{{\"error\": \"{}\"}}", msg)
+                } else {
+                    match self.tools.execute(&tc.name, input.clone(), self.config.tool_timeout).await {
+                        Ok(r) => {
+                            debug!("Tool result: name={}, result_len={}", tc.name, r.len());
+                            r
+                        }
+                        Err(e) => {
+                            error!("Tool `{}` failed: {}", tc.name, e);
+                            format!("{{\"error\": \"{}\"}}", e)
+                        }
                     }
                 };
 

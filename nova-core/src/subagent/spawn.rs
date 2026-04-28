@@ -180,7 +180,7 @@ impl SubagentSpawner {
 
         let mut final_text = String::new();
         let mut loop_count = 0;
-        const MAX_LOOPS: usize = 20; // Safety limit to prevent infinite loops
+        const MAX_LOOPS: usize = 100; // Safety limit to prevent infinite loops
 
         loop {
             loop_count += 1;

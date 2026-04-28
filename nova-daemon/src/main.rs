@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&config.log_level))
         // Suppress verbose CDP/WebSocket parsing errors from chromiumoxide
-        .add_directive("chromiumoxide=warn".parse().unwrap())
+        .add_directive("chromiumoxide=error".parse().unwrap())
         .add_directive("tungstenite=warn".parse().unwrap());
 
     tracing_subscriber::registry()
@@ -190,6 +190,7 @@ fn make_tools(
     dispatcher_tx: Arc<dispatcher::DispatcherSender>,
     shadow_tx: tokio::sync::mpsc::Sender<nova_core::models::ShadowEvent>,
     subagent_tools: Option<Arc<ToolRegistry>>,
+    workspace_dir: PathBuf,
 ) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
@@ -234,13 +235,14 @@ fn make_tools(
     // [V4 Phase 4.2] delegate_complex_project — for complex project delegation
     // [V4 Fix] Pass shadow_tx so Coordinator's SubAgents emit TaskProgress events
     // Also inject subagent_tools so Coordinator's SubAgents can execute tools
+    // [V2 Task System] Pass workspace_dir for tasks.md
     let delegate_tool = nova_core::tools::DelegateComplexProjectTool::new(
         dispatcher_tx.clone(),
         shadow_tx.clone(),
         api_key.clone(),
         api_base_url.clone(),
         model.clone(),
-    );
+    ).with_workspace_dir(workspace_dir.clone());
     let delegate_tool = if let Some(ref st) = subagent_tools {
         delegate_tool.with_tools(st.clone())
     } else {
@@ -250,13 +252,14 @@ fn make_tools(
     tools.register_builtin(Box::new(nova_core::tools::CancelDelegatedProjectTool::new()));
 
     // [FIXBUG-002] delegate_task — for Medium complexity single-task delegation
+    // [V2 Task System] Pass workspace_dir for tasks.md
     let delegate_task_tool = nova_core::tools::DelegateTaskTool::new(
         dispatcher_tx.clone(),
         shadow_tx.clone(),
         api_key.clone(),
         api_base_url.clone(),
         model.clone(),
-    );
+    ).with_workspace_dir(workspace_dir.clone());
     let delegate_task_tool = if let Some(st) = subagent_tools {
         delegate_task_tool.with_tools(st)
     } else {
@@ -292,6 +295,13 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
 
     info!("NOVA daemon starting, workspace: {:?}, mode: {}, log_level: {}",
         config.workspace, config.mode, config.log_level);
+
+    // [V2 Task System] Sweep orphaned [Running] tasks from previous crash
+    if let Err(e) = nova_core::task::TaskLogger::sweep_orphans(&config.workspace).await {
+        warn!("[V2 Task] sweep_orphans failed: {}", e);
+    } else {
+        info!("[V2 Task] sweep_orphans completed");
+    }
 
     // [V5] 检测旧 AGENTS.md 并提示迁移
     let old_agents_path = config.workspace.join("AGENTS.md");
@@ -397,6 +407,7 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 dispatcher_tx.clone(),
                 dispatcher_tx.channel(),
                 Some(tools_subagent),
+                config.workspace.clone(),
             ));
             let dc_cfg = Arc::new(HandleConfig {
                 workspace_dir: config.workspace.clone(),
@@ -428,8 +439,23 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
 
                     if let Some(channel_id_val) = resolved_channel_id {
                         let channel_id = serenity::model::id::ChannelId::new(channel_id_val);
+                        let mut content_to_send = push.content;
+                        if content_to_send.len() > 1950 {
+                            let mut byte_index = 0;
+                            for (char_count, (i, _)) in content_to_send.char_indices().enumerate() {
+                                if char_count == 1950 {
+                                    byte_index = i;
+                                    break;
+                                }
+                            }
+                            if byte_index > 0 {
+                                content_to_send.truncate(byte_index);
+                                content_to_send.push_str("\n... [Truncated]");
+                            }
+                        }
+                        
                         let builder = serenity::builder::CreateMessage::new()
-                            .content(push.content);
+                            .content(content_to_send);
                         match channel_id.send_message(&http, builder).await {
                             Ok(_) => info!("[V4] Discord push sent to channel {}", channel_id),
                             Err(e) => warn!("[V4] Discord push failed: {}", e),
@@ -492,6 +518,7 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                     dispatcher_tx.clone(),
                     dispatcher_tx.channel(),
                     Some(tools_subagent),
+                    config.workspace.clone(),
                 ));
                 // Shadow dispatcher_tx for each connection so it can be moved into the async block
                 let dispatcher_tx = dispatcher_tx.clone();
@@ -613,23 +640,32 @@ async fn handle_connection(
         None
     };
 
-    // [V4 Fix] Spawn IPC push forwarder: listens to broadcast and sends to conn
-    let writer = conn.clone_writer();
+    // [V6 Fix] Channel to inject background completion events into the main session loop
+    let (inject_tx, mut inject_rx) = tokio::sync::mpsc::channel::<Event>(32);
+
     if let Some(mut rx) = ipc_push_rx {
+        let writer = conn.clone_writer();
         tokio::spawn(async move {
             info!("[IPC Push] Forwarder started, waiting for ProjectCompleted events");
             loop {
                 match rx.recv().await {
                     Ok(event) => {
                         info!("[IPC Push] Forwarding event to TUI: {:?}", event);
-                        let mut data = serde_json::to_string(&event).unwrap();
-                        data.push('\n');
-                        let mut w = writer.lock().await;
-                        if w.write_all(data.as_bytes()).await.is_err() {
-                            warn!("[IPC Push] Write failed, connection closed");
-                            break; // Connection closed
+                        
+                        // 1. Notify main loop to inject into Session and Auto-Trigger AI
+                        let _ = inject_tx.send(event.clone()).await;
+
+                        // 2. Send to TUI via socket (Skip ProjectCompleted so the TUI doesn't render the raw System block)
+                        if !matches!(event, Event::ProjectCompleted { .. }) {
+                            let mut data = serde_json::to_string(&event).unwrap();
+                            data.push('\n');
+                            let mut w = writer.lock().await;
+                            if w.write_all(data.as_bytes()).await.is_err() {
+                                warn!("[IPC Push] Write failed, connection closed");
+                                break; // Connection closed
+                            }
+                            w.flush().await.ok();
                         }
-                        w.flush().await.ok();
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("[IPC Push] Broadcast channel closed, forwarder stopping");
@@ -659,8 +695,27 @@ async fn handle_connection(
         }
     }
 
-    while let Some(req) = conn.recv_request().await? {
-        match req {
+    loop {
+        let mut req_to_process = None;
+        tokio::select! {
+            req_res = conn.recv_request() => {
+                match req_res {
+                    Ok(Some(req)) => req_to_process = Some(req),
+                    Ok(None) | Err(_) => break, // Connection closed
+                }
+            }
+            Some(ipc_event) = inject_rx.recv() => {
+                if let Event::ProjectCompleted { report, project_id } = ipc_event {
+                    let msg_content = format!("<system_notification>\n后台任务 {} 执行完毕。以下是执行结果报告：\n\n{}\n\n请立刻以你的名义，用自然语言向我简述/汇报上述结果（如果报告已经排版得很好，可以直接原样输出，但要以你的口吻开头）。\n</system_notification>", project_id, report);
+                    req_to_process = Some(Request::UserMessage { content: msg_content });
+                    info!("Auto-triggering AI to report background task {}", project_id);
+                } else {
+                    continue;
+                }
+            }
+        }
+
+        match req_to_process.unwrap() {
             Request::UserMessage { content } => {
                 info!("Received UserMessage ({} chars)", content.len());
                 tracing::debug!("UserMessage content: {}", content);

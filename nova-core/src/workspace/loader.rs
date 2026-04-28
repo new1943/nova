@@ -80,6 +80,10 @@ impl BootstrapLoader {
         let mut parts: Vec<String> = Vec::new();
         let mut total_chars: usize = 0;
 
+        // 第零层：当前系统时间和环境信息
+        let current_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string();
+        parts.push(format!("# Current System Environment\n- Local Time: {}", current_time));
+
         // 第一层：SOUL.md, IDENTITY.md
         for &name in &["SOUL.md", "IDENTITY.md"] {
             let content = self.load_with_cache(name);
@@ -103,15 +107,21 @@ impl BootstrapLoader {
             parts.push(tool_descriptions.to_string());
         }
 
-        // 第四层：USER.md, HEARTBEAT.md, MEMORY.md
-        for &name in &["USER.md", "HEARTBEAT.md"] {
+        // 第四层：USER.md, HEARTBEAT.md, tasks.md, MEMORY.md
+        for &name in &["USER.md", "HEARTBEAT.md", "tasks.md"] {
             let content = self.load_with_cache(name);
             if !content.is_empty() {
                 let budget = MAX_PER_FILE_CHARS.min(MAX_TOTAL_CHARS.saturating_sub(total_chars));
                 if budget >= MIN_FILE_BUDGET {
                     let truncated = truncate_bootstrap(&content, budget);
                     total_chars += truncated.chars().count();
-                    parts.push(truncated);
+                    
+                    // 为 tasks.md 增加包裹标签以防混淆
+                    if name == "tasks.md" {
+                        parts.push(format!("<current_tasks>\n{}\n</current_tasks>", truncated));
+                    } else {
+                        parts.push(truncated);
+                    }
                 }
             }
         }
