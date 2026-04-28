@@ -224,7 +224,7 @@ let _ = http.create_global_application_commands(&commands).await;
 
 - [Discord Application Commands Documentation](https://discord.com/developers/docs/interactions/application-commands)
 - [Serenity Command Framework](https://docs.rs/serenity/latest/serenity/builder/struct.CreateApplicationCommand.html)
-- OpenClaw 实现：`/Users/zhenglingbing/Documents/openclaw/projects/openclaw/extensions/discord/src/monitor/native-command.ts`
+- OpenClaw 实现：`/Users/username/Documents/openclaw/projects/openclaw/extensions/discord/src/monitor/native-command.ts`
 
 ## 状态
 

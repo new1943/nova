@@ -19,6 +19,6 @@ rebel.xml
 **/.DS_Store
 
 
-.vscode
-.kiro
-.claude
+.vscode/
+.kiro/
+.claude/
