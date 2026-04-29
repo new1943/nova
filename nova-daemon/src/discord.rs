@@ -442,19 +442,22 @@ async fn process_discord_message(
                 text_buffer.push_str(&t);
                 if last_update.elapsed().as_secs() >= 2 && !text_buffer.is_empty() {
                     let display = filter_nova_os(&text_buffer);
-                    let builder = EditMessage::new().content(format!("{}...", display));
+                    let trunc_text: String = display.chars().take(1900).collect();
+                    let builder = EditMessage::new().content(format!("{}...", trunc_text));
                     let _ = reply_msg.edit(&ctx.http, builder).await;
                     last_update = tokio::time::Instant::now();
                 }
             }
             LoopEvent::ToolCallStart { name, .. } => {
                 let display = filter_nova_os(&text_buffer);
-                let builder = EditMessage::new().content(format!("{}...\n\n🛠️ Running tool: `{}`", display, name));
+                let trunc_text: String = display.chars().take(1850).collect();
+                let builder = EditMessage::new().content(format!("{}...\n\n🛠️ Running tool: `{}`", trunc_text, name));
                 let _ = reply_msg.edit(&ctx.http, builder).await;
             }
             LoopEvent::Error(e) => {
                 let display = filter_nova_os(&text_buffer);
-                let builder = EditMessage::new().content(format!("{}...\n\n❌ Error: {}", display, e));
+                let trunc_text: String = display.chars().take(1850).collect();
+                let builder = EditMessage::new().content(format!("{}...\n\n❌ Error: {}", trunc_text, e));
                 let _ = reply_msg.edit(&ctx.http, builder).await;
             }
             _ => {}
@@ -504,13 +507,25 @@ async fn process_discord_message(
     }
 
     let display = filter_nova_os(&text_buffer);
-    if display.chars().count() > 1950 {
-        let trunc_text = display.chars().take(1950).collect::<String>() + "\n...(truncated)";
-        let builder = EditMessage::new().content(trunc_text);
+    let chars: Vec<char> = display.chars().collect();
+    
+    if chars.is_empty() {
+        let builder = EditMessage::new().content("Done.");
         let _ = reply_msg.edit(&ctx.http, builder).await;
     } else {
-        let builder = EditMessage::new().content(&display);
-        let _ = reply_msg.edit(&ctx.http, builder).await;
+        let mut chunks = chars.chunks(1950);
+        
+        if let Some(first_chunk) = chunks.next() {
+            let chunk_str: String = first_chunk.iter().collect();
+            let builder = EditMessage::new().content(chunk_str);
+            let _ = reply_msg.edit(&ctx.http, builder).await;
+        }
+        
+        for chunk in chunks {
+            let chunk_str: String = chunk.iter().collect();
+            let builder = CreateMessage::new().content(chunk_str);
+            let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+        }
     }
 
     Ok(())

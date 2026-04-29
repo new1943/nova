@@ -439,26 +439,17 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
 
                     if let Some(channel_id_val) = resolved_channel_id {
                         let channel_id = serenity::model::id::ChannelId::new(channel_id_val);
-                        let mut content_to_send = push.content;
-                        if content_to_send.len() > 1950 {
-                            let mut byte_index = 0;
-                            for (char_count, (i, _)) in content_to_send.char_indices().enumerate() {
-                                if char_count == 1950 {
-                                    byte_index = i;
+                        let chars: Vec<char> = push.content.chars().collect();
+                        for chunk in chars.chunks(1950) {
+                            let chunk_str: String = chunk.iter().collect();
+                            let builder = serenity::builder::CreateMessage::new().content(chunk_str);
+                            match channel_id.send_message(&http, builder).await {
+                                Ok(_) => info!("[V4] Discord push chunk sent to channel {}", channel_id),
+                                Err(e) => {
+                                    warn!("[V4] Discord push chunk failed: {}", e);
                                     break;
                                 }
                             }
-                            if byte_index > 0 {
-                                content_to_send.truncate(byte_index);
-                                content_to_send.push_str("\n... [Truncated]");
-                            }
-                        }
-                        
-                        let builder = serenity::builder::CreateMessage::new()
-                            .content(content_to_send);
-                        match channel_id.send_message(&http, builder).await {
-                            Ok(_) => info!("[V4] Discord push sent to channel {}", channel_id),
-                            Err(e) => warn!("[V4] Discord push failed: {}", e),
                         }
                     } else {
                         warn!("[V4] Invalid Discord channel ID: {} (tried 'coordinator' mapping)", push.channel_id);
@@ -1092,7 +1083,7 @@ fn preprocess_session(messages: &[nova_core::message::Message]) -> String {
             nova_core::message::Role::User => {
                 if let Some(c) = &m.content {
                     let c = c.trim();
-                    if !c.is_empty() {
+                    if !c.is_empty() && !c.contains("<system_notification>") {
                         lines.push(format!("User: {}", c));
                     }
                 }

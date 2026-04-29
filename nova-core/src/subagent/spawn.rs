@@ -158,15 +158,13 @@ impl SubagentSpawner {
         Ok(result)
     }
 
-    /// [V4 Task 4.3] Full tool execution loop for Full phases with ToolRegistry.
-    /// Streams API responses, executes tool calls, and continues until no more tool calls.
     async fn run_with_tools_loop(config: SubagentConfig, task: String) -> Result<String> {
         use nova_api::types::ToolSchema;
+        use nova_api::stream::StreamEvent;
 
         let name = config.name.clone();
         info!("[SubAgent:{}] Tool loop started, task: {} chars", name, task.len());
 
-        let api = ApiClient::new(config.api_key.clone(), config.api_base_url.clone());
         let tools = config.tools.as_ref().unwrap();
         let tool_timeout = Duration::from_secs(60);
 
@@ -198,33 +196,109 @@ impl SubagentSpawner {
                 system: prompt.clone(),
                 messages: messages.clone(),
                 tools: tool_schemas.clone(),
-                stream: false,
+                stream: true, // [V6 Fix] Use stream to avoid proxy bugs in complete() endpoint
             };
 
-            let resp = api.complete(&req).await?;
+            let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(64);
+            let api_key = config.api_key.clone();
+            let api_base_url = config.api_base_url.clone();
+            let stream_handle = tokio::spawn(async move {
+                let api = ApiClient::new(api_key, api_base_url);
+                api.stream(&req, stream_tx).await
+            });
 
-            // Collect text content and check for tool calls
-            let mut has_tool_calls = false;
-            let mut tool_call_names = Vec::new();
+            // Collect streamed response
+            let mut current_text = String::new();
+            let mut tool_calls: Vec<nova_api::stream::AccumulatedToolCall> = Vec::new();
+            let mut current_tool: Option<nova_api::stream::AccumulatedToolCall> = None;
             let mut assistant_content_blocks = Vec::new();
 
-            for block in &resp.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        final_text.push_str(text);
-                        assistant_content_blocks.push(block.clone());
+            while let Some(event) = stream_rx.recv().await {
+                match event {
+                    StreamEvent::TextDelta(text) => {
+                        current_text.push_str(&text);
+                        final_text.push_str(&text);
                     }
-                    ContentBlock::ToolUse { name: tool_name, .. } => {
-                        has_tool_calls = true;
-                        tool_call_names.push(tool_name.clone());
-                        assistant_content_blocks.push(block.clone());
+                    StreamEvent::ToolUseStart { id, name } => {
+                        current_tool = Some(nova_api::stream::AccumulatedToolCall {
+                            id,
+                            name,
+                            input_json: String::new(),
+                        });
                     }
-                    ContentBlock::Thinking { .. } => {
-                        // Preserve thinking blocks
-                        assistant_content_blocks.push(block.clone());
+                    StreamEvent::ToolInputDelta(json) => {
+                        if let Some(ref mut tool) = current_tool {
+                            tool.input_json.push_str(&json);
+                        }
+                    }
+                    StreamEvent::ToolUseEnd { .. } => {
+                        if let Some(tool) = current_tool.take() {
+                            tool_calls.push(tool);
+                        }
+                    }
+                    StreamEvent::Error(e) => {
+                        error!("[SubAgent:{}] Stream error: {}", name, e);
                     }
                     _ => {}
                 }
+            }
+
+            if let Err(e) = stream_handle.await {
+                error!("[SubAgent:{}] Stream task panicked: {}", name, e);
+            }
+
+            // Fallback: Parse `<tool_call>` XML from text if proxy failed to convert it to tool_use
+            if tool_calls.is_empty() && current_text.contains("<tool_call>") {
+                let mut temp_text = current_text.as_str();
+                while let Some(start) = temp_text.find("<tool_call>") {
+                    temp_text = &temp_text[start + "<tool_call>".len()..];
+                    if let Some(end) = temp_text.find("</tool_call>") {
+                        let inner = &temp_text[..end];
+                        temp_text = &temp_text[end + "</tool_call>".len()..];
+                        
+                        if let Some(f_start) = inner.find("<function=") {
+                            let f_rest = &inner[f_start + "<function=".len()..];
+                            if let Some(f_end) = f_rest.find(">") {
+                                let func_name = f_rest[..f_end].trim().to_string();
+                                let mut args = serde_json::Map::new();
+                                
+                                let mut p_rest = &f_rest[f_end + 1..];
+                                while let Some(p_start) = p_rest.find("<parameter=") {
+                                    p_rest = &p_rest[p_start + "<parameter=".len()..];
+                                    if let Some(p_end) = p_rest.find(">") {
+                                        let p_name = p_rest[..p_end].trim().to_string();
+                                        let v_rest = &p_rest[p_end + 1..];
+                                        if let Some(v_end) = v_rest.find("</parameter>") {
+                                            let p_val = v_rest[..v_end].trim().to_string();
+                                            args.insert(p_name, serde_json::Value::String(p_val));
+                                            p_rest = &v_rest[v_end + "</parameter>".len()..];
+                                        } else { break; }
+                                    } else { break; }
+                                }
+                                
+                                tool_calls.push(nova_api::stream::AccumulatedToolCall {
+                                    id: format!("call_{}", uuid::Uuid::new_v4().to_string().replace("-", "")),
+                                    name: func_name,
+                                    input_json: serde_json::Value::Object(args).to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !current_text.is_empty() {
+                assistant_content_blocks.push(ContentBlock::Text { text: current_text });
+            }
+
+            let mut tool_call_names = Vec::new();
+            for tc in &tool_calls {
+                tool_call_names.push(tc.name.clone());
+                assistant_content_blocks.push(ContentBlock::ToolUse {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    input: tc.parse_input().unwrap_or_else(|_| serde_json::json!({})),
+                });
             }
 
             if !tool_call_names.is_empty() {
@@ -239,40 +313,37 @@ impl SubagentSpawner {
                 });
             }
 
-            if !has_tool_calls {
+            if tool_calls.is_empty() {
                 // No tool calls - we're done
                 info!("[SubAgent:{}] Loop {} — no tool calls, finishing", name, loop_count);
                 break;
             }
 
-            // [V4 Task 4.3] Execute tool calls and add results
-            for block in &resp.content {
-                if let ContentBlock::ToolUse { id, name: tool_name, input } = block {
-                    // Execute the tool
-                    let input_val: Value = input.clone();
-                    let input_preview: String = input_val.to_string().chars().take(200).collect();
-                    debug!("[SubAgent:{}] Executing tool '{}': {}", name, tool_name, input_preview);
+            // Execute tool calls and add results
+            for tc in tool_calls {
+                let input_val = tc.parse_input().unwrap_or_else(|_| serde_json::json!({}));
+                let input_preview: String = input_val.to_string().chars().take(200).collect();
+                debug!("[SubAgent:{}] Executing tool '{}': {}", name, tc.name, input_preview);
 
-                    let tool_result = match tools.execute(tool_name, input_val, tool_timeout).await {
-                        Ok(r) => {
-                            info!("[SubAgent:{}] Tool '{}' succeeded ({} chars)",
-                                name, tool_name, r.len());
-                            r
-                        }
-                        Err(e) => {
-                            error!("[SubAgent:{}] Tool '{}' failed: {}", name, tool_name, e);
-                            format!(r#"{{"error": "{}"}}"#, e)
-                        }
-                    };
+                let tool_result = match tools.execute(&tc.name, input_val, tool_timeout).await {
+                    Ok(r) => {
+                        info!("[SubAgent:{}] Tool '{}' succeeded ({} chars)",
+                            name, tc.name, r.len());
+                        r
+                    }
+                    Err(e) => {
+                        error!("[SubAgent:{}] Tool '{}' failed: {}", name, tc.name, e);
+                        format!(r#"{{"error": "{}"}}"#, e)
+                    }
+                };
 
-                    // Add tool result to messages
-                    messages.push(ApiMessage::User {
-                        content: Content::Blocks(vec![ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: tool_result,
-                        }]),
-                    });
-                }
+                // Add tool result to messages
+                messages.push(ApiMessage::User {
+                    content: Content::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: tc.id,
+                        content: tool_result,
+                    }]),
+                });
             }
         }
 
