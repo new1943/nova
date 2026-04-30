@@ -556,7 +556,8 @@ impl QueryLoop {
             // [V6] 委派工具执行后立即结束循环，不再发第二轮 API 请求
             // LLM 的第一轮文字回复已经告知用户，无需再来一轮
             let delegated = tool_calls.iter().any(|tc| {
-                tc.name == "delegate_task" || tc.name == "delegate_complex_project"
+                let is_allowed = tool_schemas.iter().any(|s| s.name == tc.name);
+                is_allowed && (tc.name == "delegate_task" || tc.name == "delegate_complex_project")
             });
             if delegated {
                 // 如果 LLM 没有生成任何文字（直接调了工具），补一条默认通知
