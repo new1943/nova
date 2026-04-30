@@ -10,7 +10,7 @@ use nova_core::agent::{QueryLoop, QueryLoopConfig, LoopEvent};
 use nova_core::agent::preflight::PreFlightChecker;
 use nova_core::config::NovaConfig;
 use nova_core::models::ShadowEvent;
-use nova_core::hooks::HookManager;
+
 use nova_core::memory::consolidate::MemoryConsolidator;
 use nova_core::memory::daily::DailyNotes;
 use nova_core::memory::dream::DreamEngine;
@@ -18,11 +18,10 @@ use nova_core::memory::recall::MemoryRecall;
 use nova_core::session::manager::SessionManager;
 use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::{SideQuery, MemoryKeeper};
-use nova_core::skills::{create_shared_loader, SharedSkillsLoader, SkillManageTool, SkillsListTool, SkillViewTool};
+use nova_core::skills::{create_shared_loader, SharedSkillsLoader};
 use nova_core::heartbeat::{HeartbeatScheduler, scheduler::HeartbeatEvent};
 use nova_core::coordinator::Coordinator;
-use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgenticSearchTool, WorktreeTool, AgentTool, TeamTool, create_shared_tracker};
-use nova_core::tools::bash::{BashTool, BashMode};
+use nova_core::tools::{ToolRegistry, create_shared_tracker};
 use nova_core::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
 
@@ -32,6 +31,8 @@ const PID_FILE: &str = "/tmp/nova.pid";
 mod discord;
 mod dispatcher;
 mod task_manager;
+mod tool_factory;
+mod session_diary;
 
 /// [V4 Task 6.2] Discord proactive push message
 #[derive(Clone)]
@@ -140,146 +141,7 @@ fn check_pid_file() -> bool {
     } else { false }
 }
 
-/// [V4 Fix] Create a ToolRegistry for Coordinator's SubAgents.
-/// Contains ONLY subagent-appropriate tools: bash, read_file, write_file, file_edit, glob, grep, browser.
-/// Does NOT include delegate_complex_project (avoids circular dependency).
-///
-/// [V5] SubAgent BrowserTool 使用独立 Chrome Profile，避免与主 Agent 的 CDP session 冲突
-fn make_subagent_tools(
-    browser_chrome_path: Option<String>,
-    _browser_profile_dir: Option<String>, // 忽略，主 Agent 的 profile 不适用于 SubAgent
-    browser_headless: bool,
-    file_tracker: nova_core::tools::SharedFileReadTracker,
-) -> ToolRegistry {
-    let mut tools = ToolRegistry::new();
-    tools.register_builtin(Box::new(BashTool::new(BashMode::Open)));
-    tools.register_builtin(Box::new(ReadFileTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(WriteFileTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(FileEditTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(GlobTool));
-    tools.register_builtin(Box::new(GrepTool));
-    // [V5] SubAgent 使用独立 Chrome Profile
-    let subagent_profile = format!(
-        "{}/.nova/chrome-subagent-{}",
-        dirs::home_dir().unwrap().display(),
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
-    tools.register_builtin(Box::new(BrowserTool::new(
-        browser_chrome_path,
-        Some(subagent_profile),
-        browser_headless,
-    )));
-    tools
-}
 
-fn make_tools(
-    mode: &str,
-    browser_chrome_path: Option<String>,
-    browser_profile_dir: Option<String>,
-    browser_headless: bool,
-    side_query: SideQuery,
-    session_manager: SessionManager,
-    file_tracker: nova_core::tools::SharedFileReadTracker,
-    repo_root: Option<PathBuf>,
-    teams_dir: Option<PathBuf>,
-    api_key: String,
-    api_base_url: String,
-    model: String,
-    skills_dir: PathBuf,
-    skills: SharedSkillsLoader,
-    dispatcher_tx: Arc<dispatcher::DispatcherSender>,
-    shadow_tx: tokio::sync::mpsc::Sender<nova_core::models::ShadowEvent>,
-    subagent_tools: Option<Arc<ToolRegistry>>,
-    workspace_dir: PathBuf,
-) -> ToolRegistry {
-    let bash_mode = match mode {
-        "sandbox" => BashMode::Sandbox,
-        _ => BashMode::Open,
-    };
-    let mut tools = ToolRegistry::new();
-    tools.register_builtin(Box::new(BashTool::new(bash_mode)));
-    tools.register_builtin(Box::new(ReadFileTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(WriteFileTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(FileEditTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(GlobTool));
-    tools.register_builtin(Box::new(GrepTool));
-
-    // Browser tool — 通过 @playwright/mcp 子进程驱动
-    tools.register_builtin(Box::new(BrowserTool::new(
-        browser_chrome_path,
-        browser_profile_dir,
-        browser_headless,
-    )));
-
-    tools.register_builtin(Box::new(AgenticSearchTool::new(side_query, session_manager)));
-
-    // Agent tool — spawn subagents for parallel/background tasks
-    // [V4 Fix] Pass shadow_tx so SubAgents can emit TaskProgress events
-    tools.register_builtin(Box::new(AgentTool::new(api_key.clone(), api_base_url.clone(), model.clone()).with_shadow_tx(shadow_tx.clone())));
-
-    // Worktree tool — git worktree isolation per session
-    if let Some(root) = repo_root {
-        tools.register_builtin(Box::new(WorktreeTool::new(root)));
-    }
-
-    // Team tool — team/member/task management
-    if let Some(dir) = teams_dir {
-        tools.register_builtin(Box::new(TeamTool::new(dir)));
-    }
-
-    // Skill tools — skill management (create/edit/patch/delete/list/view)
-    tools.register_builtin(Box::new(SkillManageTool::new(skills_dir.clone(), skills.clone())));
-    tools.register_builtin(Box::new(SkillsListTool::new(skills.clone())));
-    tools.register_builtin(Box::new(SkillViewTool::new(skills_dir, skills)));
-
-    // [V4 Phase 4.2] delegate_complex_project — for complex project delegation
-    // [V4 Fix] Pass shadow_tx so Coordinator's SubAgents emit TaskProgress events
-    // Also inject subagent_tools so Coordinator's SubAgents can execute tools
-    // [V2 Task System] Pass workspace_dir for tasks.md
-    let delegate_tool = nova_core::tools::DelegateComplexProjectTool::new(
-        dispatcher_tx.clone(),
-        shadow_tx.clone(),
-        api_key.clone(),
-        api_base_url.clone(),
-        model.clone(),
-    ).with_workspace_dir(workspace_dir.clone());
-    let delegate_tool = if let Some(ref st) = subagent_tools {
-        delegate_tool.with_tools(st.clone())
-    } else {
-        delegate_tool
-    };
-    tools.register_builtin(Box::new(delegate_tool));
-    tools.register_builtin(Box::new(nova_core::tools::CancelDelegatedProjectTool::new()));
-
-    // [FIXBUG-002] delegate_task — for Medium complexity single-task delegation
-    // [V2 Task System] Pass workspace_dir for tasks.md
-    let delegate_task_tool = nova_core::tools::DelegateTaskTool::new(
-        dispatcher_tx.clone(),
-        shadow_tx.clone(),
-        api_key.clone(),
-        api_base_url.clone(),
-        model.clone(),
-    ).with_workspace_dir(workspace_dir.clone());
-    let delegate_task_tool = if let Some(st) = subagent_tools {
-        delegate_task_tool.with_tools(st)
-    } else {
-        delegate_task_tool
-    };
-    tools.register_builtin(Box::new(delegate_task_tool));
-
-    tools
-}
-
-
-pub fn make_hooks() -> HookManager {
-    // T21.1: Old DualWriteMemory hooks disabled — replaced by T21 layered memory system
-    HookManager::new()
-}
-
-/// Generate tool descriptions string (used by BootstrapLoader)
-pub fn tool_descriptions(tools: &ToolRegistry) -> String {
-    tools.describe_all()
-}
 
 async fn run_daemon(config: NovaConfig) -> Result<()> {
     if check_pid_file() {
@@ -382,14 +244,14 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
             let mut discord_push_rx = discord_push_rx.unwrap(); // Safe: we checked config.discord_enabled
 
             // [V4 Fix] Create subagent tools for Coordinator's SubAgents
-            let tools_subagent = Arc::new(make_subagent_tools(
+            let tools_subagent = Arc::new(tool_factory::make_subagent_tools(
                 config.browser_chrome_path.clone(),
                 config.browser_profile_dir.clone(),
                 config.browser_headless.unwrap_or(true),
                 file_tracker.clone(),
             ));
 
-            let tools_dc = Arc::new(make_tools(
+            let tools_dc = Arc::new(tool_factory::make_tools(
                 &run_mode,
                 config.browser_chrome_path.clone(),
                 config.browser_profile_dir.clone(),
@@ -484,14 +346,14 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 let sm_for_tools = SessionManager::new(sd.clone());
 
                 // [V4 Fix] Create subagent tools for Coordinator's SubAgents
-                let tools_subagent = Arc::new(make_subagent_tools(
+                let tools_subagent = Arc::new(tool_factory::make_subagent_tools(
                     config.browser_chrome_path.clone(),
                     config.browser_profile_dir.clone(),
                     config.browser_headless.unwrap_or(true),
                     file_tracker.clone(),
                 ));
 
-                let tools = Arc::new(make_tools(
+                let tools = Arc::new(tool_factory::make_tools(
                     &run_mode,
                     config.browser_chrome_path.clone(),
                     config.browser_profile_dir.clone(),
@@ -555,7 +417,7 @@ async fn handle_connection(
 
     // BootstrapLoader: hot-reloads workspace files with mtime caching
     let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir.clone())));
-    let tool_desc = tool_descriptions(&tools);
+    let tool_desc = tool_factory::tool_descriptions(&tools);
 
     // DailyNotes: Layer 2 episodic memory (T21.1)
     let daily_notes = DailyNotes::new(memories_dir.clone());
@@ -600,9 +462,6 @@ async fn handle_connection(
     // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
     let tension_tracker = std::sync::Arc::new(nova_core::memory::TensionTracker::new());
     let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::TopicTracker::new()));
-    let mode_router = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::ModeRouter::new(
-        tension_tracker.clone(),
-    )));
     let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::MemoryBoard::new(
         workspace_dir.join("MEMORY.md"),
     )));
@@ -774,22 +633,11 @@ async fn handle_connection(
                 session_mgr.append_message(&mut session, msg)?;
 
                 // T21.4: Record MEMORY.md mtime at turn start (for Dream dual-write mutex)
-                record_memory_mtime(&mut session, &workspace_dir);
+                session_diary::record_memory_mtime(&mut session, &workspace_dir);
 
                 // Hot-reload system prompt from workspace files (mtime cached)
                 let mut sp = bootstrap.lock().await.build_system_prompt(&tool_desc);
 
-                // [V4 DEPRECATED] v2 Phase 2: Inject <nova_os> thinking pipe hints into system prompt
-                // <nova_os> is deprecated - state machine interception now handles this in Rust side
-                // let nova_os = build_nova_os_section(
-                //     mode_router.clone(),
-                //     tension_tracker.clone(),
-                //     topic_tracker.clone(),
-                // ).await;
-                // if !nova_os.is_empty() {
-                //     sp.push_str("\n\n---\n\n");
-                //     sp.push_str(&nova_os);
-                // }
 
                 // Auto-search: inject relevant history session context
                 if content.chars().count() > 5 {
@@ -855,11 +703,10 @@ async fn handle_connection(
                 let cons = consolidator.clone();
                 let tt = topic_tracker.clone();
                 let tens = tension_tracker.clone();
-                let mr = mode_router.clone();
                 let mb = memory_board.clone();
 
                 let loop_handle = tokio::spawn(async move {
-                    let hooks = make_hooks();
+                    let hooks = tool_factory::make_hooks();
                     let cons_inner = Arc::try_unwrap(cons)
                         .unwrap_or_else(|arc| (*arc).clone());
                     let ql = QueryLoop::new(
@@ -957,7 +804,7 @@ async fn handle_connection(
                     let dn = daily_notes.clone();
                     let sq = side_query.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = write_session_diary(&dn, &sq, &summary_session).await {
+                        if let Err(e) = session_diary::write_session_diary(&dn, &sq, &summary_session).await {
                             warn!("Failed to write session diary: {}", e);
                         }
                     });
@@ -1034,7 +881,7 @@ async fn handle_connection(
                     let dn = daily_notes.clone();
                     let sq = side_query.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = write_session_diary(&dn, &sq, &summary_session).await {
+                        if let Err(e) = session_diary::write_session_diary(&dn, &sq, &summary_session).await {
                             warn!("Failed to write session diary on shutdown: {}", e);
                         }
                     });
@@ -1052,7 +899,7 @@ async fn handle_connection(
         let dn = daily_notes.clone();
         let sq = side_query.clone();
         tokio::spawn(async move {
-            if let Err(e) = write_session_diary(&dn, &sq, &summary_session).await {
+            if let Err(e) = session_diary::write_session_diary(&dn, &sq, &summary_session).await {
                 warn!("Failed to write session diary on disconnect: {}", e);
             }
         });
@@ -1062,173 +909,3 @@ async fn handle_connection(
     Ok(())
 }
 
-// T21.4: Record MEMORY.md mtime at the start of each turn.
-/// Used by Dream to detect if LLM modified MEMORY.md during this turn.
-pub fn record_memory_mtime(session: &mut nova_core::session::manager::Session, workspace_dir: &Path) {
-    let memory_path = workspace_dir.join("MEMORY.md");
-    if let Ok(meta) = std::fs::metadata(&memory_path) {
-        if let Ok(mtime) = meta.modified() {
-            session.token_stats.memory_mtime = Some(mtime);
-        }
-    }
-}
-
-const MAP_CHUNK_SIZE: usize = 180_000; // ~180K chars per Map batch
-
-/// Preprocess session: keep user original + assistant decisions, strip tool details.
-fn preprocess_session(messages: &[nova_core::message::Message]) -> String {
-    let mut lines = Vec::new();
-    for m in messages {
-        match m.role {
-            nova_core::message::Role::User => {
-                if let Some(c) = &m.content {
-                    let c = c.trim();
-                    if !c.is_empty() && !c.contains("<system_notification>") {
-                        lines.push(format!("User: {}", c));
-                    }
-                }
-            }
-            nova_core::message::Role::Assistant => {
-                // Keep content (decisions/reasoning), skip tool_calls
-                if let Some(c) = &m.content {
-                    let c = c.trim();
-                    if !c.is_empty() {
-                        lines.push(format!("Assistant: {}", c));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    lines.join("\n")
-}
-
-/// Map phase: extract key points from one chunk by dimension.
-async fn map_chunk(sq: &SideQuery, chunk: &str) -> anyhow::Result<String> {
-    let system = "You are a key-point extractor. Given a conversation chunk, \
-extract important information along these dimensions:
-- 事件 (events that happened)
-- 反馈 (user feedback / opinions)
-- 用户偏好 (user preferences)
-- 项目状态 (project status / decisions)
-- 重要决策 (key decisions made)
-- 参考资料 (references, links, configurations)
-
-Output a concise list of key points, one per line, in Chinese. \
-If a dimension has no information, skip it. Do not add explanatory text.";
-
-    sq.query_await(system, chunk).await
-}
-
-/// Reduce phase: combine all map results into ~200 char final summary.
-async fn reduce_summaries(sq: &SideQuery, map_results: &[String]) -> anyhow::Result<String> {
-    let combined = map_results.join("\n\n");
-    let system = "你是一名会话记录员。根据以下会话要点，写一段 100-200 字的中文总结，要有头有尾，连贯自然。
-
-重点记录：
-- 发生了什么（事件）
-- 用户说了什么、反馈如何
-- 项目进展或重要决策
-- 用户的偏好或习惯
-
-要求：
-- 用完整的句子叙述，不是罗列要点
-- 一口气说完，不要分段
-- 100-200 字为宜
-- 只输出中文总结，不加标签不加格式";
-
-    sq.query_await(system, &combined).await
-}
-
-pub async fn write_session_diary(
-    daily: &DailyNotes,
-    sq: &SideQuery,
-    session: &nova_core::session::manager::Session,
-) -> anyhow::Result<()> {
-    // Step 1: preprocess — keep user + assistant decisions, strip tool calls
-    let preprocessed = preprocess_session(&session.messages);
-    if preprocessed.len() < 10 {
-        return Ok(());
-    }
-
-    // Step 2: map phase — split into ~180K chunks
-    let mut map_results = Vec::new();
-    for chunk in preprocessed.chars().collect::<Vec<_>>().chunks(MAP_CHUNK_SIZE) {
-        let chunk_str: String = chunk.iter().collect();
-        match map_chunk(sq, &chunk_str).await {
-            Ok(result) if !result.trim().is_empty() => {
-                map_results.push(result);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Map chunk failed: {}", e);
-            }
-        }
-    }
-
-    if map_results.is_empty() {
-        return Ok(());
-    }
-
-    // Step 3: reduce phase — combine all map results into final ~200 char summary
-    let final_summary = reduce_summaries(sq, &map_results).await?;
-    if final_summary.trim().is_empty() {
-        return Ok(());
-    }
-
-    // Step 4: write to diary
-    daily.append_session(&final_summary)?;
-    info!("Session diary written: {} chars ({} map chunks)", final_summary.len(), map_results.len());
-    Ok(())
-}
-
-/// v2 Phase 2: Build <nova_os> thinking pipe section for system prompt injection.
-/// Reads current mode and tension from trackers and formats them as <nova_os> XML block.
-async fn build_nova_os_section(
-    mode_router: std::sync::Arc<tokio::sync::RwLock<nova_core::memory::ModeRouter>>,
-    tension_tracker: std::sync::Arc<nova_core::memory::TensionTracker>,
-    topic_tracker: std::sync::Arc<tokio::sync::RwLock<nova_core::memory::TopicTracker>>,
-) -> String {
-    use nova_core::memory::Mode;
-
-    let mode = mode_router.read().await.current_mode().await;
-    let tension = tension_tracker.current_tension().await;
-    let current_topic = topic_tracker.read().await.current_topic().await;
-
-    let topic_name = current_topic
-        .as_ref()
-        .map(|t| t.name.clone())
-        .unwrap_or_else(|| "（无进行中话题）".to_string());
-
-    let topic_status = current_topic
-        .as_ref()
-        .map(|t| match t.status {
-            nova_core::memory::TopicStatus::Started => "开始",
-            nova_core::memory::TopicStatus::Active => "活跃",
-            nova_core::memory::TopicStatus::Suspended => "挂起",
-            nova_core::memory::TopicStatus::Archived => "归档",
-        })
-        .unwrap_or("无");
-
-    let mode_str = match mode {
-        Mode::Normal => "Normal",
-        Mode::SoftIntimate => "SoftIntimate",
-        Mode::HighIntimate => "HighIntimate",
-        Mode::Cooling => "Cooling",
-    };
-
-    format!(r#"<nova_os>
-## 话题生命周期
-当前话题：{} [{}]
-
-## 用户状态
-张力值：{}/100
-模式：{}
-
-## 响应策略
-根据上述状态，决定：
-1. 回复长度（短句/中句/长句）
-2. 语气风格（简洁/温和/关怀）
-3. 是否需要触发主动机制
-</nova_os>"#, topic_name, topic_status, tension, mode_str)
-}

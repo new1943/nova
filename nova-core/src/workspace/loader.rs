@@ -33,19 +33,7 @@ struct CachedFile {
     mtime: SystemTime,
 }
 
-/// Loaded workspace files (legacy, kept for backward compat)
-#[derive(Debug, Default)]
-pub struct Workspace {
-    pub soul: String,
-    pub identity: String,
-    pub user: String,
-    pub agents: String,
-    pub memory: String,
-    pub state: String,
-    pub tools: String,
-    pub tasks: String,
-    pub heartbeat: String,
-}
+
 
 /// BootstrapLoader — hot-reloads workspace .md files with mtime caching.
 ///
@@ -212,32 +200,5 @@ fn truncate_bootstrap(content: &str, budget: usize) -> String {
     format!("{}\n\n... (truncated {} chars) ...\n\n{}", head, char_count - head_chars - tail_chars, tail)
 }
 
-// Legacy loader — kept for backward compatibility
-pub struct WorkspaceLoader {
-    root: PathBuf,
-}
 
-impl WorkspaceLoader {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
 
-    pub fn load(&self) -> Result<Workspace> {
-        Ok(Workspace {
-            soul: self.read_file("SOUL.md"),
-            identity: self.read_file("IDENTITY.md"),
-            user: self.read_file("USER.md"),
-            agents: self.read_file("AGENTS.md"),
-            memory: self.read_file("MEMORY.md"),
-            state: self.read_file("STATE.md"),
-            tools: self.read_file("TOOLS.md"),
-            tasks: self.read_file("TASKS.md"),
-            heartbeat: self.read_file("HEARTBEAT.md"),
-        })
-    }
-
-    fn read_file(&self, name: &str) -> String {
-        let path = self.root.join(name);
-        std::fs::read_to_string(&path).unwrap_or_default()
-    }
-}

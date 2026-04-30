@@ -13,18 +13,10 @@ pub enum CompactMode {
     Forceful,
 }
 
-/// Compact result — [V4 DEPRECATED]
-/// LLM summarization has been moved to MemoryKeeper.
-/// This struct is kept for API compatibility but all fields will be empty.
+/// Compact result — returned from compact operations.
+/// Memory extraction is handled by MemoryKeeper via ShadowEvent bus.
 #[derive(Debug, Clone, Default)]
-pub struct CompactResult {
-    /// [DEPRECATED] 已归档的话题列表 — now handled by MemoryKeeper
-    pub archived_topics: Vec<String>,
-    /// [DEPRECATED] 提取的用户偏好 — now handled by MemoryKeeper
-    pub extracted_preferences: Vec<String>,
-    /// [DEPRECATED] 当前活跃话题摘要 — now handled by MemoryKeeper
-    pub active_summary: String,
-}
+pub struct CompactResult;
 
 /// Compact engine — [V4 DEPRECATED LLM summarization]
 ///
@@ -210,27 +202,7 @@ impl Compactor {
         new_messages
     }
 
-    /// [DEPRECATED] Only kept for test compatibility
-    #[allow(dead_code)]
-    fn clean_json(raw: &str) -> String {
-        let trimmed = raw.trim();
 
-        // Remove ```json ... ``` wrapper
-        if let Ok(re) = regex::Regex::new(r"^```json\s*\n?([\s\S]*?)\n?```$") {
-            if let Some(caps) = re.captures(trimmed) {
-                return caps.get(1).unwrap().as_str().trim().to_string();
-            }
-        }
-
-        // Remove ``` ... ``` wrapper
-        if let Ok(re) = regex::Regex::new(r"^```\s*\n?([\s\S]*?)\n?```$") {
-            if let Some(caps) = re.captures(trimmed) {
-                return caps.get(1).unwrap().as_str().trim().to_string();
-            }
-        }
-
-        trimmed.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -251,31 +223,5 @@ mod tests {
         assert!(matches!(Compactor::decide_mode(1.0), CompactMode::Forceful));
     }
 
-    #[test]
-    fn test_clean_json_with_json_fence() {
-        let input = "```json\n{\"foo\": \"bar\"}\n```";
-        let result = Compactor::clean_json(input);
-        assert_eq!(result, "{\"foo\": \"bar\"}");
-    }
 
-    #[test]
-    fn test_clean_json_with_plain_fence() {
-        let input = "```\n{\"foo\": \"bar\"}\n```";
-        let result = Compactor::clean_json(input);
-        assert_eq!(result, "{\"foo\": \"bar\"}");
-    }
-
-    #[test]
-    fn test_clean_json_without_fence() {
-        let input = "{\"foo\": \"bar\"}";
-        let result = Compactor::clean_json(input);
-        assert_eq!(result, "{\"foo\": \"bar\"}");
-    }
-
-    #[test]
-    fn test_clean_json_with_extra_whitespace() {
-        let input = "  ```json\n  {\"foo\": \"bar\"}\n  ```  ";
-        let result = Compactor::clean_json(input);
-        assert_eq!(result, "{\"foo\": \"bar\"}");
-    }
 }

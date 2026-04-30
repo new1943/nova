@@ -20,7 +20,7 @@ use nova_core::session::search::AgenticSessionSearch;
 use nova_core::sidequery::SideQuery;
 use nova_core::workspace::BootstrapLoader;
 
-use crate::{HandleConfig, tool_descriptions, make_hooks, record_memory_mtime};
+use crate::HandleConfig;
 
 /// Filter `<nova_os>...</nova_os>` blocks from content before sending to Discord.
 /// This prevents internal reasoning tags from being exposed to users.
@@ -43,55 +43,6 @@ fn filter_nova_os(content: &str) -> String {
     result
 }
 
-/// v2 Phase 2: Build <nova_os> thinking pipe section for Discord system prompt.
-async fn discord_build_nova_os_section(
-    mode_router: Arc<tokio::sync::RwLock<nova_core::memory::ModeRouter>>,
-    tension_tracker: Arc<nova_core::memory::TensionTracker>,
-    topic_tracker: Arc<tokio::sync::RwLock<nova_core::memory::TopicTracker>>,
-) -> String {
-    use nova_core::memory::Mode;
-
-    let mode = mode_router.read().await.current_mode().await;
-    let tension = tension_tracker.current_tension().await;
-    let current_topic = topic_tracker.read().await.current_topic().await;
-
-    let topic_name = current_topic
-        .as_ref()
-        .map(|t| t.name.clone())
-        .unwrap_or_else(|| "（无进行中话题）".to_string());
-
-    let topic_status = current_topic
-        .as_ref()
-        .map(|t| match t.status {
-            nova_core::memory::TopicStatus::Started => "开始",
-            nova_core::memory::TopicStatus::Active => "活跃",
-            nova_core::memory::TopicStatus::Suspended => "挂起",
-            nova_core::memory::TopicStatus::Archived => "归档",
-        })
-        .unwrap_or("无");
-
-    let mode_str = match mode {
-        Mode::Normal => "Normal",
-        Mode::SoftIntimate => "SoftIntimate",
-        Mode::HighIntimate => "HighIntimate",
-        Mode::Cooling => "Cooling",
-    };
-
-    format!(r#"<nova_os>
-## 话题生命周期
-当前话题：{} [{}]
-
-## 用户状态
-张力值：{}/100
-模式：{}
-
-## 响应策略
-根据上述状态，决定：
-1. 回复长度（短句/中句/长句）
-2. 语气风格（简洁/温和/关怀）
-3. 是否需要触发主动机制
-</nova_os>"#, topic_name, topic_status, tension, mode_str)
-}
 
 struct DiscordHandler {
     cfg: Arc<HandleConfig>,
@@ -230,7 +181,7 @@ async fn process_discord_message(
 
     let session_mgr = SessionManager::new(sessions_dir.clone());
     let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir.clone())));
-    let tool_desc = tool_descriptions(&tools);
+    let tool_desc = crate::tool_factory::tool_descriptions(&tools);
 
     let daily_notes = DailyNotes::new(memories_dir.clone());
     let side_query = SideQuery::new(
@@ -268,9 +219,6 @@ async fn process_discord_message(
     // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
     let tension_tracker = std::sync::Arc::new(nova_core::memory::TensionTracker::new());
     let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::TopicTracker::new()));
-    let mode_router = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::ModeRouter::new(
-        tension_tracker.clone(),
-    )));
     let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::MemoryBoard::new(
         workspace_dir.join("MEMORY.md"),
     )));
@@ -324,7 +272,7 @@ async fn process_discord_message(
             let dn = daily_notes.clone();
             let sq = side_query.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::write_session_diary(&dn, &sq, &summary_session).await {
+                if let Err(e) = crate::session_diary::write_session_diary(&dn, &sq, &summary_session).await {
                     warn!("Failed to write session diary: {}", e);
                 }
             });
@@ -345,21 +293,10 @@ async fn process_discord_message(
     let user_msg = nova_core::message::Message::user(&content);
     session_mgr.append_message(&mut session, user_msg)?;
 
-    record_memory_mtime(&mut session, &workspace_dir);
+    crate::session_diary::record_memory_mtime(&mut session, &workspace_dir);
 
     let mut sp = bootstrap.lock().await.build_system_prompt(&tool_desc);
 
-    // [V4 DEPRECATED] v2 Phase 2: Inject <nova_os> thinking pipe hints
-    // <nova_os> is deprecated - state machine interception now handles this in Rust side
-    // let nova_os = discord_build_nova_os_section(
-    //     mode_router.clone(),
-    //     tension_tracker.clone(),
-    //     topic_tracker.clone(),
-    // ).await;
-    // if !nova_os.is_empty() {
-    //     sp.push_str("\n\n---\n\n");
-    //     sp.push_str(&nova_os);
-    // }
 
     // Context Search
     if content.chars().count() > 5 {
@@ -410,11 +347,10 @@ async fn process_discord_message(
     let cons = consolidator.clone();
     let tt = topic_tracker.clone();
     let tens = tension_tracker.clone();
-    let mr = mode_router.clone();
     let mb = memory_board.clone();
 
     let loop_handle = tokio::spawn(async move {
-        let hooks = make_hooks();
+        let hooks = crate::tool_factory::make_hooks();
         let cons_inner = Arc::try_unwrap(cons).unwrap_or_else(|arc| (*arc).clone());
         let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner), Some(tt), Some(tens), /* mr disabled */ Some(mb), Some(shadow_tx));
         let mut s = session_clone;
@@ -587,7 +523,7 @@ async fn handle_new_command(
         );
         let session_clone = session.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::write_session_diary(&daily_notes, &side_query, &session_clone).await {
+            if let Err(e) = crate::session_diary::write_session_diary(&daily_notes, &side_query, &session_clone).await {
                 warn!("Failed to write session diary: {}", e);
             }
         });

@@ -80,8 +80,6 @@ pub struct QueryLoop {
     // v2 Phase 1.5+ trackers
     pub topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::TopicTracker>>>,
     pub tension_tracker: Option<std::sync::Arc<crate::memory::TensionTracker>>,
-    // [V4] ModeRouter disabled — nova_os deprecated
-    // pub mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
     pub memory_board: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::MemoryBoard>>>,
     // [V4 Phase 4.1] Cached complexity from previous turn for tool filtering
     // Use tokio::sync::Mutex (Send-safe, async-aware)
@@ -100,14 +98,12 @@ impl QueryLoop {
         consolidator: Option<MemoryConsolidator>,
         topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::TopicTracker>>>,
         tension_tracker: Option<std::sync::Arc<crate::memory::TensionTracker>>,
-        // [V4] ModeRouter disabled
-        // mode_router: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::ModeRouter>>>,
         memory_board: Option<std::sync::Arc<tokio::sync::RwLock<crate::memory::MemoryBoard>>>,
         shadow_tx: Option<mpsc::Sender<ShadowEvent>>,
     ) -> Self {
         Self {
             config, tools, hooks, daily_notes, side_query, consolidator,
-            topic_tracker, tension_tracker, /* mode_router, */ memory_board,
+            topic_tracker, tension_tracker, memory_board,
             cached_complexity: tokio::sync::Mutex::new(None),
             shadow_tx,
         }
@@ -128,98 +124,42 @@ impl QueryLoop {
         let mut newly_added_messages = Vec::new();
         info!("--- Starting new query loop for user input ---");
 
-        // ── [V4 Phase 3.1] Pre-flight check — blocking wait, result used immediately ─
-        // Extract user input from the last message for pre-flight classification
+        // ── TurnPipeline: 所有策略通过共享 TurnContext 协作 ─────────────
         let preflight_user_input = session.messages.last()
             .and_then(|m| m.content.as_ref().cloned())
             .unwrap_or_default();
         let preflight_recent_msgs = session.messages.iter().rev().take(10).cloned().collect::<Vec<_>>();
 
-        // [V4 Fix] Block on preflight result (30s timeout), use it immediately for tool filtering
-        let preflight_result = if let Some(ref checker) = self.config.preflight_checker {
-            let result = tokio::time::timeout(
-                Duration::from_secs(30),
-                checker.check(&preflight_user_input, &preflight_recent_msgs),
-            ).await.unwrap_or_else(|_| crate::agent::preflight::PreFlightCheckResult::default());
-            info!("[V4] Preflight: complexity={:?}, topic_shift={}, reason={}", result.complexity, result.topic_shift, result.reason);
-            info!("[V4] Preflight thinking: {}", result.thinking);
-            Some(result)
-        } else {
-            None
-        };
+        let mut turn_ctx = crate::agent::pipeline::TurnContext::new(
+            preflight_user_input,
+            preflight_recent_msgs,
+        );
 
-        // ── v2 Phase 1.5: Topic/Tension/Mode tracking ──────────────────────────
-        // Process user message through trackers to detect topic switches, update tension, and mode
-        if let Some(last_msg) = session.messages.last() {
-            if let Some(ref content) = last_msg.content {
-                if last_msg.role == crate::message::Role::User {
-                    // TopicTracker: detect topic transitions from signal words
-                    if let Some(ref tt) = self.topic_tracker {
-                        let transition = tt.write().await.on_user_message(content).await;
-                        if matches!(transition, crate::memory::TopicTransition::Archive) {
-                            info!("Topic archived via user signal");
-                        } else if matches!(transition, crate::memory::TopicTransition::NewTopic) {
-                            info!("New topic started via user signal");
-                        }
-                    }
-                    // TensionTracker: update emotional state from message
-                    if let Some(ref tt) = self.tension_tracker {
-                        tt.update_from_message(content).await;
-                    }
-                    // [V4] ModeRouter disabled — nova_os deprecated
-                    // if let Some(ref mr) = self.mode_router {
-                    //     let mode = mr.write().await.process(content).await;
-                    //     info!("Mode: {:?}", mode);
-                    // }
-                }
-            }
+        // Build and run the pipeline
+        let pipeline = self.build_pipeline();
+        if let Err(e) = pipeline.run(&mut turn_ctx).await {
+            warn!("TurnPipeline error: {}, falling back to defaults", e);
         }
 
-        // [V6] Hard Gate: 根据 complexity 物理隔离工具，LLM 无法绕过
-        use crate::agent::preflight::Complexity;
-        let tool_schemas = match preflight_result.as_ref().map(|r| r.complexity) {
-            Some(Complexity::High) => {
-                info!("[V6] Hard gate: High → only delegate_complex_project + cancel");
-                self.tools.as_api_schemas_filtered(|name| {
-                    name == "delegate_complex_project" || name == "cancel_delegated_project"
-                })
-            }
-            Some(Complexity::Medium) => {
-                info!("[V6] Hard gate: Medium → only delegate_task + cancel");
-                self.tools.as_api_schemas_filtered(|name| {
-                    name == "delegate_task" || name == "cancel_delegated_project"
-                })
-            }
-            _ => {
-                // Low 或无 preflight 结果: 所有工具可见
-                self.tools.as_api_schemas()
-            }
-        };
+        // Read pipeline results
+        let preflight_result = turn_ctx.preflight_result.clone();
 
-        // [V5] 注入 <preflight> 标签到 system prompt
-        let preflight_injection = if let Some(ref result) = preflight_result {
-            format!(
-                "\n\n<preflight>\ncomplexity: {:?}\ntopic_shift: {}\nreason: {}\n</preflight>",
-                result.complexity, result.topic_shift, result.reason
-            )
+        // Generate tool schemas from GateStage result
+        let tool_schemas = if let Some(ref allowed) = turn_ctx.allowed_tools {
+            let allowed = allowed.clone();
+            self.tools.as_api_schemas_filtered(|name| allowed.contains(&name.to_string()))
         } else {
-            String::new()
+            self.tools.as_api_schemas()
         };
 
-        // [V2 Task System] 注入当前任务上下文
-        let tasks_context = if let Some(ref memories_dir) = self.config.memories_dir {
-            match crate::task::TaskLogger::read_context(memories_dir).await {
-                Ok(ctx) => ctx,
-                Err(_) => String::new(),
-            }
-        } else {
-            String::new()
-        };
+        // Build injection string from InjectStage result
+        let injection_string = turn_ctx.build_injection_string();
 
-        // Cache for next turn (fallback if preflight doesn't complete in time)
+        // Cache complexity for next turn fallback
         if let Some(ref result) = preflight_result {
             *self.cached_complexity.lock().await = Some(result.complexity);
         }
+
         let mut budget = TokenBudget::new(
             self.config.context_window,
             self.config.budget_trigger_pct,
@@ -267,8 +207,8 @@ impl QueryLoop {
             // Build request
             let api_messages = build_api_messages(&session.messages);
             info!("Sending API request to {} ({} messages, estimated {} tokens)", self.config.model, api_messages.len(), estimated_tokens);
-            // [V6] 注入 <preflight> 标签 + hard gate 工具过滤
-            let effective_system = format!("{}\n{}\n{}", system_prompt, preflight_injection, tasks_context);
+            // Build effective system prompt with pipeline injections
+            let effective_system = format!("{}{}", system_prompt, injection_string);
 
             let req = ApiRequest {
                 model: self.config.model.clone(),
@@ -553,11 +493,9 @@ impl QueryLoop {
                 session.add_message(tool_msg);
             }
 
-            // [V6] 委派工具执行后立即结束循环，不再发第二轮 API 请求
-            // LLM 的第一轮文字回复已经告知用户，无需再来一轮
-            let delegated = tool_calls.iter().any(|tc| {
-                let is_allowed = tool_schemas.iter().any(|s| s.name == tc.name);
-                is_allowed && (tc.name == "delegate_task" || tc.name == "delegate_complex_project")
+            // Pipeline ExecuteConfig: 委派工具执行后立即结束循环
+            let delegated = turn_ctx.should_terminate_after_tool && tool_calls.iter().any(|tc| {
+                tc.name == "delegate_task" || tc.name == "delegate_complex_project"
             });
             if delegated {
                 // 如果 LLM 没有生成任何文字（直接调了工具），补一条默认通知
@@ -565,7 +503,7 @@ impl QueryLoop {
                     let fallback = "好的，任务已派发给后台处理，完成后会自动通知您。";
                     let _ = event_tx.send(LoopEvent::TextDelta(fallback.to_string())).await;
                 }
-                info!("[V6] Delegation tool executed, ending query loop (no second round-trip)");
+                info!("Pipeline: delegation tool executed, ending query loop");
                 self.hooks.fire_stop(&mut session).await;
                 let _ = event_tx.send(LoopEvent::TurnEnd).await;
                 break;
@@ -575,6 +513,42 @@ impl QueryLoop {
         // [V4 Phase 3.1] Preflight result already captured at start of turn
         // [V4 Phase 4.1] Cached for next turn already done above
         Ok((session, newly_added_messages, preflight_result))
+    }
+
+    /// Build a TurnPipeline from QueryLoop's optional components.
+    /// Stages are added conditionally based on available trackers/checkers.
+    fn build_pipeline(&self) -> crate::agent::pipeline::TurnPipeline {
+        use crate::agent::stages::*;
+        let mut pipeline = crate::agent::pipeline::TurnPipeline::new();
+
+        // Stage 1: Classify (only if preflight checker is configured)
+        if let Some(ref checker) = self.config.preflight_checker {
+            pipeline.add_stage(Box::new(classify::ClassifyStage::new(
+                std::sync::Arc::new(checker.clone()),
+                30, // timeout seconds
+            )));
+        }
+
+        // Stage 2: Track (only if trackers are available)
+        if let (Some(ref tt), Some(ref tens)) = (&self.topic_tracker, &self.tension_tracker) {
+            pipeline.add_stage(Box::new(track::TrackStage::new(
+                tt.clone(),
+                tens.clone(),
+            )));
+        }
+
+        // Stage 3: Gate (always present — enforces tool isolation)
+        pipeline.add_stage(Box::new(gate::GateStage::new()));
+
+        // Stage 4: Inject (always present — manages prompt injections)
+        pipeline.add_stage(Box::new(inject::InjectStage::new(
+            self.config.memories_dir.clone(),
+        )));
+
+        // Stage 5: ExecuteConfig (always present — sets termination policy)
+        pipeline.add_stage(Box::new(execute_config::ExecuteConfigStage::new()));
+
+        pipeline
     }
 
     // T21.1: Write diary entry before compacting messages.
