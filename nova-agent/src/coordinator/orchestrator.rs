@@ -72,8 +72,8 @@ impl Coordinator {
             };
 
             let agent_type = match phase {
-                CoordinatorPhase::Research | CoordinatorPhase::Verification => SubagentType::ReadOnly,
-                CoordinatorPhase::Synthesis | CoordinatorPhase::Implementation => SubagentType::Full,
+                CoordinatorPhase::Research => SubagentType::ReadOnly,
+                _ => SubagentType::Full,
             };
 
             let config = SubagentConfig {

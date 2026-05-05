@@ -146,12 +146,10 @@ impl BrowserTool {
             nova_dir.join("browser-profile").to_string_lossy().to_string()
         });
 
-        // SubAgent 使用随机端口，避免与主 Agent 的 Chrome (9222) 冲突
-        let port = if profile_dir.contains("chrome-subagent") {
-            Self::find_available_port()
-        } else {
-            9222
-        };
+        // SubAgent 复用主 Agent 的 Chrome 实例（端口 9222），通过不同 Page/Tab 隔离
+        // 注意：随机端口方案（find_available_port）会启动新 Chrome 实例，
+        // 在 macOS 上导致 WebSocket 立即断开 → "receiver is gone"
+        let port = 9222;
 
         Self {
             chrome_path,
@@ -162,13 +160,6 @@ impl BrowserTool {
         }
     }
 
-    /// 为 SubAgent 动态分配可用端口
-    fn find_available_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map(|a| a.port())
-            .unwrap_or(9333)
-    }
 
     fn discover_chrome() -> Option<String> {
         let candidates = [
