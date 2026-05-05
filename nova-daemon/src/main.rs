@@ -1,45 +1,45 @@
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, broadcast, Mutex};
 use tracing::{info, error, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use nova_core::agent::{QueryLoop, QueryLoopConfig, LoopEvent};
-use nova_core::agent::preflight::PreFlightChecker;
+use nova_agent::{QueryLoop, QueryLoopConfig, LoopEvent};
+use nova_agent::preflight::PreFlightChecker;
 use nova_core::config::NovaConfig;
+use nova_core::llm_backend::LlmBackend;
 use nova_core::models::ShadowEvent;
 
-use nova_core::memory::consolidate::MemoryConsolidator;
-use nova_core::memory::daily::DailyNotes;
-use nova_core::memory::dream::DreamEngine;
-use nova_core::memory::recall::MemoryRecall;
-use nova_core::session::manager::SessionManager;
-use nova_core::session::search::AgenticSessionSearch;
-use nova_core::sidequery::{SideQuery, MemoryKeeper};
-use nova_core::skills::{create_shared_loader, SharedSkillsLoader};
-use nova_core::heartbeat::{HeartbeatScheduler, scheduler::HeartbeatEvent};
-use nova_core::coordinator::Coordinator;
-use nova_core::tools::{ToolRegistry, create_shared_tracker};
-use nova_core::workspace::BootstrapLoader;
+use nova_llm::client::ApiClient;
+use nova_memory::memory::consolidate::MemoryConsolidator;
+use nova_memory::memory::daily::DailyNotes;
+use nova_memory::memory::dream::DreamEngine;
+use nova_memory::memory::recall::MemoryRecall;
+use nova_memory::session::manager::SessionManager;
+use nova_memory::session::AgenticSessionSearch;
+use nova_memory::sidequery::{SideQuery, MemoryKeeper};
+use nova_tools::skills::{create_shared_loader, SharedSkillsLoader};
+use nova_agent::heartbeat::{HeartbeatScheduler};
+use nova_agent::heartbeat::scheduler::HeartbeatEvent;
+use nova_agent::Coordinator;
+use nova_tools::{ToolRegistry, ToolContext, create_shared_tracker};
+use nova_agent::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
 
 const SOCKET_PATH: &str = "/tmp/nova.sock";
 const PID_FILE: &str = "/tmp/nova.pid";
 
+mod agentic_search;
 mod discord;
-mod dispatcher;
-mod task_manager;
+mod discord_adapter;
 mod tool_factory;
 mod session_diary;
 
-/// [V4 Task 6.2] Discord proactive push message
-#[derive(Clone)]
-struct DiscordPush {
-    channel_id: String,
-    content: String,
-}
+// Re-use library crate modules
+use nova_daemon::dispatcher;
+use nova_daemon::DiscordPush;
 
 pub struct HandleConfig {
     workspace_dir: PathBuf,
@@ -50,11 +50,18 @@ pub struct HandleConfig {
     run_mode: String,
     tools: Arc<ToolRegistry>,
     heartbeat_interval_secs: u64,
+    /// Shared LLM backend for all SideQuery/QueryLoop/DreamEngine construction
+    llm_backend: Arc<dyn LlmBackend>,
+    /// API key retained for PreFlightChecker and Coordinator (not yet trait-ified)
+    api_key: String,
+    /// API base URL retained for PreFlightChecker and Coordinator (not yet trait-ified)
+    api_base_url: String,
     /// Arc-wrapped dispatcher sender so it can be shared across HandleConfigs
     /// without move semantics. Clone of Arc<DispatcherSender> is cheap (just ref count).
     dispatcher_tx: Arc<dispatcher::DispatcherSender>,
     /// [V4 Task 6.2] Optional channel for Discord proactive push.
     /// When Some, DiscordHandler listens and sends messages to specified channels.
+    #[allow(dead_code)]
     discord_push_tx: Option<std::sync::Arc<tokio::sync::mpsc::Sender<DiscordPush>>>,
     /// [V4 Fix] Broadcast sender for IPC push events to TUI
     ipc_push_tx: Option<std::sync::Arc<tokio::sync::broadcast::Sender<nova_ipc::Event>>>,
@@ -159,7 +166,7 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
         config.workspace, config.mode, config.log_level);
 
     // [V2 Task System] Sweep orphaned [Running] tasks from previous crash
-    if let Err(e) = nova_core::task::TaskLogger::sweep_orphans(&config.workspace).await {
+    if let Err(e) = nova_tools::task::TaskLogger::sweep_orphans(&config.workspace).await {
         warn!("[V2 Task] sweep_orphans failed: {}", e);
     } else {
         info!("[V2 Task] sweep_orphans completed");
@@ -175,13 +182,17 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
 
     let skills = create_shared_loader(config.workspace.join("skills"))?;
 
+    // [R3] Create shared LLM backend — single Arc used by all SideQuery/QueryLoop/DreamEngine
+    let llm_backend: Arc<dyn LlmBackend> = Arc::new(ApiClient::new(
+        config.api_key.clone(),
+        config.api_base_url.clone(),
+    ));
+
     let mut loop_config = QueryLoopConfig {
         max_turns: config.max_turns,
         tool_timeout: std::time::Duration::from_secs(config.tool_timeout_secs),
         model: config.model.clone(),
         max_tokens: 8192,
-        api_key: config.api_key.clone(),
-        api_base_url: config.api_base_url.clone(),
         context_window: config.context_window,
         budget_trigger_pct: config.budget_trigger_pct,
         compact_target_pct: config.compact_target_pct,
@@ -198,11 +209,7 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
     // [V4 Phase 2.4] Create MemoryKeeper for async memory extraction
     let memory_keeper = Arc::new(MemoryKeeper::new(
         config.workspace.clone(),
-        SideQuery::new(
-            loop_config.api_key.clone(),
-            loop_config.api_base_url.clone(),
-            loop_config.model.clone(),
-        ),
+        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
     ));
 
     // [V4 Task 6.2] Create Discord push channel (before Dispatcher so it can be passed in)
@@ -233,9 +240,9 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
     // [V4 Phase 3.1] Set up PreFlightChecker now that we have api credentials
     // (was deferred until after Dispatcher creation per comment above)
     loop_config.preflight_checker = Some(PreFlightChecker::new(
-        loop_config.api_key.clone(),
-        loop_config.api_base_url.clone(),
-        loop_config.model.clone(),
+        config.api_key.clone(),
+        config.api_base_url.clone(),
+        config.model.clone(),
     ));
     info!("[V4] PreFlightChecker initialized");
 
@@ -256,13 +263,13 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 config.browser_chrome_path.clone(),
                 config.browser_profile_dir.clone(),
                 config.browser_headless.unwrap_or(true),
-                SideQuery::new(loop_config.api_key.clone(), loop_config.api_base_url.clone(), loop_config.model.clone()),
+                SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
                 SessionManager::new(config.workspace.join("sessions")),
                 file_tracker.clone(),
                 Some(config.workspace.clone()),
                 Some(config.workspace.join("teams")),
-                loop_config.api_key.clone(),
-                loop_config.api_base_url.clone(),
+                config.api_key.clone(),
+                config.api_base_url.clone(),
                 loop_config.model.clone(),
                 config.workspace.join("skills"),
                 skills.clone(),
@@ -280,6 +287,9 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 run_mode: run_mode.clone(),
                 tools: tools_dc,
                 heartbeat_interval_secs: config.heartbeat_interval_secs,
+                llm_backend: llm_backend.clone(),
+                api_key: config.api_key.clone(),
+                api_base_url: config.api_base_url.clone(),
                 dispatcher_tx: dispatcher_tx.clone(),
                 discord_push_tx: discord_push_tx.clone(),
                 ipc_push_tx: None, // Discord doesn't use IPC push
@@ -339,8 +349,7 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 let sk = skills.clone();
                 let rm = run_mode.clone();
                 let sq_for_tools = SideQuery::new(
-                    lc.api_key.clone(),
-                    lc.api_base_url.clone(),
+                    llm_backend.clone(),
                     lc.model.clone(),
                 );
                 let sm_for_tools = SessionManager::new(sd.clone());
@@ -363,8 +372,8 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                     file_tracker.clone(),
                     Some(workspace_dir.clone()),
                     Some(config.workspace.join("teams")),
-                    lc.api_key.clone(),
-                    lc.api_base_url.clone(),
+                    config.api_key.clone(),
+                    config.api_base_url.clone(),
                     lc.model.clone(),
                     config.workspace.join("skills"),
                     sk.clone(),
@@ -376,6 +385,9 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 // Shadow dispatcher_tx for each connection so it can be moved into the async block
                 let dispatcher_tx = dispatcher_tx.clone();
                 let ipc_push_tx_clone = ipc_push_tx.clone();
+                let backend_clone = llm_backend.clone();
+                let api_key_clone = config.api_key.clone();
+                let api_base_url_clone = config.api_base_url.clone();
                 tokio::spawn(async move {
                     let cfg = HandleConfig {
                         workspace_dir,
@@ -386,6 +398,9 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                         run_mode: rm,
                         tools,
                         heartbeat_interval_secs: config.heartbeat_interval_secs,
+                        llm_backend: backend_clone,
+                        api_key: api_key_clone,
+                        api_base_url: api_base_url_clone,
                         dispatcher_tx: dispatcher_tx.clone(),
                         discord_push_tx: None, // IPC connections don't use Discord push
                         ipc_push_tx: Some(Arc::new(ipc_push_tx_clone)), // [V4 Fix] Broadcast to TUI
@@ -413,6 +428,9 @@ async fn handle_connection(
     let tools = cfg.tools;
     let dispatcher_tx = cfg.dispatcher_tx.clone();
     let ipc_push_tx = cfg.ipc_push_tx.clone();
+    let llm_backend = cfg.llm_backend.clone();
+    let api_key = cfg.api_key.clone();
+    let api_base_url = cfg.api_base_url.clone();
     let session_mgr = SessionManager::new(sessions_dir.clone());
 
     // BootstrapLoader: hot-reloads workspace files with mtime caching
@@ -423,46 +441,32 @@ async fn handle_connection(
     let daily_notes = DailyNotes::new(memories_dir.clone());
 
     // SideQuery for diary generation and recall (T21.1 + T21.2)
-    let side_query = SideQuery::new(
-        loop_config.api_key.clone(),
-        loop_config.api_base_url.clone(),
-        loop_config.model.clone(),
-    );
+    let side_query = SideQuery::new(llm_backend.clone(), loop_config.model.clone());
 
     // MemoryRecall for diary recall (T21.2)
     let recall_session_mgr = SessionManager::new(sessions_dir.clone());
     let memory_recall = MemoryRecall::new(memories_dir.clone(), side_query.clone(), recall_session_mgr);
 
     // DreamEngine for periodic memory consolidation (T21.4)
-    let dream_sq = SideQuery::new(
-        loop_config.api_key.clone(),
-        loop_config.api_base_url.clone(),
-        loop_config.model.clone(),
-    );
     let dream_engine = Arc::new(DreamEngine::new(
         workspace_dir.clone(),
         memories_dir.clone(),
-        dream_sq,
+        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
     ));
 
     // Pass memories_dir to QueryLoop for diary writing
     loop_config.memories_dir = Some(memories_dir.clone());
 
     // T23: MemoryConsolidator for Layer 1 idle-time dual-write mutex
-    let consolidate_sq = SideQuery::new(
-        loop_config.api_key.clone(),
-        loop_config.api_base_url.clone(),
-        loop_config.model.clone(),
-    );
     let consolidator = Arc::new(MemoryConsolidator::new(
         workspace_dir.clone(),
-        consolidate_sq,
+        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
     ));
 
     // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
-    let tension_tracker = std::sync::Arc::new(nova_core::memory::TensionTracker::new());
-    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::TopicTracker::new()));
-    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::MemoryBoard::new(
+    let tension_tracker = std::sync::Arc::new(nova_memory::TensionTracker::new());
+    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::TopicTracker::new()));
+    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::MemoryBoard::new(
         workspace_dir.join("MEMORY.md"),
     )));
 
@@ -484,11 +488,7 @@ async fn handle_connection(
     };
 
     // [V4 Fix] Create IPC push receiver for ProjectCompleted notifications
-    let mut ipc_push_rx = if let Some(ref tx) = ipc_push_tx {
-        Some(tx.subscribe())
-    } else {
-        None
-    };
+    let ipc_push_rx = ipc_push_tx.as_ref().map(|tx| tx.subscribe());
 
     // [V6 Fix] Channel to inject background completion events into the main session loop
     let (inject_tx, mut inject_rx) = tokio::sync::mpsc::channel::<Event>(32);
@@ -546,6 +546,7 @@ async fn handle_connection(
     }
 
     loop {
+        #[allow(unused_assignments)]
         let mut req_to_process = None;
         tokio::select! {
             req_res = conn.recv_request() => {
@@ -642,8 +643,7 @@ async fn handle_connection(
                 // Auto-search: inject relevant history session context
                 if content.chars().count() > 5 {
                     let sq = SideQuery::new(
-                        loop_config.api_key.clone(),
-                        loop_config.api_base_url.clone(),
+                        llm_backend.clone(),
                         loop_config.model.clone(),
                     );
                     let search_mgr = SessionManager::new(sessions_dir.clone());
@@ -704,28 +704,35 @@ async fn handle_connection(
                 let tt = topic_tracker.clone();
                 let tens = tension_tracker.clone();
                 let mb = memory_board.clone();
+                let session_id_str = session.session_id.clone();
+                let workspace_dir_clone = workspace_dir.clone();
+                let backend_for_loop = llm_backend.clone();
+                let skills_clone = Some(skills.clone());
 
                 let loop_handle = tokio::spawn(async move {
                     let hooks = tool_factory::make_hooks();
                     let cons_inner = Arc::try_unwrap(cons)
                         .unwrap_or_else(|arc| (*arc).clone());
+                    let tool_ctx = ToolContext::new(
+                        session_id_str.clone(),
+                        Some(workspace_dir_clone),
+                    );
                     let ql = QueryLoop::new(
-                        tools_clone, hooks, lc, Some(dn), Some(sq_loop),
+                        backend_for_loop, tools_clone, hooks, lc, Some(dn), Some(sq_loop),
                         Some(cons_inner),
                         Some(tt), Some(tens), /* mr disabled */ Some(mb),
                         Some(shadow_tx),
+                        skills_clone,
+                        tool_ctx,
                     );
                     let mut s = session_clone;
                     s.turn_count = 0;
                     
-                    let session_id_str = s.session_id.clone();
-                    nova_core::tools::CURRENT_CHANNEL_ID.scope(session_id_str, async move {
-                        let result = ql.run_turn(s.clone(), &sp, event_tx).await;
-                        match result {
-                            Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
-                            Err(_) => (s, vec![], None),
-                        }
-                    }).await
+                    let result = ql.run_turn(s.clone(), &sp, event_tx).await;
+                    match result {
+                        Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
+                        Err(_) => (s, vec![], None),
+                    }
                 });
 
                 while let Some(event) = event_rx.recv().await {
@@ -816,8 +823,7 @@ async fn handle_connection(
             }
             Request::SearchSessions { query } => {
                 let sq = SideQuery::new(
-                    loop_config.api_key.clone(),
-                    loop_config.api_base_url.clone(),
+                    llm_backend.clone(),
                     loop_config.model.clone(),
                 );
                 let search_mgr = SessionManager::new(sessions_dir.clone());
@@ -854,8 +860,8 @@ async fn handle_connection(
                 // [V4 Fix] Pass shadow_tx so Coordinator's SubAgents emit TaskProgress events
                 // Note: tools=None here since this is a direct API path, not through DelegateComplexProjectTool
                 let coordinator = Coordinator::new(
-                    loop_config.api_key.clone(),
-                    loop_config.api_base_url.clone(),
+                    api_key.clone(),
+                    api_base_url.clone(),
                     loop_config.model.clone(),
                     String::new(), // system_prompt empty
                     Some(dispatcher_tx.channel()),

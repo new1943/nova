@@ -5,9 +5,14 @@ edition = "2021"
 
 [dependencies]
 nova-core = { path = "../nova-core" }
+nova-llm = { path = "../nova-llm" }
+nova-tools = { path = "../nova-tools" }
+nova-memory = { path = "../nova-memory" }
+nova-agent = { path = "../nova-agent" }
 nova-ipc = { path = "../nova-ipc" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 regex = "1"
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -16,3 +21,7 @@ dirs = "5"
 chrono = { workspace = true }
 uuid = { workspace = true }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+
+[dev-dependencies]
+tempfile = "3"
+async-trait = { workspace = true }

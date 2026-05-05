@@ -84,11 +84,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
         loop {
             let disconnected = tokio::select! {
                 Some(req) = req_rx.recv() => {
-                    if current_client.send_request(&req).await.is_err() {
-                        true
-                    } else {
-                        false
-                    }
+                    current_client.send_request(&req).await.is_err()
                 }
                 result = current_client.recv_event() => {
                     match result {

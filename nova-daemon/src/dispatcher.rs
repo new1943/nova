@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, broadcast};
 use tokio::task;
 use nova_core::models::{ShadowEvent, ShadowEventEmitter};
-use nova_core::sidequery::MemoryKeeper;
+use nova_memory::sidequery::MemoryKeeper;
 use nova_ipc::Event as IpcEvent;
 use tracing::{info, warn, debug};
 use crate::task_manager::TaskManager;

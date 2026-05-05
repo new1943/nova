@@ -9,16 +9,17 @@ use tracing::{info, warn, error};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-use nova_core::agent::{QueryLoop, LoopEvent};
+use nova_agent::{QueryLoop, LoopEvent};
 use nova_core::models::ShadowEvent;
-use nova_core::memory::consolidate::MemoryConsolidator;
-use nova_core::memory::daily::DailyNotes;
-use nova_core::memory::dream::DreamEngine;
-use nova_core::memory::recall::MemoryRecall;
-use nova_core::session::manager::SessionManager;
-use nova_core::session::search::AgenticSessionSearch;
-use nova_core::sidequery::SideQuery;
-use nova_core::workspace::BootstrapLoader;
+use nova_memory::memory::consolidate::MemoryConsolidator;
+use nova_memory::memory::daily::DailyNotes;
+use nova_memory::memory::dream::DreamEngine;
+use nova_memory::memory::recall::MemoryRecall;
+use nova_memory::session::manager::SessionManager;
+use nova_memory::session::AgenticSessionSearch;
+use nova_memory::sidequery::SideQuery;
+use nova_agent::workspace::BootstrapLoader;
+use nova_tools::ToolContext;
 
 use crate::HandleConfig;
 
@@ -178,48 +179,35 @@ async fn process_discord_message(
     let skills = cfg.skills.clone();
     let tools = cfg.tools.clone();
     let dispatcher_tx = cfg.dispatcher_tx.clone();
+    let llm_backend = cfg.llm_backend.clone();
 
     let session_mgr = SessionManager::new(sessions_dir.clone());
     let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir.clone())));
     let tool_desc = crate::tool_factory::tool_descriptions(&tools);
 
     let daily_notes = DailyNotes::new(memories_dir.clone());
-    let side_query = SideQuery::new(
-        loop_config.api_key.clone(),
-        loop_config.api_base_url.clone(),
-        loop_config.model.clone(),
-    );
+    let side_query = SideQuery::new(llm_backend.clone(), loop_config.model.clone());
 
     let recall_session_mgr = SessionManager::new(sessions_dir.clone());
     let memory_recall = MemoryRecall::new(memories_dir.clone(), side_query.clone(), recall_session_mgr);
 
-    let dream_sq = SideQuery::new(
-        loop_config.api_key.clone(),
-        loop_config.api_base_url.clone(),
-        loop_config.model.clone(),
-    );
     let dream_engine = Arc::new(DreamEngine::new(
         workspace_dir.clone(),
         memories_dir.clone(),
-        dream_sq,
+        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
     ));
 
     loop_config.memories_dir = Some(memories_dir.clone());
 
-    let consolidate_sq = SideQuery::new(
-        loop_config.api_key.clone(),
-        loop_config.api_base_url.clone(),
-        loop_config.model.clone(),
-    );
     let consolidator = Arc::new(MemoryConsolidator::new(
         workspace_dir.clone(),
-        consolidate_sq,
+        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
     ));
 
     // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
-    let tension_tracker = std::sync::Arc::new(nova_core::memory::TensionTracker::new());
-    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::TopicTracker::new()));
-    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_core::memory::MemoryBoard::new(
+    let tension_tracker = std::sync::Arc::new(nova_memory::TensionTracker::new());
+    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::TopicTracker::new()));
+    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::MemoryBoard::new(
         workspace_dir.join("MEMORY.md"),
     )));
 
@@ -301,8 +289,7 @@ async fn process_discord_message(
     // Context Search
     if content.chars().count() > 5 {
         let sq = SideQuery::new(
-            loop_config.api_key.clone(),
-            loop_config.api_base_url.clone(),
+            llm_backend.clone(),
             loop_config.model.clone(),
         );
         let search_mgr = SessionManager::new(sessions_dir.clone());
@@ -348,22 +335,27 @@ async fn process_discord_message(
     let tt = topic_tracker.clone();
     let tens = tension_tracker.clone();
     let mb = memory_board.clone();
+    let session_id_str = session.session_id.clone();
+    let workspace_dir_clone = workspace_dir.clone();
+    let backend_for_loop = llm_backend.clone();
+    let skills_clone = Some(skills.clone());
 
     let loop_handle = tokio::spawn(async move {
         let hooks = crate::tool_factory::make_hooks();
         let cons_inner = Arc::try_unwrap(cons).unwrap_or_else(|arc| (*arc).clone());
-        let ql = QueryLoop::new(tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner), Some(tt), Some(tens), /* mr disabled */ Some(mb), Some(shadow_tx));
+        let tool_ctx = ToolContext::new(
+            session_id_str.clone(),
+            Some(workspace_dir_clone),
+        );
+        let ql = QueryLoop::new(backend_for_loop, tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner), Some(tt), Some(tens), /* mr disabled */ Some(mb), Some(shadow_tx), skills_clone, tool_ctx);
         let mut s = session_clone;
         s.turn_count = 0;
         
-        let session_id_str = s.session_id.clone();
-        nova_core::tools::CURRENT_CHANNEL_ID.scope(session_id_str, async move {
-            let result = ql.run_turn(s.clone(), &sp, event_tx).await;
-            match result {
-                Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
-                Err(_) => (s, vec![], None),
-            }
-        }).await
+        let result = ql.run_turn(s.clone(), &sp, event_tx).await;
+        match result {
+            Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
+            Err(_) => (s, vec![], None),
+        }
     });
 
     let builder = CreateMessage::new().content("🤔 Thinking...");
@@ -517,8 +509,7 @@ async fn handle_new_command(
     if session.messages.len() > 2 {
         let daily_notes = DailyNotes::new(cfg.memories_dir.clone());
         let side_query = SideQuery::new(
-            cfg.loop_config.api_key.clone(),
-            cfg.loop_config.api_base_url.clone(),
+            cfg.llm_backend.clone(),
             cfg.loop_config.model.clone(),
         );
         let session_clone = session.clone();

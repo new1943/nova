@@ -3,14 +3,14 @@
 use std::path::Path;
 use tracing::{info, warn};
 
-use nova_core::memory::daily::DailyNotes;
-use nova_core::sidequery::SideQuery;
+use nova_memory::memory::daily::DailyNotes;
+use nova_memory::sidequery::SideQuery;
 
 const MAP_CHUNK_SIZE: usize = 180_000; // ~180K chars per Map batch
 
 /// Record MEMORY.md mtime at the start of each turn.
 /// Used by Dream to detect if LLM modified MEMORY.md during this turn.
-pub fn record_memory_mtime(session: &mut nova_core::session::manager::Session, workspace_dir: &Path) {
+pub fn record_memory_mtime(session: &mut nova_memory::session::manager::Session, workspace_dir: &Path) {
     let memory_path = workspace_dir.join("MEMORY.md");
     if let Ok(meta) = std::fs::metadata(&memory_path) {
         if let Ok(mtime) = meta.modified() {
@@ -87,7 +87,7 @@ async fn reduce_summaries(sq: &SideQuery, map_results: &[String]) -> anyhow::Res
 pub async fn write_session_diary(
     daily: &DailyNotes,
     sq: &SideQuery,
-    session: &nova_core::session::manager::Session,
+    session: &nova_memory::session::manager::Session,
 ) -> anyhow::Result<()> {
     // Step 1: preprocess — keep user + assistant decisions, strip tool calls
     let preprocessed = preprocess_session(&session.messages);

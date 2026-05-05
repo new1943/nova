@@ -2,7 +2,10 @@
 resolver = "2"
 members = [
     "nova-core",
-    "nova-api",
+    "nova-llm",
+    "nova-tools",
+    "nova-memory",
+    "nova-agent",
     "nova-ipc",
     "nova-daemon",
     "nova-tui",

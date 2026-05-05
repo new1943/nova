@@ -1,0 +1,25 @@
+[package]
+name = "nova-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nova-core = { path = "../nova-core" }
+nova-llm = { path = "../nova-llm" }
+nova-tools = { path = "../nova-tools" }
+nova-memory = { path = "../nova-memory" }
+
+# Workspace dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+tiktoken-rs = { workspace = true }
+once_cell = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

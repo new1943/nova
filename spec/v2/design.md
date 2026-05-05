@@ -361,17 +361,17 @@ impl Compactor {
 - active_summary：当前仍在继续的话题摘要
 只输出JSON，不要其他文字。"#;
 
-        let api = nova_api::client::ApiClient::new(
+        let api = nova_llm::client::ApiClient::new(
             self.api_key.clone(),
             self.api_base_url.clone(),
         );
 
-        let req = nova_api::types::ApiRequest {
+        let req = nova_llm::types::ApiRequest {
             model: self.model.clone(),
             max_tokens: 500,
             system: system.to_string(),
-            messages: vec![nova_api::types::ApiMessage::User {
-                content: nova_api::types::Content::Text(conversation),
+            messages: vec![nova_llm::types::ApiMessage::User {
+                content: nova_llm::types::Content::Text(conversation),
             }],
             tools: vec![],
             stream: false,
@@ -381,7 +381,7 @@ impl Compactor {
 
         // 提取文本
         for block in &resp.content {
-            if let nova_api::types::ContentBlock::Text { text } = block {
+            if let nova_llm::types::ContentBlock::Text { text } = block {
                 return Ok(text.clone());
             }
         }

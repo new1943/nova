@@ -3,14 +3,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nova_core::hooks::HookManager;
-use nova_core::session::manager::SessionManager;
-use nova_core::sidequery::SideQuery;
-use nova_core::skills::SharedSkillsLoader;
-use nova_core::tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgenticSearchTool, WorktreeTool, AgentTool, TeamTool};
-use nova_core::tools::bash::{BashTool, BashMode};
-use nova_core::skills::{SkillManageTool, SkillsListTool, SkillViewTool};
+use nova_agent::hooks::HookManager;
+use nova_memory::session::manager::SessionManager;
+use nova_memory::sidequery::SideQuery;
+use nova_tools::skills::SharedSkillsLoader;
+use nova_tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgentTool, WorktreeTool, TeamTool};
+use nova_tools::bash::{BashTool, BashMode};
+use nova_tools::skills::{SkillManageTool, SkillsListTool, SkillViewTool};
+use nova_tools::SharedFileReadTracker;
 
+use nova_agent::delegate::{DelegateComplexProjectTool, DelegateTaskTool, CancelDelegatedProjectTool};
+use nova_core::models::ShadowEventEmitter;
+
+use crate::agentic_search::AgenticSearchTool;
 use crate::dispatcher;
 
 /// Create a ToolRegistry for Coordinator's SubAgents.
@@ -22,7 +27,7 @@ pub fn make_subagent_tools(
     browser_chrome_path: Option<String>,
     _browser_profile_dir: Option<String>,
     browser_headless: bool,
-    file_tracker: nova_core::tools::SharedFileReadTracker,
+    file_tracker: SharedFileReadTracker,
 ) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register_builtin(Box::new(BashTool::new(BashMode::Open)));
@@ -54,7 +59,7 @@ pub fn make_tools(
     browser_headless: bool,
     side_query: SideQuery,
     session_manager: SessionManager,
-    file_tracker: nova_core::tools::SharedFileReadTracker,
+    file_tracker: SharedFileReadTracker,
     repo_root: Option<PathBuf>,
     teams_dir: Option<PathBuf>,
     api_key: String,
@@ -65,7 +70,7 @@ pub fn make_tools(
     dispatcher_tx: Arc<dispatcher::DispatcherSender>,
     shadow_tx: tokio::sync::mpsc::Sender<nova_core::models::ShadowEvent>,
     subagent_tools: Option<Arc<ToolRegistry>>,
-    workspace_dir: PathBuf,
+    _workspace_dir: PathBuf,
 ) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
@@ -106,29 +111,29 @@ pub fn make_tools(
     tools.register_builtin(Box::new(SkillViewTool::new(skills_dir, skills)));
 
     // delegate_complex_project
-    let delegate_tool = nova_core::tools::DelegateComplexProjectTool::new(
-        dispatcher_tx.clone(),
+    let delegate_tool = DelegateComplexProjectTool::new(
+        dispatcher_tx.clone() as Arc<dyn ShadowEventEmitter>,
         shadow_tx.clone(),
         api_key.clone(),
         api_base_url.clone(),
         model.clone(),
-    ).with_workspace_dir(workspace_dir.clone());
+    );
     let delegate_tool = if let Some(ref st) = subagent_tools {
         delegate_tool.with_tools(st.clone())
     } else {
         delegate_tool
     };
     tools.register_builtin(Box::new(delegate_tool));
-    tools.register_builtin(Box::new(nova_core::tools::CancelDelegatedProjectTool::new()));
+    tools.register_builtin(Box::new(CancelDelegatedProjectTool::new()));
 
     // delegate_task — for Medium complexity single-task delegation
-    let delegate_task_tool = nova_core::tools::DelegateTaskTool::new(
-        dispatcher_tx.clone(),
+    let delegate_task_tool = DelegateTaskTool::new(
+        dispatcher_tx.clone() as Arc<dyn ShadowEventEmitter>,
         shadow_tx.clone(),
         api_key.clone(),
         api_base_url.clone(),
         model.clone(),
-    ).with_workspace_dir(workspace_dir.clone());
+    );
     let delegate_task_tool = if let Some(st) = subagent_tools {
         delegate_task_tool.with_tools(st)
     } else {

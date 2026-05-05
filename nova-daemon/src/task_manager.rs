@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::io::Write;
+use nova_core::atomic_write::atomic_write;
 use nova_core::models::{ShadowEvent, TaskAction};
 use anyhow::Result;
 use regex::Regex;
@@ -158,7 +159,7 @@ impl TaskManager {
     }
 
     fn write_file(&self, content: impl AsRef<str>) -> Result<()> {
-        std::fs::write(&self.tasks_path, content.as_ref())?;
+        atomic_write(&self.tasks_path, content.as_ref().as_bytes())?;
         Ok(())
     }
 
