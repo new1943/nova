@@ -38,6 +38,9 @@ pub struct NovaConfig {
     /// Discord Gateway: enabled flag (default: false)
     #[serde(default = "default_discord_enabled")]
     pub discord_enabled: bool,
+    /// Discord: show tool approval buttons before executing sensitive tools (default: true)
+    #[serde(default = "default_tool_approval_enabled")]
+    pub tool_approval_enabled: bool,
     /// Discord Gateway: Bot Token (required if enabled)
     pub discord_token: Option<String>,
     /// Discord: Default channel ID for proactive pushes (e.g. ProjectCompleted).
@@ -61,6 +64,7 @@ fn default_compact_target() -> f32 { 0.6 }
 fn default_budget_trigger() -> f32 { 0.9 }
 fn default_mode() -> String { "open".into() }
 fn default_discord_enabled() -> bool { false }
+fn default_tool_approval_enabled() -> bool { true }
 fn default_log_level() -> String { "info".into() }
 
 impl Default for NovaConfig {
@@ -82,6 +86,7 @@ impl Default for NovaConfig {
             browser_profile_dir: None,
             browser_headless: None,
             discord_enabled: default_discord_enabled(),
+            tool_approval_enabled: default_tool_approval_enabled(),
             discord_token: None,
             discord_channel_id: None,
             log_level: default_log_level(),

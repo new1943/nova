@@ -2,7 +2,6 @@ pub mod dual_write;
 pub mod store;
 pub mod daily;
 pub mod recall;
-pub mod dream;
 pub mod consolidate;
 pub mod topic_state;
 pub mod tension_tracker;
@@ -11,7 +10,6 @@ pub mod memory_board;
 
 pub use dual_write::{DualWriteMemory, MemoryType};
 pub use recall::MemoryRecall;
-pub use dream::DreamEngine;
 pub use consolidate::MemoryConsolidator;
 pub use topic_state::{TopicTracker, Topic, TopicStatus, TopicTransition};
 pub use tension_tracker::{TensionTracker, TensionCalculator, UserState, SessionState, Emotion, Context, UserIntent};

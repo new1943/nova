@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// LLM 补全请求（provider 无关）
@@ -26,10 +27,20 @@ pub enum CompletionContent {
     Blocks(Vec<ContentBlock>),
 }
 
+/// Image source for base64-encoded images (Anthropic API format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,  // always "base64"
+    pub media_type: String,   // e.g. "image/png", "image/jpeg"
+    pub data: String,         // base64-encoded image data
+}
+
 /// 内容块类型
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
     Text { text: String },
+    Image { source: ImageSource },
     Thinking { thinking: String, signature: Option<String> },
     ToolUse { id: String, name: String, input: serde_json::Value },
     ToolResult { tool_use_id: String, content: String },
@@ -44,7 +55,7 @@ pub struct ToolSchema {
 }
 
 /// LLM 补全响应
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub id: String,
     pub content: Vec<ContentBlock>,

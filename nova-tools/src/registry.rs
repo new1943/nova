@@ -129,3 +129,28 @@ impl ToolRegistry {
         desc
     }
 }
+
+/// ToolRegistry 实现 nova_core::executor::ToolExecutor trait，
+/// 使 Executor 模块能通过抽象接口调用工具（解耦 nova-core ↔ nova-tools 依赖）。
+#[async_trait]
+impl nova_core::executor::ToolExecutor for ToolRegistry {
+    async fn execute(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &nova_core::executor::ToolExecContext,
+    ) -> Result<String> {
+        let tool_ctx = ToolContext::new(ctx.channel_id.clone(), ctx.workspace_dir.clone());
+        let timeout = Duration::from_secs(60);
+        self.execute(name, args, &tool_ctx, timeout).await
+    }
+
+    fn is_read_only(&self, tool_name: &str) -> bool {
+        // 写工具名称列表 — 不是只读的工具
+        // 这里集中管理，取代之前 review.rs/project.rs 中分散的 substring 匹配
+        const WRITE_TOOLS: &[&str] = &[
+            "write_file", "file_edit", "execute_bash", "browser",
+        ];
+        !WRITE_TOOLS.contains(&tool_name)
+    }
+}

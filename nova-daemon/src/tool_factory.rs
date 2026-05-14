@@ -5,50 +5,13 @@ use std::sync::Arc;
 
 use nova_agent::hooks::HookManager;
 use nova_memory::session::manager::SessionManager;
-use nova_memory::sidequery::SideQuery;
 use nova_tools::skills::SharedSkillsLoader;
-use nova_tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, AgentTool, WorktreeTool, TeamTool};
+use nova_tools::{ToolRegistry, ReadFileTool, WriteFileTool, FileEditTool, GlobTool, GrepTool, BrowserTool, WorktreeTool, TeamTool, MemoryTool};
 use nova_tools::bash::{BashTool, BashMode};
 use nova_tools::skills::{SkillManageTool, SkillsListTool, SkillViewTool};
 use nova_tools::SharedFileReadTracker;
 
-use nova_agent::delegate::{DelegateComplexProjectTool, DelegateTaskTool, CancelDelegatedProjectTool};
-use nova_core::models::ShadowEventEmitter;
-
 use crate::agentic_search::AgenticSearchTool;
-use crate::dispatcher;
-
-/// Create a ToolRegistry for Coordinator's SubAgents.
-/// Contains ONLY subagent-appropriate tools: bash, read_file, write_file, file_edit, glob, grep, browser.
-/// Does NOT include delegate_complex_project (avoids circular dependency).
-///
-/// SubAgent BrowserTool uses an isolated Chrome Profile to avoid CDP session conflicts.
-pub fn make_subagent_tools(
-    browser_chrome_path: Option<String>,
-    _browser_profile_dir: Option<String>,
-    browser_headless: bool,
-    file_tracker: SharedFileReadTracker,
-) -> ToolRegistry {
-    let mut tools = ToolRegistry::new();
-    tools.register_builtin(Box::new(BashTool::new(BashMode::Open)));
-    tools.register_builtin(Box::new(ReadFileTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(WriteFileTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(FileEditTool::new(file_tracker.clone())));
-    tools.register_builtin(Box::new(GlobTool));
-    tools.register_builtin(Box::new(GrepTool));
-    // SubAgent uses isolated Chrome Profile
-    let subagent_profile = format!(
-        "{}/.nova/chrome-subagent-{}",
-        dirs::home_dir().unwrap().display(),
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
-    tools.register_builtin(Box::new(BrowserTool::new(
-        browser_chrome_path,
-        Some(subagent_profile),
-        browser_headless,
-    )));
-    tools
-}
 
 /// Create the full ToolRegistry for the main agent.
 #[allow(clippy::too_many_arguments)]
@@ -57,20 +20,11 @@ pub fn make_tools(
     browser_chrome_path: Option<String>,
     browser_profile_dir: Option<String>,
     browser_headless: bool,
-    side_query: SideQuery,
-    session_manager: SessionManager,
     file_tracker: SharedFileReadTracker,
     repo_root: Option<PathBuf>,
     teams_dir: Option<PathBuf>,
-    api_key: String,
-    api_base_url: String,
-    model: String,
     skills_dir: PathBuf,
     skills: SharedSkillsLoader,
-    dispatcher_tx: Arc<dispatcher::DispatcherSender>,
-    shadow_tx: tokio::sync::mpsc::Sender<nova_core::models::ShadowEvent>,
-    subagent_tools: Option<Arc<ToolRegistry>>,
-    _workspace_dir: PathBuf,
 ) -> ToolRegistry {
     let bash_mode = match mode {
         "sandbox" => BashMode::Sandbox,
@@ -90,10 +44,16 @@ pub fn make_tools(
         browser_headless,
     )));
 
-    tools.register_builtin(Box::new(AgenticSearchTool::new(side_query, session_manager)));
+    // v3: Memory tool — review/save/load
+    tools.register_builtin(Box::new(MemoryTool::new()));
 
-    // Agent tool — spawn subagents for parallel/background tasks
-    tools.register_builtin(Box::new(AgentTool::new(api_key.clone(), api_base_url.clone(), model.clone()).with_shadow_tx(shadow_tx.clone())));
+    // Agentic search — session history search
+    // Note: AgenticSearchTool needs a SideQuery, but in v3 we pass it at construction time.
+    // For now, we create a placeholder that will be replaced by the daemon.
+    // This is a known limitation — the tool_factory doesn't have access to the LLM backend.
+    // The daemon creates SideQuery and passes it via make_tools_with_search.
+    // For simplicity, we skip AgenticSearchTool registration here if no SideQuery is available.
+    // TODO: refactor to pass SideQuery through make_tools
 
     // Worktree tool — git worktree isolation per session
     if let Some(root) = repo_root {
@@ -110,43 +70,29 @@ pub fn make_tools(
     tools.register_builtin(Box::new(SkillsListTool::new(skills.clone())));
     tools.register_builtin(Box::new(SkillViewTool::new(skills_dir, skills)));
 
-    // delegate_complex_project
-    let delegate_tool = DelegateComplexProjectTool::new(
-        dispatcher_tx.clone() as Arc<dyn ShadowEventEmitter>,
-        shadow_tx.clone(),
-        api_key.clone(),
-        api_base_url.clone(),
-        model.clone(),
-    );
-    let delegate_tool = if let Some(ref st) = subagent_tools {
-        delegate_tool.with_tools(st.clone())
-    } else {
-        delegate_tool
-    };
-    tools.register_builtin(Box::new(delegate_tool));
-    tools.register_builtin(Box::new(CancelDelegatedProjectTool::new()));
-
-    // delegate_task — for Medium complexity single-task delegation
-    let delegate_task_tool = DelegateTaskTool::new(
-        dispatcher_tx.clone() as Arc<dyn ShadowEventEmitter>,
-        shadow_tx.clone(),
-        api_key.clone(),
-        api_base_url.clone(),
-        model.clone(),
-    );
-    let delegate_task_tool = if let Some(st) = subagent_tools {
-        delegate_task_tool.with_tools(st)
-    } else {
-        delegate_task_tool
-    };
-    tools.register_builtin(Box::new(delegate_task_tool));
-
     tools
 }
 
-/// Create HookManager (currently empty — old hooks disabled)
-pub fn make_hooks() -> HookManager {
-    HookManager::new()
+/// Create the agentic search tool (requires SideQuery from daemon).
+pub fn make_agentic_search_tool(
+    side_query: nova_memory::sidequery::SideQuery,
+    session_manager: SessionManager,
+) -> AgenticSearchTool {
+    AgenticSearchTool::new(side_query, session_manager)
+}
+
+/// Create HookManager with MemoryExtract hooks wired up.
+pub fn make_hooks(workspace_dir: PathBuf) -> HookManager {
+    use nova_agent::hooks::post_sampling::MemoryExtractHook;
+    use nova_agent::hooks::stop::MemoryExtractStopHook;
+    use nova_memory::memory::DualWriteMemory;
+    use tokio::sync::Mutex;
+
+    let dual_write = Arc::new(Mutex::new(DualWriteMemory::new(workspace_dir)));
+    let mut hooks = HookManager::new();
+    hooks.register_post_sampling(Box::new(MemoryExtractHook::new(dual_write.clone())));
+    hooks.register_stop(Box::new(MemoryExtractStopHook::new(dual_write)));
+    hooks
 }
 
 /// Generate tool descriptions string (used by BootstrapLoader)

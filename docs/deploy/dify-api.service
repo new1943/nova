@@ -1,0 +1,24 @@
+# Dify systemd 服务配置（Linux 服务器生产部署用）
+# 将此文件保存到 /etc/systemd/system/dify-api.service
+
+[Unit]
+Description=Dify Backend API
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/Dify/deploy/dify/api
+ExecStart=/usr/local/bin/uv run gunicorn app:app \
+    --bind 0.0.0.0:5000 \
+    --workers 2 \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --access-logfile /home/YOUR_USER/Dify/deploy/logs/api-access.log \
+    --error-logfile /home/YOUR_USER/Dify/deploy/logs/api-error.log \
+    --pid /home/YOUR_USER/Dify/deploy/pids/api.pid
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -261,6 +261,13 @@ impl ApiClient {
     fn convert_content_block_to_api(block: &CoreContentBlock) -> ContentBlock {
         match block {
             CoreContentBlock::Text { text } => ContentBlock::Text { text: text.clone() },
+            CoreContentBlock::Image { source } => ContentBlock::Image {
+                source: crate::types::ImageSource {
+                    source_type: source.source_type.clone(),
+                    media_type: source.media_type.clone(),
+                    data: source.data.clone(),
+                },
+            },
             CoreContentBlock::Thinking {
                 thinking,
                 signature,
@@ -286,6 +293,13 @@ impl ApiClient {
     fn convert_content_block_to_core(block: ContentBlock) -> CoreContentBlock {
         match block {
             ContentBlock::Text { text } => CoreContentBlock::Text { text },
+            ContentBlock::Image { source } => CoreContentBlock::Image {
+                source: nova_core::llm_backend::ImageSource {
+                    source_type: source.source_type,
+                    media_type: source.media_type,
+                    data: source.data,
+                },
+            },
             ContentBlock::Thinking {
                 thinking,
                 signature,

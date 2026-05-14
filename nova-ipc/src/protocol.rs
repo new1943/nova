@@ -11,6 +11,10 @@ pub enum Request {
     Shutdown,
     /// Trigger a multi-phase orchestration task via Coordinator
     Orchestrate { task: String },
+    /// Stop all running background executor tasks
+    Stop,
+    /// List running background tasks and session status
+    ListTasks,
 }
 
 /// Daemon → TUI events (streamed)

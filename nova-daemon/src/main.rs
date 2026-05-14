@@ -7,23 +7,18 @@ use tracing::{info, error, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use nova_agent::{QueryLoop, QueryLoopConfig, LoopEvent};
-use nova_agent::preflight::PreFlightChecker;
 use nova_core::config::NovaConfig;
 use nova_core::llm_backend::LlmBackend;
-use nova_core::models::ShadowEvent;
 
 use nova_llm::client::ApiClient;
 use nova_memory::memory::consolidate::MemoryConsolidator;
 use nova_memory::memory::daily::DailyNotes;
-use nova_memory::memory::dream::DreamEngine;
-use nova_memory::memory::recall::MemoryRecall;
 use nova_memory::session::manager::SessionManager;
 use nova_memory::session::AgenticSessionSearch;
-use nova_memory::sidequery::{SideQuery, MemoryKeeper};
+use nova_memory::sidequery::SideQuery;
 use nova_tools::skills::{create_shared_loader, SharedSkillsLoader};
 use nova_agent::heartbeat::{HeartbeatScheduler};
 use nova_agent::heartbeat::scheduler::HeartbeatEvent;
-use nova_agent::Coordinator;
 use nova_tools::{ToolRegistry, ToolContext, create_shared_tracker};
 use nova_agent::workspace::BootstrapLoader;
 use nova_ipc::{IpcServer, Event, Request};
@@ -47,24 +42,17 @@ pub struct HandleConfig {
     memories_dir: PathBuf,
     loop_config: QueryLoopConfig,
     skills: SharedSkillsLoader,
-    run_mode: String,
     tools: Arc<ToolRegistry>,
     heartbeat_interval_secs: u64,
-    /// Shared LLM backend for all SideQuery/QueryLoop/DreamEngine construction
+    /// Shared LLM backend for all QueryLoop construction
     llm_backend: Arc<dyn LlmBackend>,
-    /// API key retained for PreFlightChecker and Coordinator (not yet trait-ified)
-    api_key: String,
-    /// API base URL retained for PreFlightChecker and Coordinator (not yet trait-ified)
-    api_base_url: String,
-    /// Arc-wrapped dispatcher sender so it can be shared across HandleConfigs
-    /// without move semantics. Clone of Arc<DispatcherSender> is cheap (just ref count).
-    dispatcher_tx: Arc<dispatcher::DispatcherSender>,
     /// [V4 Task 6.2] Optional channel for Discord proactive push.
-    /// When Some, DiscordHandler listens and sends messages to specified channels.
     #[allow(dead_code)]
     discord_push_tx: Option<std::sync::Arc<tokio::sync::mpsc::Sender<DiscordPush>>>,
     /// [V4 Fix] Broadcast sender for IPC push events to TUI
     ipc_push_tx: Option<std::sync::Arc<tokio::sync::broadcast::Sender<nova_ipc::Event>>>,
+    /// Whether to show Discord tool approval buttons (default: true)
+    tool_approval_enabled: bool,
 }
 
 fn budget_pct_calc(input_tokens: usize, context_window: usize) -> f32 {
@@ -182,13 +170,13 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
 
     let skills = create_shared_loader(config.workspace.join("skills"))?;
 
-    // [R3] Create shared LLM backend — single Arc used by all SideQuery/QueryLoop/DreamEngine
+    // Create shared LLM backend — single Arc used by all QueryLoop/SideQuery construction
     let llm_backend: Arc<dyn LlmBackend> = Arc::new(ApiClient::new(
         config.api_key.clone(),
         config.api_base_url.clone(),
     ));
 
-    let mut loop_config = QueryLoopConfig {
+    let loop_config = QueryLoopConfig {
         max_turns: config.max_turns,
         tool_timeout: std::time::Duration::from_secs(config.tool_timeout_secs),
         model: config.model.clone(),
@@ -197,7 +185,6 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
         budget_trigger_pct: config.budget_trigger_pct,
         compact_target_pct: config.compact_target_pct,
         memories_dir: None,
-        preflight_checker: None, // [V4 Phase 3.1] Set up after Dispatcher creation
     };
 
     let server = IpcServer::bind(SOCKET_PATH.as_ref()).await?;
@@ -205,12 +192,6 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
 
     // Create shared file tracker for read-first safety
     let file_tracker = create_shared_tracker();
-
-    // [V4 Phase 2.4] Create MemoryKeeper for async memory extraction
-    let memory_keeper = Arc::new(MemoryKeeper::new(
-        config.workspace.clone(),
-        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
-    ));
 
     // [V4 Task 6.2] Create Discord push channel (before Dispatcher so it can be passed in)
     // This channel forwards ProjectCompleted events to Discord push listener
@@ -225,74 +206,49 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
     // Using broadcast channel so all TUI connections receive the notification
     let ipc_push_tx = tokio::sync::broadcast::channel::<nova_ipc::Event>(32).0;
 
-    // [V4 Phase 2.2] Spawn the ShadowEvent dispatcher loop (with MemoryKeeper and optionally Discord push)
-    let dispatcher_tx = {
-        let mut d = dispatcher::Dispatcher::new(config.workspace.clone())
-            .with_memory_keeper(memory_keeper);
+    // Spawn the ShadowEvent dispatcher loop (with optionally Discord push)
+    {
+        let mut d = dispatcher::Dispatcher::new(config.workspace.clone());
         if let Some(ref tx) = discord_push_tx {
             d = d.with_discord_push_tx(tx.clone());
         }
         d = d.with_ipc_push_tx(Arc::new(ipc_push_tx.clone()));
-        d.spawn()
-    };
-    info!("ShadowEvent dispatcher spawned with MemoryKeeper");
-
-    // [V4 Phase 3.1] Set up PreFlightChecker now that we have api credentials
-    // (was deferred until after Dispatcher creation per comment above)
-    loop_config.preflight_checker = Some(PreFlightChecker::new(
-        config.api_key.clone(),
-        config.api_base_url.clone(),
-        config.model.clone(),
-    ));
-    info!("[V4] PreFlightChecker initialized");
+        d.spawn();
+    }
+    info!("ShadowEvent dispatcher spawned");
 
     if config.discord_enabled {
         if let Some(token) = config.discord_token.clone() {
             let mut discord_push_rx = discord_push_rx.unwrap(); // Safe: we checked config.discord_enabled
 
-            // [V4 Fix] Create subagent tools for Coordinator's SubAgents
-            let tools_subagent = Arc::new(tool_factory::make_subagent_tools(
-                config.browser_chrome_path.clone(),
-                config.browser_profile_dir.clone(),
-                config.browser_headless.unwrap_or(true),
-                file_tracker.clone(),
-            ));
-
-            let tools_dc = Arc::new(tool_factory::make_tools(
+            let mut tools_dc = tool_factory::make_tools(
                 &run_mode,
                 config.browser_chrome_path.clone(),
                 config.browser_profile_dir.clone(),
                 config.browser_headless.unwrap_or(true),
-                SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
-                SessionManager::new(config.workspace.join("sessions")),
                 file_tracker.clone(),
                 Some(config.workspace.clone()),
                 Some(config.workspace.join("teams")),
-                config.api_key.clone(),
-                config.api_base_url.clone(),
-                loop_config.model.clone(),
                 config.workspace.join("skills"),
                 skills.clone(),
-                dispatcher_tx.clone(),
-                dispatcher_tx.channel(),
-                Some(tools_subagent),
-                config.workspace.clone(),
-            ));
+            );
+            // Register agentic search tool (needs SideQuery from daemon)
+            let sq_dc = nova_memory::sidequery::SideQuery::new(llm_backend.clone(), loop_config.model.clone());
+            let sm_dc = SessionManager::new(config.workspace.join("sessions"));
+            tools_dc.register_builtin(Box::new(tool_factory::make_agentic_search_tool(sq_dc, sm_dc)));
+            let tools_dc = Arc::new(tools_dc);
             let dc_cfg = Arc::new(HandleConfig {
                 workspace_dir: config.workspace.clone(),
                 sessions_dir: config.workspace.join("sessions"),
                 memories_dir: config.workspace.clone(),
                 loop_config: loop_config.clone(),
                 skills: skills.clone(),
-                run_mode: run_mode.clone(),
                 tools: tools_dc,
                 heartbeat_interval_secs: config.heartbeat_interval_secs,
                 llm_backend: llm_backend.clone(),
-                api_key: config.api_key.clone(),
-                api_base_url: config.api_base_url.clone(),
-                dispatcher_tx: dispatcher_tx.clone(),
                 discord_push_tx: discord_push_tx.clone(),
                 ipc_push_tx: None, // Discord doesn't use IPC push
+                tool_approval_enabled: config.tool_approval_enabled,
             });
 
             // [V4 Task 6.2] Spawn Discord proactive push listener
@@ -347,47 +303,25 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                 let md = config.workspace.clone();
                 let lc = loop_config.clone();
                 let sk = skills.clone();
-                let rm = run_mode.clone();
-                let sq_for_tools = SideQuery::new(
-                    llm_backend.clone(),
-                    lc.model.clone(),
-                );
-                let sm_for_tools = SessionManager::new(sd.clone());
 
-                // [V4 Fix] Create subagent tools for Coordinator's SubAgents
-                let tools_subagent = Arc::new(tool_factory::make_subagent_tools(
-                    config.browser_chrome_path.clone(),
-                    config.browser_profile_dir.clone(),
-                    config.browser_headless.unwrap_or(true),
-                    file_tracker.clone(),
-                ));
-
-                let tools = Arc::new(tool_factory::make_tools(
+                let mut tools = tool_factory::make_tools(
                     &run_mode,
                     config.browser_chrome_path.clone(),
                     config.browser_profile_dir.clone(),
                     config.browser_headless.unwrap_or(true),
-                    sq_for_tools,
-                    sm_for_tools,
                     file_tracker.clone(),
                     Some(workspace_dir.clone()),
                     Some(config.workspace.join("teams")),
-                    config.api_key.clone(),
-                    config.api_base_url.clone(),
-                    lc.model.clone(),
                     config.workspace.join("skills"),
                     sk.clone(),
-                    dispatcher_tx.clone(),
-                    dispatcher_tx.channel(),
-                    Some(tools_subagent),
-                    config.workspace.clone(),
-                ));
-                // Shadow dispatcher_tx for each connection so it can be moved into the async block
-                let dispatcher_tx = dispatcher_tx.clone();
+                );
+                // Register agentic search tool (needs SideQuery from daemon)
+                let sq_ipc = nova_memory::sidequery::SideQuery::new(llm_backend.clone(), lc.model.clone());
+                let sm_ipc = SessionManager::new(sd.clone());
+                tools.register_builtin(Box::new(tool_factory::make_agentic_search_tool(sq_ipc, sm_ipc)));
+                let tools = Arc::new(tools);
                 let ipc_push_tx_clone = ipc_push_tx.clone();
                 let backend_clone = llm_backend.clone();
-                let api_key_clone = config.api_key.clone();
-                let api_base_url_clone = config.api_base_url.clone();
                 tokio::spawn(async move {
                     let cfg = HandleConfig {
                         workspace_dir,
@@ -395,15 +329,12 @@ async fn run_daemon(config: NovaConfig) -> Result<()> {
                         memories_dir: md,
                         loop_config: lc,
                         skills: sk,
-                        run_mode: rm,
                         tools,
                         heartbeat_interval_secs: config.heartbeat_interval_secs,
                         llm_backend: backend_clone,
-                        api_key: api_key_clone,
-                        api_base_url: api_base_url_clone,
-                        dispatcher_tx: dispatcher_tx.clone(),
                         discord_push_tx: None, // IPC connections don't use Discord push
                         ipc_push_tx: Some(Arc::new(ipc_push_tx_clone)), // [V4 Fix] Broadcast to TUI
+                        tool_approval_enabled: false, // IPC/TUI has no Discord button UI
                     };
                     if let Err(e) = handle_connection(conn, cfg).await {
                         error!("Connection error: {}", e);
@@ -424,14 +355,13 @@ async fn handle_connection(
     let memories_dir = cfg.memories_dir;
     let mut loop_config = cfg.loop_config;
     let skills = cfg.skills;
-    let _run_mode = cfg.run_mode;
     let tools = cfg.tools;
-    let dispatcher_tx = cfg.dispatcher_tx.clone();
     let ipc_push_tx = cfg.ipc_push_tx.clone();
     let llm_backend = cfg.llm_backend.clone();
-    let api_key = cfg.api_key.clone();
-    let api_base_url = cfg.api_base_url.clone();
     let session_mgr = SessionManager::new(sessions_dir.clone());
+
+    // Task registry (global singleton shared with Discord path)
+    let task_registry = nova_core::executor::registry::TaskRegistry::global();
 
     // BootstrapLoader: hot-reloads workspace files with mtime caching
     let bootstrap = Arc::new(Mutex::new(BootstrapLoader::new(workspace_dir.clone())));
@@ -440,19 +370,8 @@ async fn handle_connection(
     // DailyNotes: Layer 2 episodic memory (T21.1)
     let daily_notes = DailyNotes::new(memories_dir.clone());
 
-    // SideQuery for diary generation and recall (T21.1 + T21.2)
+    // SideQuery for diary generation and session search
     let side_query = SideQuery::new(llm_backend.clone(), loop_config.model.clone());
-
-    // MemoryRecall for diary recall (T21.2)
-    let recall_session_mgr = SessionManager::new(sessions_dir.clone());
-    let memory_recall = MemoryRecall::new(memories_dir.clone(), side_query.clone(), recall_session_mgr);
-
-    // DreamEngine for periodic memory consolidation (T21.4)
-    let dream_engine = Arc::new(DreamEngine::new(
-        workspace_dir.clone(),
-        memories_dir.clone(),
-        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
-    ));
 
     // Pass memories_dir to QueryLoop for diary writing
     loop_config.memories_dir = Some(memories_dir.clone());
@@ -462,13 +381,6 @@ async fn handle_connection(
         workspace_dir.clone(),
         SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
     ));
-
-    // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
-    let tension_tracker = std::sync::Arc::new(nova_memory::TensionTracker::new());
-    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::TopicTracker::new()));
-    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::MemoryBoard::new(
-        workspace_dir.join("MEMORY.md"),
-    )));
 
     let mut session = match session_mgr.resume_latest()? {
         Some(s) => {
@@ -576,15 +488,6 @@ async fn handle_connection(
                 {
                     let idle_secs = (chrono::Utc::now() - session.updated_at).num_seconds();
 
-                    // [V4 Task 6.1] SystemIdle — emit when idle >= 60 seconds
-                    if idle_secs >= 60 {
-                        info!("[V4] SystemIdle detected ({}s idle), emitting event", idle_secs);
-                        dispatcher_tx.emit(ShadowEvent::SystemIdle {
-                            duration_secs: idle_secs as u64,
-                            transcript: session.messages.clone(),
-                        });
-                    }
-
                     let has_unswept = session.last_memory_sweep_index < session.messages.len();
                     if idle_secs > 900 && has_unswept {
                         info!(
@@ -650,14 +553,8 @@ async fn handle_connection(
                     let searcher = AgenticSessionSearch::new(sq, search_mgr);
 
                     let search_fut = searcher.search(&content);
-                    let recall_fut = memory_recall.recall(&content, 3);
 
-                    let (search_res, recall_res) = tokio::join!(
-                        tokio::time::timeout(std::time::Duration::from_secs(15), search_fut),
-                        tokio::time::timeout(std::time::Duration::from_secs(15), recall_fut),
-                    );
-
-                    match search_res {
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), search_fut).await {
                         Ok(Ok(results)) if !results.is_empty() => {
                             // Dynamic injection: use up to 5% of context window for history
                             let max_inject_chars = (loop_config.context_window / 20).max(1000);
@@ -679,21 +576,9 @@ async fn handle_connection(
                         Ok(Err(e)) => info!("Auto-search failed (non-fatal): {}", e),
                         Err(_) => info!("Auto-search timed out, skipping"),
                     }
-
-                    // T21.2: Memory recall — inject relevant daily diary entries
-                    match recall_res {
-                        Ok(Ok(injection)) if !injection.is_empty() => {
-                            sp.push_str(&injection);
-                            info!("Memory recall injected diary context (~{} chars)", injection.len());
-                        }
-                        Ok(Ok(_)) | Ok(Err(_)) => {}
-                        Err(_) => info!("Memory recall timed out, skipping"),
-                    }
                 }
 
                 let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
-                // [V4 Task 3.2] Get shadow event sender for QueryLoop
-                let shadow_tx = dispatcher_tx.channel();
                 let lc = loop_config.clone();
                 let ctx_window = lc.context_window;
                 let dn = daily_notes.clone();
@@ -701,16 +586,12 @@ async fn handle_connection(
                 let session_clone = session.clone();
                 let tools_clone = tools.clone();
                 let cons = consolidator.clone();
-                let tt = topic_tracker.clone();
-                let tens = tension_tracker.clone();
-                let mb = memory_board.clone();
                 let session_id_str = session.session_id.clone();
                 let workspace_dir_clone = workspace_dir.clone();
                 let backend_for_loop = llm_backend.clone();
-                let skills_clone = Some(skills.clone());
 
                 let loop_handle = tokio::spawn(async move {
-                    let hooks = tool_factory::make_hooks();
+                    let hooks = tool_factory::make_hooks(workspace_dir_clone.clone());
                     let cons_inner = Arc::try_unwrap(cons)
                         .unwrap_or_else(|arc| (*arc).clone());
                     let tool_ctx = ToolContext::new(
@@ -720,18 +601,16 @@ async fn handle_connection(
                     let ql = QueryLoop::new(
                         backend_for_loop, tools_clone, hooks, lc, Some(dn), Some(sq_loop),
                         Some(cons_inner),
-                        Some(tt), Some(tens), /* mr disabled */ Some(mb),
-                        Some(shadow_tx),
-                        skills_clone,
+                        None, // notify_tx — no executor notifications from daemon yet
                         tool_ctx,
                     );
                     let mut s = session_clone;
                     s.turn_count = 0;
-                    
+
                     let result = ql.run_turn(s.clone(), &sp, event_tx).await;
                     match result {
-                        Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
-                        Err(_) => (s, vec![], None),
+                        Ok((updated_s, new_msgs)) => (updated_s, new_msgs),
+                        Err(_) => (s, vec![]),
                     }
                 });
 
@@ -748,32 +627,21 @@ async fn handle_connection(
                             message: "Compacting conversation...".into(),
                         },
                         LoopEvent::Error(e) => Event::Error { message: e },
+                        LoopEvent::FileOutput { .. } | LoopEvent::Embed { .. } => continue,
                     };
                     conn.send_event(&ipc_event).await.ok();
                 }
 
-                if let Ok((updated, new_msgs, preflight_result)) = loop_handle.await {
+                if let Ok((updated, new_msgs)) = loop_handle.await {
                     session = updated;
 
-                    // T3.2: TopicShift → ShadowEvent::TopicArchived
-                    if preflight_result.as_ref().map(|p| p.topic_shift).unwrap_or(false) {
-                        info!("Topic shift detected, emitting TopicArchived event");
-                        dispatcher_tx.emit(ShadowEvent::TopicArchived {
-                            transcript: session.messages.clone(),
-                        });
-                    }
-
                     let history = session_mgr.history_for(&session);
-                    // Append ONLY newly added messages instead of relying on `[old_len..]`
-                    // since compaction might reduce the total length in memory!
                     for msg in &new_msgs {
                         let _ = history.append(msg);
                     }
 
                     // T23: Detect if any tool call wrote to MEMORY.md
-                    // Scan new_msgs for tool results that indicate MEMORY.md was modified
                     let memory_written = new_msgs.iter().any(|m| {
-                        // Check assistant tool_calls for write_file/file_edit targeting MEMORY.md
                         if let Some(tcs) = &m.tool_calls {
                             tcs.iter().any(|tc| {
                                 (tc.name == "write_file" || tc.name == "file_edit")
@@ -789,19 +657,6 @@ async fn handle_connection(
                     }
 
                     session_mgr.save_meta(&session)?;
-
-                    // T21.4: Check dream trigger after each turn
-                    if dream_engine.should_dream() {
-                        let de = dream_engine.clone();
-                        let mtime = session.token_stats.memory_mtime;
-                        tokio::spawn(async move {
-                            if let Err(e) = de.dream(mtime).await {
-                                warn!("Dream consolidation failed: {}", e);
-                            } else {
-                                info!("Dream consolidation completed");
-                            }
-                        });
-                    }
                 }
             }
             Request::NewSession => {
@@ -855,30 +710,56 @@ async fn handle_connection(
                     session = s;
                 }
             }
-            Request::Orchestrate { task } => {
-                info!("Orchestration requested: {}", task);
-                // [V4 Fix] Pass shadow_tx so Coordinator's SubAgents emit TaskProgress events
-                // Note: tools=None here since this is a direct API path, not through DelegateComplexProjectTool
-                let coordinator = Coordinator::new(
-                    api_key.clone(),
-                    api_base_url.clone(),
-                    loop_config.model.clone(),
-                    String::new(), // system_prompt empty
-                    Some(dispatcher_tx.channel()),
-                    None, // [V4 Fix] No tools for direct Orchestrate API
+            Request::Stop => {
+                let count = task_registry.stop_all().await;
+                info!("/stop — aborted {} background tasks", count);
+                let msg = if count == 0 {
+                    "⏹ No background tasks running.".to_string()
+                } else {
+                    format!("⏹ Stopped {} background task(s).", count)
+                };
+                conn.send_event(&Event::Notification { message: msg }).await?;
+            }
+            Request::ListTasks => {
+                let running = task_registry.list().await;
+                let turn = session.turn_count;
+                let msgs = session.messages.len();
+                let mut info_text = format!(
+                    "📋 Session Status\n\
+                     - Session: {}\n\
+                     - Messages: {}\n\
+                     - Turn: {} / {}\n\
+                     - Model: {} | Context: {} tokens\n",
+                    session.session_id, msgs, turn,
+                    loop_config.max_turns, loop_config.model, loop_config.context_window,
                 );
-                match coordinator.orchestrate(&task).await {
-                    Ok(result) => {
-                        conn.send_event(&Event::Notification {
-                            message: format!("[Coordinator] Output:\n{}", result.output),
-                        }).await?;
-                    }
-                    Err(e) => {
-                        conn.send_event(&Event::Error {
-                            message: format!("Orchestration failed: {}", e),
-                        }).await?;
+                if running.is_empty() {
+                    info_text.push_str("\nNo background tasks running.");
+                } else {
+                    info_text.push_str(&format!("\n🔧 Background Tasks ({}):\n", running.len()));
+                    for t in &running {
+                        let elapsed = t.started_at.elapsed().as_secs();
+                        info_text.push_str(&format!(
+                            "  - [{}] {} ({}) — {}s ago\n",
+                            t.id, t.name, t.tool, elapsed
+                        ));
                     }
                 }
+                conn.send_event(&Event::Notification { message: info_text }).await?;
+            }
+            Request::Orchestrate { task } => {
+                // v3: Orchestration is now handled by the LLM via execute_project tool.
+                // This IPC path is kept for backwards compatibility but simply asks the LLM.
+                info!("Orchestration requested (v3: delegating to LLM): {}", task);
+                let msg = nova_core::message::Message::user(format!(
+                    "Please orchestrate and complete this task: {}",
+                    task
+                ));
+                session_mgr.append_message(&mut session, msg)?;
+                // The next UserMessage cycle will handle this through the normal query loop
+                conn.send_event(&Event::Notification {
+                    message: "Task queued for next interaction".into(),
+                }).await?;
             }
             Request::Shutdown => {
                 // T21.1: Write session diary before shutdown

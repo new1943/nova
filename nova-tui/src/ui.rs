@@ -274,7 +274,7 @@ fn render_input_box(f: &mut Frame, app: &App, area: Rect) {
 
     let input_text = if app.input.is_empty() {
         Span::styled(
-            "Type a message... (/new /quit) [Tab: panel] [Shift+↑↓: scroll]",
+            "Type a message... (/new /stop /tasks /quit) [Tab: panel] [Shift+↑↓: scroll]",
             Style::default().fg(Theme::DIM),
         )
     } else {

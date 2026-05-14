@@ -145,6 +145,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                                 app.status_text = "New session...".into();
                                 let _ = req_tx.try_send(Request::NewSession);
                             }
+                            "/stop" => {
+                                app.push_message(DisplayRole::System, "Stopping background tasks...".into());
+                                let _ = req_tx.try_send(Request::Stop);
+                            }
+                            "/tasks" => {
+                                let _ = req_tx.try_send(Request::ListTasks);
+                            }
                             _ if text.starts_with("/search ") => {
                                 let query = text.trim_start_matches("/search ").to_string();
                                 app.push_message(

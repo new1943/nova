@@ -1,30 +1,10 @@
+pub mod approval;
 pub mod atomic_write;
 pub mod config;
+pub mod executor;
 pub mod injection_scanner;
 pub mod llm_backend;
 pub mod message;
 pub mod models;
 pub mod platform;
-pub mod preflight_types;
-pub mod pipeline;
 pub mod retry;
-
-// ── 以下模块将搬迁到独立 crate，暂时注释 ──────────────────────
-// pub mod agent;
-// pub mod session;
-// pub mod tools;
-// pub mod workspace;
-// pub mod token;
-// pub mod hooks;
-// pub mod memory;
-// pub mod heartbeat;
-// pub mod skills;
-// pub mod team;
-// pub mod subagent;
-// pub mod sidequery;
-// pub mod dream;
-// pub mod worktree;
-// pub mod coordinator;
-// pub mod paste;
-// pub mod sandbox;
-// pub mod task;

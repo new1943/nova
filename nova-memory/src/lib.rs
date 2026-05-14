@@ -1,16 +1,14 @@
 pub mod memory;
 pub mod sidequery;
 pub mod session;
-pub mod dream;
 
 // Re-export key types
 pub use memory::{
-    DualWriteMemory, MemoryType, MemoryRecall, DreamEngine as MemoryDreamEngine,
+    DualWriteMemory, MemoryType, MemoryRecall,
     MemoryConsolidator, TopicTracker, Topic, TopicStatus, TopicTransition,
     TensionTracker, TensionCalculator, UserState, SessionState, Emotion, Context, UserIntent,
     ModeRouter, Mode, MemoryBoard,
 };
-pub use sidequery::{SideQuery, MemoryKeeper};
+pub use sidequery::SideQuery;
 pub use session::manager::{Session, SessionManager, SessionMeta, TokenStats};
 pub use session::AgenticSessionSearch;
-pub use dream::engine::DreamEngine;

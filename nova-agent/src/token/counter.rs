@@ -7,7 +7,7 @@ use anyhow::Result;
 /// A wrapper for precise token counting using tiktoken.
 pub struct TokenCounter {
     #[allow(clippy::type_complexity)]
-    encoder: Box<dyn Fn(&str) -> Vec<usize> + Send + Sync>,
+    encoder: Box<dyn Fn(&str) -> Vec<u32> + Send + Sync>,
 }
 
 impl TokenCounter {

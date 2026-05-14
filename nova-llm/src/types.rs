@@ -31,12 +31,23 @@ pub enum Content {
     Blocks(Vec<ContentBlock>),
 }
 
+/// Image source for base64-encoded images
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
+}
+
 /// Content block types in API messages
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "thinking")]
     Thinking { thinking: String, #[serde(default)] signature: Option<String> },
     #[serde(rename = "tool_use")]

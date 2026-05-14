@@ -98,8 +98,13 @@ impl Compactor {
     fn calculate_split(&self, messages: &[Message], context_window: usize) -> Result<usize> {
         let total_chars: usize = messages
             .iter()
-            .filter_map(|m| m.content.as_ref())
-            .map(|c| c.len())
+            .map(|m| {
+                let content_chars = m.content.as_ref().map(|c| c.len()).unwrap_or(0);
+                let tc_chars = m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter().map(|tc| tc.name.len() + tc.arguments.to_string().len()).sum::<usize>()
+                }).unwrap_or(0);
+                content_chars + tc_chars
+            })
             .sum();
         let target_chars = (context_window as f32 * self.target_pct * 4.0) as usize;
 
@@ -110,7 +115,11 @@ impl Compactor {
         let mut keep_chars = 0usize;
         let mut keep_from = messages.len();
         for (i, msg) in messages.iter().enumerate().rev() {
-            let msg_chars = msg.content.as_ref().map(|c| c.len()).unwrap_or(0);
+            let content_chars = msg.content.as_ref().map(|c| c.len()).unwrap_or(0);
+            let tc_chars = msg.tool_calls.as_ref().map(|tcs| {
+                tcs.iter().map(|tc| tc.name.len() + tc.arguments.to_string().len()).sum::<usize>()
+            }).unwrap_or(0);
+            let msg_chars = content_chars + tc_chars;
             if keep_chars + msg_chars > target_chars && keep_from < messages.len() {
                 break;
             }

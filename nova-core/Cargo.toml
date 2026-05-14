@@ -12,7 +12,8 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 toml = "0.8"
-dirs = "5"
+dirs = "6"
+base64 = "0.22"
 
 [dev-dependencies]
 proptest = "1"

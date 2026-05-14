@@ -13,7 +13,6 @@ use crate::hooks::HookManager;
 use nova_memory::memory::MemoryConsolidator;
 use nova_memory::memory::daily::DailyNotes;
 use nova_core::message::{Message, Role, ToolCall};
-use nova_core::models::ShadowEvent;
 use nova_memory::session::manager::Session;
 use nova_memory::sidequery::SideQuery;
 use crate::token::budget::{BudgetCheck, TokenBudget};
@@ -21,6 +20,13 @@ use crate::token::compact::Compactor;
 use nova_tools::registry::{ToolRegistry, ToolContext};
 
 /// Event emitted by the query loop to the caller (TUI/daemon)
+#[derive(Debug, Clone)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: String,
+    pub inline: bool,
+}
+
 #[derive(Debug)]
 pub enum LoopEvent {
     TextDelta(String),
@@ -30,6 +36,15 @@ pub enum LoopEvent {
     TokenUsage { input: u32, output: u32 },
     Error(String),
     CompactTriggered,
+    FileOutput { path: String, filename: String },
+    Embed {
+        title: Option<String>,
+        description: Option<String>,
+        color: Option<u32>,
+        fields: Vec<EmbedField>,
+        image_url: Option<String>,
+        footer: Option<String>,
+    },
 }
 
 /// Query Loop configuration
@@ -44,9 +59,6 @@ pub struct QueryLoopConfig {
     pub compact_target_pct: f32,
     /// Memories directory for diary writing (Layer 2 episodic memory)
     pub memories_dir: Option<std::path::PathBuf>,
-    /// Optional pre-flight checker for state machine interception
-    /// If None, pre-flight check is skipped (legacy mode)
-    pub preflight_checker: Option<crate::preflight::PreFlightChecker>,
 }
 
 impl Default for QueryLoopConfig {
@@ -60,12 +72,13 @@ impl Default for QueryLoopConfig {
             budget_trigger_pct: 0.9,
             compact_target_pct: 0.6,
             memories_dir: None,
-            preflight_checker: None,
         }
     }
 }
 
-/// The core Query Loop — strategies 1+2+3+5+6 integrated
+/// The core Query Loop — v3 architecture (Main Loop + Tool Registry)
+///
+/// No Preflight. No Pipeline Stages. LLM sees all tools and decides what to do.
 pub struct QueryLoop {
     pub config: QueryLoopConfig,
     pub backend: Arc<dyn LlmBackend>,
@@ -74,19 +87,12 @@ pub struct QueryLoop {
     pub daily_notes: Option<DailyNotes>,
     pub side_query: Option<SideQuery>,
     pub consolidator: Option<MemoryConsolidator>,
-    // v2 Phase 1.5+ trackers
-    pub topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<nova_memory::TopicTracker>>>,
-    pub tension_tracker: Option<std::sync::Arc<nova_memory::TensionTracker>>,
-    pub memory_board: Option<std::sync::Arc<tokio::sync::RwLock<nova_memory::MemoryBoard>>>,
-    // [V4 Phase 4.1] Cached complexity from previous turn for tool filtering
-    cached_complexity: tokio::sync::Mutex<Option<nova_core::preflight_types::Complexity>>,
-    // [V4 Task 3.2] Optional channel for emitting ShadowEvent::TopicArchived
-    #[allow(dead_code)]
-    shadow_tx: Option<mpsc::Sender<ShadowEvent>>,
-    // [R4] Optional shared skills loader for progressive disclosure
-    pub skills_loader: Option<nova_tools::skills::cache::SharedSkillsLoader>,
+    // Optional channel for emitting notifications (used by daemon)
+    pub notify_tx: Option<mpsc::Sender<nova_core::executor::types::Notification>>,
     // Tool context for executing tools
     pub tool_context: ToolContext,
+    // Optional approval handler for tool execution gating
+    pub approval_handler: Option<Arc<dyn nova_core::approval::ApprovalHandler>>,
 }
 
 impl QueryLoop {
@@ -99,70 +105,37 @@ impl QueryLoop {
         daily_notes: Option<DailyNotes>,
         side_query: Option<SideQuery>,
         consolidator: Option<MemoryConsolidator>,
-        topic_tracker: Option<std::sync::Arc<tokio::sync::RwLock<nova_memory::TopicTracker>>>,
-        tension_tracker: Option<std::sync::Arc<nova_memory::TensionTracker>>,
-        memory_board: Option<std::sync::Arc<tokio::sync::RwLock<nova_memory::MemoryBoard>>>,
-        shadow_tx: Option<mpsc::Sender<ShadowEvent>>,
-        skills_loader: Option<nova_tools::skills::cache::SharedSkillsLoader>,
+        notify_tx: Option<mpsc::Sender<nova_core::executor::types::Notification>>,
         tool_context: ToolContext,
     ) -> Self {
         Self {
             config, backend, tools, hooks, daily_notes, side_query, consolidator,
-            topic_tracker, tension_tracker, memory_board,
-            cached_complexity: tokio::sync::Mutex::new(None),
-            shadow_tx,
-            skills_loader,
+            notify_tx,
             tool_context,
+            approval_handler: None,
         }
     }
 
+    pub fn with_approval_handler(mut self, handler: Arc<dyn nova_core::approval::ApprovalHandler>) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
     /// Run a full query loop turn for user input.
+    ///
+    /// v3 architecture: no Pipeline, no Preflight. LLM sees all tools and decides.
     pub async fn run_turn(
         &self,
         mut session: Session,
         system_prompt: &str,
         event_tx: mpsc::Sender<LoopEvent>,
-    ) -> Result<(Session, Vec<Message>, Option<nova_core::preflight_types::PreFlightCheckResult>)> {
-        // Reset turn counter
+    ) -> Result<(Session, Vec<Message>)> {
         session.reset_turns();
         let mut newly_added_messages = Vec::new();
         info!("--- Starting new query loop for user input ---");
 
-        // ── TurnPipeline: 所有策略通过共享 TurnContext 协作 ─────────────
-        let preflight_user_input = session.messages.last()
-            .and_then(|m| m.content.as_ref().cloned())
-            .unwrap_or_default();
-        let preflight_recent_msgs = session.messages.iter().rev().take(10).cloned().collect::<Vec<_>>();
-
-        let mut turn_ctx = nova_core::pipeline::TurnContext::new(
-            preflight_user_input,
-            preflight_recent_msgs,
-        );
-
-        // Build and run the pipeline
-        let pipeline = self.build_pipeline();
-        if let Err(e) = pipeline.run(&mut turn_ctx).await {
-            warn!("TurnPipeline error: {}, falling back to defaults", e);
-        }
-
-        // Read pipeline results
-        let preflight_result = turn_ctx.preflight_result.clone();
-
-        // Generate tool schemas from GateStage result
-        let tool_schemas = if let Some(ref allowed) = turn_ctx.allowed_tools {
-            let allowed = allowed.clone();
-            self.tools.as_api_schemas_filtered(|name| allowed.contains(&name.to_string()))
-        } else {
-            self.tools.as_api_schemas()
-        };
-
-        // Build injection string from InjectStage result
-        let injection_string = turn_ctx.build_injection_string();
-
-        // Cache complexity for next turn fallback
-        if let Some(ref result) = preflight_result {
-            *self.cached_complexity.lock().await = Some(result.complexity);
-        }
+        // v3: All tools are always visible to the LLM
+        let tool_schemas = self.tools.as_api_schemas();
 
         let mut budget = TokenBudget::new(
             self.config.context_window,
@@ -183,7 +156,7 @@ impl QueryLoop {
                 break;
             }
 
-            // --- Strategy 2: Pre-flight budget check ---
+            // Pre-flight budget check
             let estimated_tokens = estimate_message_tokens(&session.messages);
             let budget_pct = estimated_tokens as f32 / self.config.context_window as f32;
             debug!("Pre-flight budget: estimated_tokens={}, budget_pct={:.1}%, compact_threshold={:.1}%",
@@ -204,9 +177,7 @@ impl QueryLoop {
             // Build request
             let completion_messages = build_completion_messages(&session.messages);
             info!("Sending API request to {} ({} messages, estimated {} tokens)", self.config.model, completion_messages.len(), estimated_tokens);
-            let effective_system = format!("{}{}", system_prompt, injection_string);
 
-            // Convert nova_llm ToolSchema to nova_core ToolSchema
             let core_tool_schemas: Vec<CoreToolSchema> = tool_schemas.iter().map(|ts| {
                 CoreToolSchema {
                     name: ts.name.clone(),
@@ -218,13 +189,13 @@ impl QueryLoop {
             let req = CompletionRequest {
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
-                system: effective_system,
+                system: system_prompt.to_string(),
                 messages: completion_messages,
                 tools: core_tool_schemas,
                 stream: true,
             };
 
-            // Stream API response via LlmBackend trait
+            // Stream API response
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamDelta>(64);
             let stream_handle = tokio::spawn({
                 let backend = self.backend.clone();
@@ -283,7 +254,6 @@ impl QueryLoop {
                 }
             }
 
-            // Check if the stream task itself errored
             if let Ok(Err(e)) = stream_handle.await {
                 error!("API stream fatal error: {}", e);
                 if text_content.is_empty() && tool_calls.is_empty() {
@@ -295,7 +265,7 @@ impl QueryLoop {
             debug!("API response: text_content_len={}, tool_calls={}, usage=input:{} output:{}",
                 text_content.len(), tool_calls.len(), usage.input_tokens, usage.output_tokens);
 
-            // If the stream produced nothing at all, retry automatically
+            // Empty response retry
             if text_content.is_empty() && tool_calls.is_empty() && !context_overflow && usage.input_tokens == 0 {
                 warn!("Empty API response, retry={}/{}", empty_retries, MAX_EMPTY_RETRIES);
                 empty_retries += 1;
@@ -311,7 +281,7 @@ impl QueryLoop {
             }
             empty_retries = 0;
 
-            // GAP 2: context-overflow → compact and retry this turn
+            // Context overflow → compact and retry
             if context_overflow {
                 warn!("Context overflow detected, attempting compact...");
                 let _ = event_tx.send(LoopEvent::CompactTriggered).await;
@@ -325,7 +295,7 @@ impl QueryLoop {
                     }
                     Ok(_) => {
                         let _ = event_tx.send(LoopEvent::Error(
-                            "Context size exceeded model limits, but cannot safely compact further because the most recent messages are too large! Please type /new to start a fresh session.".into()
+                            "Context size exceeded model limits. Please type /new to start a fresh session.".into()
                         )).await;
                         break;
                     }
@@ -340,7 +310,7 @@ impl QueryLoop {
             session.token_stats.total_input_tokens += usage.input_tokens;
             session.token_stats.total_output_tokens += usage.output_tokens;
 
-            // Post-flight budget check + record turn
+            // Post-flight budget check
             let input_tokens = usage.input_tokens as usize;
             let budget_pct = input_tokens as f32 / self.config.context_window as f32;
             debug!("Post-flight budget: input_tokens={}, budget_pct={:.1}%, check={:?}",
@@ -391,7 +361,7 @@ impl QueryLoop {
             let content = if text_content.is_empty() { None } else { Some(text_content) };
             let assistant_msg = Message::assistant(content, msg_tool_calls);
 
-            // --- Strategy 5: PostSampling Hooks (async, non-blocking) ---
+            // PostSampling Hooks
             self.hooks.fire_post_sampling(&assistant_msg, &session).await;
 
             newly_added_messages.push(assistant_msg.clone());
@@ -405,13 +375,8 @@ impl QueryLoop {
                 break;
             }
 
-            // Execute each tool call with timeout
+            // Execute each tool call
             for tc in &tool_calls {
-                // ── v2 Phase 1.5: Reset topic inactive turns on tool use ──────
-                if let Some(ref tt) = self.topic_tracker {
-                    tt.write().await.on_tool_call().await;
-                }
-
                 let input = tc.parse_input().unwrap_or_else(|_| serde_json::json!({}));
                 let input_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
                 let input_preview = if input_str.len() > 200 {
@@ -432,14 +397,37 @@ impl QueryLoop {
                 };
                 debug!("Tool call: name={}, args={}", tc.name, input_preview);
 
-                // [V6] Hard gate 校验
+                // Check if tool is allowed
                 let is_allowed = tool_schemas.iter().any(|s| s.name == tc.name);
-                
+
+                // Approval check for sensitive tools
+                let approval_denied = if is_allowed {
+                    if let Some(ref handler) = self.approval_handler {
+                        if nova_core::approval::requires_approval(&tc.name) {
+                            let decision = handler.request_approval(&tc.name, &input).await;
+                            match decision {
+                                nova_core::approval::ApprovalDecision::Allow => false,
+                                nova_core::approval::ApprovalDecision::AllowSession => false,
+                                nova_core::approval::ApprovalDecision::Deny => true,
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
                 let mut result = if !is_allowed {
                     let allowed_names: Vec<&str> = tool_schemas.iter().map(|s| s.name.as_str()).collect();
-                    let msg = format!("[V6 Hard Gate] Tool `{}` is blocked by current complexity gate. Only allowed tools: {:?}", tc.name, allowed_names);
+                    let msg = format!("Tool `{}` is not available. Available tools: {:?}", tc.name, allowed_names);
                     warn!("{}", msg);
                     format!("{{\"error\": \"{}\"}}", msg)
+                } else if approval_denied {
+                    warn!("Tool `{}` denied by user approval", tc.name);
+                    format!("{{\"error\": \"Tool '{}' was denied by user\"}}", tc.name)
                 } else {
                     match self.tools.execute(&tc.name, input.clone(), &self.tool_context, self.config.tool_timeout).await {
                         Ok(r) => {
@@ -453,7 +441,7 @@ impl QueryLoop {
                     }
                 };
 
-                // Tool-Level Output Truncation
+                // Tool output truncation
                 const MAX_TOOL_CHARS: usize = 30000;
                 if result.len() > MAX_TOOL_CHARS {
                     let omitted = result.len() - MAX_TOOL_CHARS;
@@ -476,63 +464,9 @@ impl QueryLoop {
                 newly_added_messages.push(tool_msg.clone());
                 session.add_message(tool_msg);
             }
-
-            // Pipeline ExecuteConfig: 委派工具执行后立即结束循环
-            let delegated = turn_ctx.should_terminate_after_tool && tool_calls.iter().any(|tc| {
-                tc.name == "delegate_task" || tc.name == "delegate_complex_project"
-            });
-            if delegated {
-                if text_len == 0 {
-                    let fallback = "好的，任务已派发给后台处理，完成后会自动通知您。";
-                    let _ = event_tx.send(LoopEvent::TextDelta(fallback.to_string())).await;
-                }
-                info!("Pipeline: delegation tool executed, ending query loop");
-                self.hooks.fire_stop(&mut session).await;
-                let _ = event_tx.send(LoopEvent::TurnEnd).await;
-                break;
-            }
         }
 
-        Ok((session, newly_added_messages, preflight_result))
-    }
-
-    /// Build a TurnPipeline from QueryLoop's optional components.
-    fn build_pipeline(&self) -> nova_core::pipeline::TurnPipeline {
-        use crate::stages::*;
-        let mut pipeline = nova_core::pipeline::TurnPipeline::new();
-
-        // Stage 1: Classify
-        if let Some(ref checker) = self.config.preflight_checker {
-            pipeline.add_stage(Box::new(classify::ClassifyStage::new(
-                std::sync::Arc::new(checker.clone()),
-                30,
-            )));
-        }
-
-        // Stage 2: Track
-        if let (Some(ref tt), Some(ref tens)) = (&self.topic_tracker, &self.tension_tracker) {
-            pipeline.add_stage(Box::new(track::TrackStage::new(
-                tt.clone(),
-                tens.clone(),
-            )));
-        }
-
-        // Stage 3: Gate
-        pipeline.add_stage(Box::new(gate::GateStage::new()));
-
-        // Stage 4: Inject
-        pipeline.add_stage(Box::new(inject::InjectStage::new(
-            self.config.memories_dir.clone(),
-            self.skills_loader.clone(),
-        )));
-
-        // Stage 5: PlatformHint
-        pipeline.add_stage(Box::new(platform_hint::PlatformHintStage::new()));
-
-        // Stage 6: ExecuteConfig
-        pipeline.add_stage(Box::new(execute_config::ExecuteConfigStage::new()));
-
-        pipeline
+        Ok((session, newly_added_messages))
     }
 
     async fn write_compact_diary(&self, messages: &[Message]) {
@@ -648,10 +582,41 @@ fn build_completion_messages(messages: &[Message]) -> Vec<CompletionMessage> {
         match msg.role {
             Role::System => {}
             Role::User => {
-                if let Some(ref content) = msg.content {
-                    msgs.push(CompletionMessage::User {
-                        content: CompletionContent::Text(content.clone()),
-                    });
+                if msg.attachments.is_empty() {
+                    if let Some(ref content) = msg.content {
+                        msgs.push(CompletionMessage::User {
+                            content: CompletionContent::Text(content.clone()),
+                        });
+                    }
+                } else {
+                    let mut blocks = Vec::new();
+                    if let Some(ref content) = msg.content {
+                        if !content.is_empty() {
+                            blocks.push(CoreContentBlock::Text { text: content.clone() });
+                        }
+                    }
+                    for att in &msg.attachments {
+                        if att.media_type.starts_with("image/") {
+                            use base64::Engine as _;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
+                            blocks.push(CoreContentBlock::Image {
+                                source: nova_core::llm_backend::ImageSource {
+                                    source_type: "base64".into(),
+                                    media_type: att.media_type.clone(),
+                                    data: b64,
+                                },
+                            });
+                        } else {
+                            blocks.push(CoreContentBlock::Text {
+                                text: format!("[Attached file: {} ({} bytes, {})]", att.filename, att.data.len(), att.media_type),
+                            });
+                        }
+                    }
+                    if !blocks.is_empty() {
+                        msgs.push(CompletionMessage::User {
+                            content: CompletionContent::Blocks(blocks),
+                        });
+                    }
                 }
             }
             Role::Assistant => {

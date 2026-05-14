@@ -1,20 +1,21 @@
 use anyhow::Result;
 use serenity::prelude::*;
 use serenity::model::application::Interaction;
-use serenity::model::channel::Message;
+use serenity::model::channel::{Message, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::async_trait;
-use serenity::builder::{CreateMessage, EditMessage};
+use serenity::builder::{CreateAttachment, CreateButton, CreateActionRow, CreateMessage, EditMessage};
+use serenity::model::application::ButtonStyle;
+use nova_core::approval::{ApprovalDecision, ApprovalHandler};
+use nova_core::message::MessageAttachment;
 use tracing::{info, warn, error};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
 use nova_agent::{QueryLoop, LoopEvent};
-use nova_core::models::ShadowEvent;
 use nova_memory::memory::consolidate::MemoryConsolidator;
 use nova_memory::memory::daily::DailyNotes;
-use nova_memory::memory::dream::DreamEngine;
-use nova_memory::memory::recall::MemoryRecall;
 use nova_memory::session::manager::SessionManager;
 use nova_memory::session::AgenticSessionSearch;
 use nova_memory::sidequery::SideQuery;
@@ -45,12 +46,72 @@ fn filter_nova_os(content: &str) -> String {
 }
 
 
+/// Pending approval requests, keyed by approval ID
+pub type PendingApprovals = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>>>;
+
+struct DiscordApprovalHandler {
+    ctx: Context,
+    channel_id: serenity::model::id::ChannelId,
+    pending: PendingApprovals,
+}
+
+#[async_trait]
+impl ApprovalHandler for DiscordApprovalHandler {
+    async fn request_approval(&self, tool_name: &str, arguments: &serde_json::Value) -> ApprovalDecision {
+        let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let args_preview = {
+            let s = serde_json::to_string_pretty(arguments).unwrap_or_default();
+            if s.len() > 300 {
+                let end = s.char_indices().map(|(i, _)| i).filter(|&i| i <= 300).last().unwrap_or(0);
+                format!("{}...", &s[..end])
+            } else { s }
+        };
+
+        let buttons = vec![
+            CreateButton::new(format!("approve:{}", id)).label("Allow").style(ButtonStyle::Success),
+            CreateButton::new(format!("session:{}", id)).label("Allow Session").style(ButtonStyle::Primary),
+            CreateButton::new(format!("deny:{}", id)).label("Deny").style(ButtonStyle::Danger),
+        ];
+        let action_row = CreateActionRow::Buttons(buttons);
+        let builder = CreateMessage::new()
+            .content(format!("🔧 Tool `{}` requests execution\n```\n{}\n```", tool_name, args_preview))
+            .components(vec![action_row]);
+
+        let mut msg = match self.channel_id.send_message(&self.ctx.http, builder).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Failed to send approval request: {}", e);
+                return ApprovalDecision::Allow;
+            }
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), tx);
+
+        // Wait for response with 5-minute timeout
+        match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+            Ok(Ok(decision)) => {
+                let _ = msg.edit(&self.ctx.http, EditMessage::new().content(format!("✅ Tool `{}` — {:?}", tool_name, decision)).components(vec![])).await;
+                decision
+            }
+            _ => {
+                warn!("Approval request timed out for tool `{}`", tool_name);
+                self.pending.lock().await.remove(&id);
+                let _ = msg.edit(&self.ctx.http, EditMessage::new().content(format!("⏰ Tool `{}` — timed out, denying", tool_name)).components(vec![])).await;
+                ApprovalDecision::Deny
+            }
+        }
+    }
+}
+
 struct DiscordHandler {
     cfg: Arc<HandleConfig>,
     // Mutex to prevent concurrent processing in the same channel
     active_channels: Arc<Mutex<std::collections::HashSet<String>>>,
     // Application ID set after Ready event
     app_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    // Pending approval requests
+    pending_approvals: PendingApprovals,
 }
 
 #[async_trait]
@@ -74,7 +135,7 @@ impl EventHandler for DiscordHandler {
         if msg.author.bot { return; }
         
         let content = msg.content.trim().to_string();
-        if content.is_empty() { return; }
+        if content.is_empty() && msg.attachments.is_empty() { return; }
 
         let session_id = msg.channel_id.to_string();
 
@@ -87,16 +148,29 @@ impl EventHandler for DiscordHandler {
         active.insert(session_id.clone());
         drop(active);
 
+        // Add eyes reaction to indicate processing
+        let _ = msg.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
+
         let cfg = self.cfg.clone();
         let ctx = ctx.clone();
         let msg = msg.clone();
         let active_channels = self.active_channels.clone();
+        let pending = self.pending_approvals.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = process_discord_message(cfg, ctx.clone(), msg.clone(), session_id.clone(), content).await {
-                error!("Discord process error: {}", e);
-                let builder = CreateMessage::new().content(format!("❌ Error: {}", e));
-                let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+            let result = process_discord_message(cfg, ctx.clone(), msg.clone(), session_id.clone(), content, pending).await;
+            // Remove eyes reaction
+            let _ = msg.delete_reaction_emoji(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
+            match result {
+                Ok(_) => {
+                    let _ = msg.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
+                }
+                Err(e) => {
+                    error!("Discord process error: {}", e);
+                    let _ = msg.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
+                    let builder = CreateMessage::new().content(format!("❌ Error: {}", e));
+                    let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+                }
             }
             let mut active = active_channels.lock().await;
             active.remove(&session_id);
@@ -104,12 +178,12 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::Command(cmd) = interaction else { return; };
+        match interaction {
+            Interaction::Command(cmd) => {
+                let channel_id = cmd.channel_id;
+                let session_id = channel_id.to_string();
 
-        let channel_id = cmd.channel_id;
-        let session_id = channel_id.to_string();
-
-        match cmd.data.name.as_str() {
+                match cmd.data.name.as_str() {
             "new" => {
                 let cfg = self.cfg.clone();
                 let active_channels = self.active_channels.clone();
@@ -156,11 +230,81 @@ impl EventHandler for DiscordHandler {
                     active.remove(&session_id);
                 });
             }
+            "stop" => {
+                let count = nova_core::executor::registry::TaskRegistry::global().stop_all().await;
+                let msg = if count == 0 {
+                    "⏹ No background tasks running.".to_string()
+                } else {
+                    format!("⏹ Stopped {} background task(s).", count)
+                };
+                let response = serenity::builder::CreateInteractionResponse::Message(
+                    serenity::builder::CreateInteractionResponseMessage::new().content(msg),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+            }
+            "tasks" => {
+                let running = nova_core::executor::registry::TaskRegistry::global().list().await;
+                let mut text = if running.is_empty() {
+                    "📋 No background tasks running.".to_string()
+                } else {
+                    let mut s = format!("🔧 Background Tasks ({}):\n", running.len());
+                    for t in &running {
+                        let elapsed = t.started_at.elapsed().as_secs();
+                        s.push_str(&format!("  - [{}] {} ({}) — {}s ago\n", t.id, t.name, t.tool, elapsed));
+                    }
+                    s
+                };
+                // Session status
+                let sessions_dir = self.cfg.sessions_dir.clone();
+                let session_mgr = SessionManager::new(sessions_dir);
+                let sid = channel_id.to_string();
+                if let Ok(Some(s)) = session_mgr.resume_by_id(&sid) {
+                    text.push_str(&format!(
+                        "\n📋 Session: {} | Messages: {} | Turn: {}/{}",
+                        s.session_id, s.messages.len(), s.turn_count, self.cfg.loop_config.max_turns,
+                    ));
+                }
+                let response = serenity::builder::CreateInteractionResponse::Message(
+                    serenity::builder::CreateInteractionResponseMessage::new().content(text),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+            }
             _ => {
                 let builder = serenity::builder::CreateInteractionResponseFollowup::new()
                     .content("Unknown command");
                 let _ = cmd.create_followup(&ctx.http, builder).await;
             }
+            }
+            }
+            Interaction::Component(component) => {
+                let custom_id = &component.data.custom_id;
+                let pending = self.pending_approvals.clone();
+
+                let (decision, label) = if custom_id.starts_with("approve:") {
+                    (ApprovalDecision::Allow, "Approved")
+                } else if custom_id.starts_with("session:") {
+                    (ApprovalDecision::AllowSession, "Approved (session)")
+                } else if custom_id.starts_with("deny:") {
+                    (ApprovalDecision::Deny, "Denied")
+                } else {
+                    return;
+                };
+
+                // Extract the ID from the custom_id
+                let id = custom_id.split(':').nth(1).unwrap_or("").to_string();
+
+                if let Some(tx) = pending.lock().await.remove(&id) {
+                    let _ = tx.send(decision);
+                }
+
+                let response = serenity::builder::CreateInteractionResponse::UpdateMessage(
+                    serenity::builder::CreateInteractionResponseMessage::new()
+                        .content(format!("🔧 {}", label))
+                        .components(vec![]),
+                );
+                let _ = component.create_response(&ctx.http, response).await;
+            }
+            _ => {}
         }
     }
 }
@@ -171,6 +315,7 @@ async fn process_discord_message(
     msg: Message,
     session_id: String,
     content: String,
+    pending_approvals: PendingApprovals,
 ) -> Result<()> {
     let workspace_dir = cfg.workspace_dir.clone();
     let sessions_dir = cfg.sessions_dir.clone();
@@ -178,7 +323,6 @@ async fn process_discord_message(
     let mut loop_config = cfg.loop_config.clone();
     let skills = cfg.skills.clone();
     let tools = cfg.tools.clone();
-    let dispatcher_tx = cfg.dispatcher_tx.clone();
     let llm_backend = cfg.llm_backend.clone();
 
     let session_mgr = SessionManager::new(sessions_dir.clone());
@@ -188,28 +332,12 @@ async fn process_discord_message(
     let daily_notes = DailyNotes::new(memories_dir.clone());
     let side_query = SideQuery::new(llm_backend.clone(), loop_config.model.clone());
 
-    let recall_session_mgr = SessionManager::new(sessions_dir.clone());
-    let memory_recall = MemoryRecall::new(memories_dir.clone(), side_query.clone(), recall_session_mgr);
-
-    let dream_engine = Arc::new(DreamEngine::new(
-        workspace_dir.clone(),
-        memories_dir.clone(),
-        SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
-    ));
-
     loop_config.memories_dir = Some(memories_dir.clone());
 
     let consolidator = Arc::new(MemoryConsolidator::new(
         workspace_dir.clone(),
         SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
     ));
-
-    // v2 Phase 1.5: TopicTracker, TensionTracker, ModeRouter, MemoryBoard
-    let tension_tracker = std::sync::Arc::new(nova_memory::TensionTracker::new());
-    let topic_tracker = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::TopicTracker::new()));
-    let memory_board = std::sync::Arc::new(tokio::sync::RwLock::new(nova_memory::MemoryBoard::new(
-        workspace_dir.join("MEMORY.md"),
-    )));
 
     let mut session = match session_mgr.resume_by_id(&session_id)? {
         Some(s) => s,
@@ -265,20 +393,86 @@ async fn process_discord_message(
                 }
             });
         }
-        
+
         if let Err(e) = session_mgr.clear_session(&mut session) {
             let builder = CreateMessage::new().content(format!("❌ Failed to clear session: {}", e));
             let _ = msg.channel_id.send_message(&ctx.http, builder).await;
             return Ok(());
         }
-        
+
         let builder = CreateMessage::new().content("✨ Started a new session. Context cleared.");
         let _ = msg.channel_id.send_message(&ctx.http, builder).await;
         return Ok(());
     }
 
+    if content.trim() == "/stop" {
+        let count = nova_core::executor::registry::TaskRegistry::global().stop_all().await;
+        let reply = if count == 0 {
+            "⏹ No background tasks running.".to_string()
+        } else {
+            format!("⏹ Stopped {} background task(s).", count)
+        };
+        let builder = CreateMessage::new().content(reply);
+        let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+        return Ok(());
+    }
 
-    let user_msg = nova_core::message::Message::user(&content);
+    if content.trim() == "/tasks" {
+        let running = nova_core::executor::registry::TaskRegistry::global().list().await;
+        let mut text = if running.is_empty() {
+            "📋 No background tasks running.".to_string()
+        } else {
+            let mut s = format!("🔧 Background Tasks ({}):\n", running.len());
+            for t in &running {
+                let elapsed = t.started_at.elapsed().as_secs();
+                s.push_str(&format!("  - [{}] {} ({}) — {}s ago\n", t.id, t.name, t.tool, elapsed));
+            }
+            s
+        };
+        text.push_str(&format!(
+            "\n📋 Session: {} | Messages: {} | Turn: {}/{}",
+            session.session_id, session.messages.len(), session.turn_count, loop_config.max_turns,
+        ));
+        let builder = CreateMessage::new().content(text);
+        let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+        return Ok(());
+    }
+
+
+    // Download attachments from Discord message
+    let attachments: Vec<MessageAttachment> = if !msg.attachments.is_empty() {
+        let mut result = Vec::new();
+        for att in &msg.attachments {
+            if att.size > 20 * 1024 * 1024 {
+                warn!("Skipping attachment {} ({} bytes exceeds 20MB limit)", att.filename, att.size);
+                continue;
+            }
+            match att.download().await {
+                Ok(bytes) => {
+                    let media_type = att.content_type.clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    info!("Downloaded attachment: {} ({} bytes, {})", att.filename, bytes.len(), media_type);
+                    result.push(MessageAttachment {
+                        filename: att.filename.clone(),
+                        media_type,
+                        data: bytes,
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to download attachment {}: {}", att.filename, e);
+                }
+            }
+        }
+        result
+    } else {
+        Vec::new()
+    };
+
+    let user_msg = if attachments.is_empty() {
+        nova_core::message::Message::user(&content)
+    } else {
+        nova_core::message::Message::user_with_attachments(&content, attachments)
+    };
     session_mgr.append_message(&mut session, user_msg)?;
 
     crate::session_diary::record_memory_mtime(&mut session, &workspace_dir);
@@ -296,14 +490,8 @@ async fn process_discord_message(
         let searcher = AgenticSessionSearch::new(sq, search_mgr);
 
         let search_fut = searcher.search(&content);
-        let recall_fut = memory_recall.recall(&content, 3);
 
-        let (search_res, recall_res) = tokio::join!(
-            tokio::time::timeout(std::time::Duration::from_secs(15), search_fut),
-            tokio::time::timeout(std::time::Duration::from_secs(15), recall_fut),
-        );
-
-        if let Ok(Ok(results)) = search_res {
+        if let Ok(Ok(results)) = tokio::time::timeout(std::time::Duration::from_secs(15), search_fut).await {
             if !results.is_empty() {
                 let max_inject_chars = (loop_config.context_window / 20).max(1000);
                 let per_session_chars = max_inject_chars / 3;
@@ -316,45 +504,49 @@ async fn process_discord_message(
                 sp.push_str(&ctx_str);
             }
         }
-        if let Ok(Ok(injection)) = recall_res {
-            if !injection.is_empty() {
-                sp.push_str(&injection);
-            }
-        }
     }
 
     let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
-    // [V4 Task 3.2] Get shadow event sender for QueryLoop
-    let shadow_tx = dispatcher_tx.channel();
     let lc = loop_config.clone();
     let dn = daily_notes.clone();
     let sq_loop = side_query.clone();
     let session_clone = session.clone();
     let tools_clone = tools.clone();
     let cons = consolidator.clone();
-    let tt = topic_tracker.clone();
-    let tens = tension_tracker.clone();
-    let mb = memory_board.clone();
     let session_id_str = session.session_id.clone();
     let workspace_dir_clone = workspace_dir.clone();
     let backend_for_loop = llm_backend.clone();
-    let skills_clone = Some(skills.clone());
+    let ctx_for_approval = ctx.clone();
+    let approval_channel_id = msg.channel_id;
+    let pending_approvals_clone = pending_approvals;
 
     let loop_handle = tokio::spawn(async move {
-        let hooks = crate::tool_factory::make_hooks();
+        let hooks = crate::tool_factory::make_hooks(workspace_dir_clone.clone());
         let cons_inner = Arc::try_unwrap(cons).unwrap_or_else(|arc| (*arc).clone());
         let tool_ctx = ToolContext::new(
             session_id_str.clone(),
             Some(workspace_dir_clone),
         );
-        let ql = QueryLoop::new(backend_for_loop, tools_clone, hooks, lc, Some(dn), Some(sq_loop), Some(cons_inner), Some(tt), Some(tens), /* mr disabled */ Some(mb), Some(shadow_tx), skills_clone, tool_ctx);
+        let mut ql = QueryLoop::new(
+            backend_for_loop, tools_clone, hooks, lc, Some(dn), Some(sq_loop),
+            Some(cons_inner),
+            None, // notify_tx
+            tool_ctx,
+        );
+        if cfg.tool_approval_enabled {
+            ql = ql.with_approval_handler(Arc::new(DiscordApprovalHandler {
+                ctx: ctx_for_approval,
+                channel_id: approval_channel_id,
+                pending: pending_approvals_clone,
+            }));
+        }
         let mut s = session_clone;
         s.turn_count = 0;
-        
+
         let result = ql.run_turn(s.clone(), &sp, event_tx).await;
         match result {
-            Ok((updated_s, new_msgs, preflight)) => (updated_s, new_msgs, preflight),
-            Err(_) => (s, vec![], None),
+            Ok((updated_s, new_msgs)) => (updated_s, new_msgs),
+            Err(_) => (s, vec![]),
         }
     });
 
@@ -388,19 +580,51 @@ async fn process_discord_message(
                 let builder = EditMessage::new().content(format!("{}...\n\n❌ Error: {}", trunc_text, e));
                 let _ = reply_msg.edit(&ctx.http, builder).await;
             }
+            LoopEvent::FileOutput { path, filename } => {
+                send_file_to_discord(&ctx, &msg, &path, &filename).await;
+            }
+            LoopEvent::Embed { title, description, color, fields, image_url, footer } => {
+                let mut embed = serenity::builder::CreateEmbed::new();
+                if let Some(t) = title { embed = embed.title(t); }
+                if let Some(d) = description { embed = embed.description(d); }
+                if let Some(c) = color { embed = embed.colour(c); }
+                if let Some(url) = image_url { embed = embed.image(url); }
+                if let Some(f) = footer { embed = embed.footer(serenity::builder::CreateEmbedFooter::new(f)); }
+                for field in &fields {
+                    embed = embed.field(&field.name, &field.value, field.inline);
+                }
+                let builder = CreateMessage::new().add_embed(embed);
+                let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+            }
             _ => {}
         }
     }
 
-    if let Ok((updated, new_msgs, preflight_result)) = loop_handle.await {
+    if let Ok((updated, new_msgs)) = loop_handle.await {
         session = updated;
 
-        // T3.2: TopicShift → ShadowEvent::TopicArchived
-        if preflight_result.as_ref().map(|p| p.topic_shift).unwrap_or(false) {
-            info!("Topic shift detected, emitting TopicArchived event");
-            dispatcher_tx.emit(ShadowEvent::TopicArchived {
-                transcript: session.messages.clone(),
-            });
+        // Detect and send file outputs from tool results
+        for m in &new_msgs {
+            if m.role == nova_core::message::Role::Tool {
+                if let Some(ref content) = m.content {
+                    for line in content.lines() {
+                        // Screenshot pattern
+                        if let Some(rest) = line.strip_prefix("Screenshot saved: ") {
+                            let path = rest.trim();
+                            let filename = std::path::Path::new(path)
+                                .file_name().and_then(|n| n.to_str()).unwrap_or("screenshot.png").to_string();
+                            send_file_to_discord(&ctx, &msg, path, &filename).await;
+                        }
+                        // Generic file output pattern: [FILE:path]
+                        if line.starts_with("[FILE:") && line.ends_with(']') {
+                            let path = &line[6..line.len()-1];
+                            let filename = std::path::Path::new(path)
+                                .file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+                            send_file_to_discord(&ctx, &msg, path, &filename).await;
+                        }
+                    }
+                }
+            }
         }
 
         let history = session_mgr.history_for(&session);
@@ -420,14 +644,6 @@ async fn process_discord_message(
         }
 
         session_mgr.save_meta(&session)?;
-
-        if dream_engine.should_dream() {
-            let de = dream_engine.clone();
-            let mtime = session.token_stats.memory_mtime;
-            tokio::spawn(async move {
-                let _ = de.dream(mtime).await;
-            });
-        }
     }
 
     if text_buffer.is_empty() {
@@ -468,6 +684,7 @@ pub async fn start(token: String, cfg: Arc<HandleConfig>) -> Result<()> {
         cfg,
         active_channels: Arc::new(Mutex::new(std::collections::HashSet::new())),
         app_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        pending_approvals: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let mut client = Client::builder(&token, intents)
@@ -485,6 +702,10 @@ fn register_global_commands() -> Vec<serenity::builder::CreateCommand> {
             .description("Start a new session, clearing all conversation history"),
         serenity::builder::CreateCommand::new("reset")
             .description("Reset the current session to initial state"),
+        serenity::builder::CreateCommand::new("stop")
+            .description("Stop all running background executor tasks"),
+        serenity::builder::CreateCommand::new("tasks")
+            .description("List running background tasks and session status"),
     ]
 }
 
@@ -558,4 +779,21 @@ async fn handle_reset_command(
     let builder = CreateMessage::new().content("🔄 Session reset to initial state.");
     let _ = channel_id.send_message(&ctx.http, builder).await;
     Ok(())
+}
+
+async fn send_file_to_discord(ctx: &Context, msg: &Message, path: &str, filename: &str) {
+    let file_path = std::path::Path::new(path);
+    if !file_path.exists() {
+        warn!("FileOutput path does not exist: {}", path);
+        return;
+    }
+    match CreateAttachment::path(file_path).await {
+        Ok(attachment) => {
+            let builder = CreateMessage::new()
+                .content(format!("📎 {}", filename))
+                .add_file(attachment);
+            let _ = msg.channel_id.send_message(&ctx.http, builder).await;
+        }
+        Err(e) => warn!("Failed to send file {}: {}", path, e),
+    }
 }
