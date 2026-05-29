@@ -112,17 +112,19 @@ pub async fn execute_parallel(
         }
     };
 
-    let _ = notify_tx
-        .send(Notification {
-            id: task_id.clone(),
-            name: task_name.clone(),
-            tool: "execute_parallel".into(),
-            status,
-            output: Some(output),
-            channel: channel.clone(),
-            phases: None,
-        })
-        .await;
+    let notification = Notification {
+        id: task_id.clone(),
+        name: task_name.clone(),
+        tool: "execute_parallel".into(),
+        status,
+        output: Some(output),
+        channel: channel.clone(),
+        phases: None,
+    };
+    match notify_tx.send(notification).await {
+        Ok(_) => tracing::info!("[execute_parallel] Task {} notification sent successfully", task_id),
+        Err(e) => tracing::error!("[execute_parallel] Task {} notification send FAILED: {}", task_id, e),
+    }
 
     task_id
 }

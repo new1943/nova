@@ -1,7 +1,7 @@
 # NOVA 配置参数详解手册
 
-**版本**: v2.0
-**日期**: 2026-04-19
+**版本**: v3.1
+**日期**: 2026-05-15
 **状态**: 持续更新
 
 > 详细说明每个参数的机制、作用、取值范围及调优建议
@@ -14,9 +14,9 @@
 
 | 参数 | 文件 | 默认值 | 说明 |
 |:---|:---|:---|:---|
-| `MAX_TURNS` | `agent/loop.rs` | 20 | 单次对话的最大轮数限制 |
-| `MAX_EMPTY_RETRIES` | `agent/loop.rs` | 3 | 空响应重试次数 |
-| `MAX_TOOL_CHARS` | `agent/loop.rs` | 30,000 | 工具输出字符数上限（超过则截断） |
+| `MAX_TURNS` | `nova-agent/src/agent_loop.rs` | 20 | 单次对话的最大轮数限制 |
+| `MAX_EMPTY_RETRIES` | `nova-agent/src/agent_loop.rs` | 3 | 空响应重试次数 |
+| `MAX_TOOL_CHARS` | `nova-agent/src/pipeline/stages/execute.rs` | 30,000 | 工具输出字符数上限（超过则截断） |
 
 #### `MAX_TURNS`
 
@@ -285,8 +285,8 @@ tension = intimacy * 0.4 + trust * 0.2 + emotion_weight + context_weight + inten
 
 | 参数 | 文件 | 默认值 | 说明 |
 |:---|:---|:---|:---|
-| `DREAM_LOCK_TIMEOUT` | `dream.rs` | 24h | 两次整理的最小间隔 |
-| `MIN_SESSIONS_FOR_DREAM` | `dream.rs` | 5 | 触发整理所需的最小 session 数 |
+| `DREAM_LOCK_TIMEOUT` | `nova-memory/src/dream/engine.rs` | 24h | 两次整理的最小间隔 |
+| `MIN_SESSIONS_FOR_DREAM` | `nova-memory/src/dream/engine.rs` | 5 | 触发整理所需的最小 session 数 |
 
 ---
 
@@ -304,7 +304,7 @@ tension = intimacy * 0.4 + trust * 0.2 + emotion_weight + context_weight + inten
 ### 按模块分类
 
 ```
-Agent
+Agent (nova-agent/src/)
 ├── MAX_TURNS = 20
 ├── MAX_EMPTY_RETRIES = 3
 └── MAX_TOOL_CHARS = 30,000
@@ -338,14 +338,14 @@ Session Search
 ├── MAX_MESSAGES_TO_SCAN = 200
 └── MAX_SESSIONS_TO_SEARCH = 50
 
-Tools
+Tools (nova-tools/src/)
 ├── bash: MAX_OUTPUT = 20,000, HEAD = 8,000, TAIL = 8,000
 ├── browser: MAX_OUTPUT = 15,000, HEAD = 5,000, TAIL = 5,000
 ├── read_file: MAX_SIZE = 1,048,576 (1MB)
 ├── glob: MAX_RESULTS = 100
 └── grep: MAX_RESULTS = 200, VCS_DIRS = [.git, .svn, .hg, .sl]
 
-Memory
+Memory (nova-memory/src/)
 ├── MAX_TOPICS = 20
 ├── DREAM_LOCK_TIMEOUT = 24h
 └── MIN_SESSIONS_FOR_DREAM = 5

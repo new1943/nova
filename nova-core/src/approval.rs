@@ -17,5 +17,7 @@ pub trait ApprovalHandler: Send + Sync {
 
 /// Tools that require user approval before execution
 pub fn requires_approval(tool_name: &str) -> bool {
-    matches!(tool_name, "bash" | "write_file" | "file_edit" | "delegate_complex_project")
+    matches!(tool_name, "bash" | "write_file" | "file_edit"
+        | "execute_react" | "execute_chain" | "execute_parallel"
+        | "execute_with_review" | "execute_project")
 }

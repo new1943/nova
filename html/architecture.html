@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NOVA Agent 系统架构文档（完整版）</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap');
+        
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+        
+        .header-gradient {
+            background: linear-gradient(90deg, #00f5ff, #67e8f9);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .section {
+            scroll-margin-top: 80px;
+        }
+
+        .mermaid {
+            background: #1e2937;
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .card {
+            background: #1e2937;
+            border: 1px solid #334155;
+        }
+
+        .nav-link {
+            transition: all 0.2s ease;
+        }
+        
+        .nav-link:hover {
+            color: #67e8f9;
+        }
+
+        table {
+            border: 1px solid #334155;
+        }
+        
+        th {
+            background: #0f172a;
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-200">
+    <!-- Navbar -->
+    <nav class="sticky top-0 z-50 bg-slate-900 border-b border-slate-800">
+        <div class="max-w-7xl mx-auto px-8 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-x-3">
+                <div class="text-2xl font-bold tracking-tight">NOVA</div>
+                <div class="text-sm px-3 py-1 bg-slate-800 rounded-full text-cyan-400">完整架构版</div>
+            </div>
+            <div class="flex gap-x-8 text-sm">
+                <a href="#overview" class="nav-link">概述</a>
+                <a href="#crates" class="nav-link">Crate 结构</a>
+                <a href="#pipeline" class="nav-link">TurnPipeline</a>
+                <a href="#memory" class="nav-link">记忆系统</a>
+                <a href="#refactor" class="nav-link">重构建议</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="max-w-7xl mx-auto px-8 py-12">
+        
+        <!-- Header -->
+        <div class="text-center mb-16">
+            <h1 class="text-6xl font-bold tracking-tighter header-gradient mb-4">NOVA</h1>
+            <p class="text-2xl text-slate-400">Rust Agent 系统完整架构文档</p>
+            <p class="mt-4 text-slate-500">迭代后深度整理版 • 2025</p>
+        </div>
+
+        <!-- 1. Overview -->
+        <section id="overview" class="section mb-20">
+            <h2 class="text-4xl font-semibold mb-8 flex items-center gap-x-3">
+                <span>1. 项目概述</span>
+            </h2>
+            
+            <div class="card p-8 rounded-2xl">
+                <p class="text-xl leading-relaxed text-slate-300">
+                    NOVA 是一个采用 <strong class="text-cyan-400">Daemon + Client</strong> 架构的高性能 Rust Agent 系统。
+                    目标是实现类 Claude Code 的智能代理能力，同时提供赛博朋克风格的 TUI 和 Discord 多端接入。
+                </p>
+                
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mt-8">
+                    <div class="bg-slate-800 p-5 rounded-xl">
+                        <div class="text-cyan-400 text-sm font-medium mb-1">核心架构</div>
+                        <div class="font-semibold">Daemon + IPC + Client</div>
+                    </div>
+                    <div class="bg-slate-800 p-5 rounded-xl">
+                        <div class="text-cyan-400 text-sm font-medium mb-1">执行引擎</div>
+                        <div class="font-semibold">5-Stage TurnPipeline</div>
+                    </div>
+                    <div class="bg-slate-800 p-5 rounded-xl">
+                        <div class="text-cyan-400 text-sm font-medium mb-1">语言</div>
+                        <div class="font-semibold">Rust（9 个 Crate）</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 2. Crate Structure -->
+        <section id="crates" class="section mb-20">
+            <h2 class="text-4xl font-semibold mb-8">2. Crate 结构与依赖</h2>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <!-- Crate Cards -->
+                <div class="card p-6 rounded-2xl">
+                    <div class="font-mono text-cyan-400 text-xl mb-3">nova-core</div>
+                    <div class="text-sm text-slate-400 mb-4">零依赖 · 基础抽象层</div>
+                    <div class="space-y-2 text-sm">
+                        <div>• 定义所有核心 Trait</div>
+                        <div>• Message、Config、Policy</div>
+                        <div>• Executor 模式定义</div>
+                    </div>
+                </div>
+                
+                <div class="card p-6 rounded-2xl">
+                    <div class="font-mono text-cyan-400 text-xl mb-3">nova-agent</div>
+                    <div class="text-sm text-slate-400 mb-4">Agent 核心逻辑</div>
+                    <div class="space-y-2 text-sm">
+                        <div>• QueryLoop + TurnPipeline</div>
+                        <div>• Token Budget &amp; Compact</div>
+                        <div>• Hooks 系统</div>
+                    </div>
+                </div>
+                
+                <div class="card p-6 rounded-2xl">
+                    <div class="font-mono text-cyan-400 text-xl mb-3">nova-memory</div>
+                    <div class="text-sm text-slate-400 mb-4">记忆子系统</div>
+                    <div class="space-y-2 text-sm">
+                        <div>• Tension / Mode / Topic</div>
+                        <div>• MemoryBoard</div>
+                        <div>• Dual-Write 机制</div>
+                    </div>
+                </div>
+                
+                <div class="card p-6 rounded-2xl">
+                    <div class="font-mono text-cyan-400 text-xl mb-3">nova-daemon</div>
+                    <div class="text-sm text-slate-400 mb-4">守护进程核心</div>
+                    <div class="space-y-2 text-sm">
+                        <div>• SessionHandler</div>
+                        <div>• Discord Gateway</div>
+                        <div>• ToolFactory</div>
+                    </div>
+                </div>
+                
+                <div class="card p-6 rounded-2xl">
+                    <div class="font-mono text-cyan-400 text-xl mb-3">nova-tui</div>
+                    <div class="text-sm text-slate-400 mb-4">终端界面</div>
+                    <div class="space-y-2 text-sm">
+                        <div>• Ratatui + Crossterm</div>
+                        <div>• 赛博朋克主题</div>
+                    </div>
+                </div>
+                
+                <div class="card p-6 rounded-2xl">
+                    <div class="font-mono text-cyan-400 text-xl mb-3">nova-ipc</div>
+                    <div class="text-sm text-slate-400 mb-4">通信协议</div>
+                    <div class="space-y-2 text-sm">
+                        <div>• Unix Domain Socket</div>
+                        <div>• JSON Lines 协议</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. TurnPipeline -->
+        <section id="pipeline" class="section mb-20">
+            <h2 class="text-4xl font-semibold mb-8">3. TurnPipeline 执行引擎（核心）</h2>
+            
+            <div class="card p-8 rounded-2xl mb-8">
+                <p class="text-lg mb-6">NOVA 的 Agent 执行采用可组合的 <strong>5 阶段流水线</strong>，每一次用户输入都会经过完整流程。</p>
+                
+                <div class="mermaid">
+                    graph TD
+                        A[用户输入] --> B[PolicyStage]
+                        B --> C[InjectStage]
+                        C --> D[BudgetStage]
+                        D --> E[StreamStage]
+                        E --> F[ExecuteStage]
+                        F --> G{是否继续?}
+                        G -->|是| B
+                        G -->|否| H[结束 Turn]
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
+                <div class="card p-5">
+                    <div class="font-semibold text-cyan-400 mb-2">1. PolicyStage</div>
+                    <div class="text-sm">根据 AgentPolicy 决定工具可见性与是否终止</div>
+                </div>
+                <div class="card p-5">
+                    <div class="font-semibold text-cyan-400 mb-2">2. InjectStage</div>
+                    <div class="text-sm">注入 System Prompt、记忆、模式提示</div>
+                </div>
+                <div class="card p-5">
+                    <div class="font-semibold text-cyan-400 mb-2">3. BudgetStage</div>
+                    <div class="text-sm">Token 预算检查与压缩触发</div>
+                </div>
+                <div class="card p-5">
+                    <div class="font-semibold text-cyan-400 mb-2">4. StreamStage</div>
+                    <div class="text-sm">调用 LLM 进行流式响应</div>
+                </div>
+                <div class="card p-5">
+                    <div class="font-semibold text-cyan-400 mb-2">5. ExecuteStage</div>
+                    <div class="text-sm">执行工具调用并处理结果</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 4. Memory System -->
+        <section id="memory" class="section mb-20">
+            <h2 class="text-4xl font-semibold mb-8">4. 记忆系统深度解析</h2>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div class="card p-7">
+                    <h3 class="text-2xl font-semibold mb-4">TensionTracker</h3>
+                    <p class="text-slate-300">实时检测用户消息中的情绪张力，用于动态调整交互模式。</p>
+                </div>
+                <div class="card p-7">
+                    <h3 class="text-2xl font-semibold mb-4">ModeRouter</h3>
+                    <p class="text-slate-300">支持四种交互模式：Normal / SoftIntimate / HighIntimate / Cooling，并注入对应提示。</p>
+                </div>
+                <div class="card p-7">
+                    <h3 class="text-2xl font-semibold mb-4">TopicTracker</h3>
+                    <p class="text-slate-300">管理话题生命周期，支持自动归档与上下文切换。</p>
+                </div>
+                <div class="card p-7">
+                    <h3 class="text-2xl font-semibold mb-4">MemoryBoard</h3>
+                    <p class="text-slate-300">长期记忆白板，支持手动和自动整理，类似人类的长期记忆库。</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- 5. Refactoring Suggestions -->
+        <section id="refactor" class="section mb-20">
+            <h2 class="text-4xl font-semibold mb-8">5. 重构建议（针对当前混乱）</h2>
+            
+            <div class="space-y-6">
+                <div class="card p-7 border-l-4 border-amber-500">
+                    <h3 class="font-semibold text-amber-400 mb-3">1. 统一 Memory 注入机制</h3>
+                    <p>目前 MemoryBoard、DailyNotes、Recall 注入时机不统一，建议建立 MemoryLayer 的优先级和注入顺序。</p>
+                </div>
+                
+                <div class="card p-7 border-l-4 border-amber-500">
+                    <h3 class="font-semibold text-amber-400 mb-3">2. Executor 模式标准化</h3>
+                    <p>5 种执行模式（ReAct/Chain/Parallel 等）应统一暴露为标准工具，并完善 WithReview 和 Project 模式。</p>
+                </div>
+                
+                <div class="card p-7 border-l-4 border-amber-500">
+                    <h3 class="font-semibold text-amber-400 mb-3">3. 提取 Client 基类</h3>
+                    <p>TUI 和 Discord 客户端存在较多重复逻辑，建议抽象出 NovaClient 基类。</p>
+                </div>
+                
+                <div class="card p-7 border-l-4 border-amber-500">
+                    <h3 class="font-semibold text-amber-400 mb-3">4. 加强错误处理与重试</h3>
+                    <p>目前重试策略分散在多个模块，建议在 nova-core 中统一定义 RetryPolicy。</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Mermaid Architecture -->
+        <section class="section mb-20">
+            <h2 class="text-4xl font-semibold mb-8">6. 整体架构 Mermaid 图</h2>
+            
+            <div class="card p-8">
+                <div class="mermaid">
+                    graph TB
+                        subgraph Client Layer
+                            TUI[nova-tui]
+                            Discord[discord]
+                        end
+
+                        subgraph Daemon Layer
+                            Daemon[nova-daemon]
+                            IPC[nova-ipc]
+                        end
+
+                        subgraph Core Layer
+                            Agent[nova-agent]
+                            Memory[nova-memory]
+                            Tools[nova-tools]
+                            LLM[nova-llm]
+                        end
+
+                        Core[nova-core]
+
+                        TUI --> IPC
+                        Discord --> IPC
+                        IPC --> Daemon
+                        Daemon --> Agent
+                        Agent --> Memory
+                        Agent --> Tools
+                        Agent --> LLM
+                        LLM --> Core
+                        Memory --> Core
+                        Tools --> Core
+                </div>
+            </div>
+        </section>
+
+        <div class="text-center text-slate-500 text-sm mt-12">
+            本文档由 Hermes Agent 自动生成并持续更新
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            flowchart: { curve: 'basis' }
+        });
+        
+        // Tailwind script
+        function initializeTailwind() {
+            console.log('%c[NOVA] Architecture document initialized', 'color:#64748b');
+        }
+        window.onload = initializeTailwind;
+    </script>
+</body>
+</html>

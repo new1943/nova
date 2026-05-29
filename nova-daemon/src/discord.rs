@@ -11,7 +11,7 @@ use nova_core::message::MessageAttachment;
 use tracing::{info, warn, error};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, broadcast};
 
 use nova_agent::{QueryLoop, LoopEvent};
 use nova_memory::memory::consolidate::MemoryConsolidator;
@@ -128,6 +128,93 @@ impl EventHandler for DiscordHandler {
         if let Err(e) = http.create_global_commands(&commands).await {
             warn!("Failed to register global commands: {}", e);
         }
+
+        // Spawn background listener for executor task completion notifications.
+        // When a task completes, the Agent processes the result and sends a summary to Discord.
+        let cfg = self.cfg.clone();
+        let ctx_clone = ctx.clone();
+        tokio::spawn(async move {
+            let mut rx = cfg.exec_event_tx.subscribe();
+            info!("[Discord Notify] Background listener started for task completions");
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let nova_ipc::Event::ProjectCompleted { project_id, report } = event {
+                            info!("[Discord Notify] Task {} completed, running Agent to summarize", project_id);
+                            // Run a standalone Agent turn to summarize the result
+                            let msg_content = format!(
+                                "<system_notification>\n后台任务 {} 执行完毕。以下是执行结果报告：\n\n{}\n\n请立刻以你的名义，用自然语言向我简述/汇报上述结果。\n</system_notification>",
+                                project_id, report
+                            );
+                            let tool_desc = crate::tool_factory::tool_descriptions(&cfg.tools);
+                            let sp = {
+                                let mut bootstrap = nova_agent::BootstrapLoader::new(cfg.workspace_dir.clone());
+                                bootstrap.build_system_prompt(&tool_desc)
+                            };
+                            let hooks = crate::tool_factory::make_hooks(cfg.workspace_dir.clone());
+                            let tool_ctx = nova_tools::ToolContext::new(
+                                format!("discord-notify-{}", project_id),
+                                Some(cfg.workspace_dir.clone()),
+                            );
+                            let ql = QueryLoop::new(
+                                cfg.llm_backend.clone(),
+                                cfg.tools.clone(),
+                                hooks,
+                                cfg.loop_config.clone(),
+                                None, None, None, None,
+                                tool_ctx,
+                            );
+                            let session = nova_memory::session::manager::Session {
+                                session_id: format!("discord-notify-{}", project_id),
+                                messages: vec![nova_core::message::Message::user(&msg_content)],
+                                turn_count: 0,
+                                max_turns: cfg.loop_config.max_turns,
+                                token_stats: Default::default(),
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                                last_memory_sweep_index: 0,
+                                memory_updated_mutex: false,
+                            };
+                            let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
+                            let handle = tokio::spawn(async move {
+                                ql.run_turn(session, &sp, event_tx).await
+                            });
+                            // Collect response text
+                            let mut response = String::new();
+                            while let Some(ev) = event_rx.recv().await {
+                                if let LoopEvent::TextDelta(t) = ev {
+                                    response.push_str(&t);
+                                }
+                            }
+                            let _ = handle.await;
+                            // Send to Discord
+                            if !response.is_empty() {
+                                let filtered = filter_nova_os(&response);
+                                if let Some(ch_id) = cfg.discord_channel_id {
+                                    let channel_id = serenity::model::id::ChannelId::new(ch_id);
+                                    let chars: Vec<char> = filtered.chars().collect();
+                                    for chunk in chars.chunks(1950) {
+                                        let chunk_str: String = chunk.iter().collect();
+                                        let builder = CreateMessage::new().content(chunk_str);
+                                        if let Err(e) = channel_id.send_message(&ctx_clone.http, builder).await {
+                                            warn!("[Discord Notify] Failed to send: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    info!("[Discord Notify] Task {} summary sent to Discord", project_id);
+                                } else {
+                                    warn!("[Discord Notify] No discord_channel_id configured, cannot send task {} result", project_id);
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("[Discord Notify] Lagged {} messages", n);
+                    }
+                }
+            }
+        });
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -330,14 +417,17 @@ async fn process_discord_message(
     let tool_desc = crate::tool_factory::tool_descriptions(&tools);
 
     let daily_notes = DailyNotes::new(memories_dir.clone());
+    let episodic = nova_agent::memory::EpisodicMemory::new(daily_notes.clone());
     let side_query = SideQuery::new(llm_backend.clone(), loop_config.model.clone());
 
     loop_config.memories_dir = Some(memories_dir.clone());
 
-    let consolidator = Arc::new(MemoryConsolidator::new(
+    let raw_consolidator = MemoryConsolidator::new(
         workspace_dir.clone(),
         SideQuery::new(llm_backend.clone(), loop_config.model.clone()),
-    ));
+    );
+    let consolidation = nova_agent::memory::ConsolidationMemory::new(raw_consolidator.clone());
+    let consolidator = Arc::new(raw_consolidator);
 
     let mut session = match session_mgr.resume_by_id(&session_id)? {
         Some(s) => s,
@@ -508,11 +598,11 @@ async fn process_discord_message(
 
     let (event_tx, mut event_rx) = mpsc::channel::<LoopEvent>(64);
     let lc = loop_config.clone();
-    let dn = daily_notes.clone();
+    let ep = episodic.clone();
     let sq_loop = side_query.clone();
     let session_clone = session.clone();
     let tools_clone = tools.clone();
-    let cons = consolidator.clone();
+    let cons_mem = consolidation.clone();
     let session_id_str = session.session_id.clone();
     let workspace_dir_clone = workspace_dir.clone();
     let backend_for_loop = llm_backend.clone();
@@ -522,14 +612,13 @@ async fn process_discord_message(
 
     let loop_handle = tokio::spawn(async move {
         let hooks = crate::tool_factory::make_hooks(workspace_dir_clone.clone());
-        let cons_inner = Arc::try_unwrap(cons).unwrap_or_else(|arc| (*arc).clone());
         let tool_ctx = ToolContext::new(
             session_id_str.clone(),
             Some(workspace_dir_clone),
         );
         let mut ql = QueryLoop::new(
-            backend_for_loop, tools_clone, hooks, lc, Some(dn), Some(sq_loop),
-            Some(cons_inner),
+            backend_for_loop, tools_clone, hooks, lc, Some(ep), Some(sq_loop),
+            Some(cons_mem),
             None, // notify_tx
             tool_ctx,
         );

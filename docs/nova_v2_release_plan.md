@@ -22,7 +22,7 @@ R4 "自进化" ───── Hermes 高优先级借鉴 + 测试              [
 
 ---
 
-## R1: 轻装上阵 (3 天)
+## R1: 轻装上阵 (3 天) — ✅ 已完成
 
 > 目标：消除技术债，建立 TurnPipeline 闭环，main.rs 从 1235→~300 行
 
@@ -94,14 +94,14 @@ nova-daemon/src/
 
 **R1 交付物**：
 - ✅ 127 处技术债标记减至 ~10 处
-- ✅ main.rs 从 1235 行 → ~300 行（含 session_handler）
-- ✅ TurnPipeline 闭环：Classify→Track→Gate→Inject→ExecuteConfig
+- ✅ main.rs 从 850 行 → 304 行（含 session_handler + lifecycle 模块拆分）
+- ✅ TurnPipeline 闭环：Budget→Stream→Execute→Inject→Policy
 - ✅ 策略冲突消除：AGENTS.md 不再重复代码约束
 - ✅ decision_log 可观测性
 
 ---
 
-## R2: Crate 拆分 (3 天)
+## R2: Crate 拆分 (3 天) — ✅ 已完成（9 crate）
 
 > 目标：从 5 crate 拆到 8 crate，增量编译秒级，模块可独立测试
 
@@ -178,14 +178,14 @@ members = [
 ```
 
 **R2 交付物**：
-- ✅ 8 个 crate，DAG 依赖清晰
+- ✅ 9 个 crate（含 discord），DAG 依赖清晰
 - ✅ 改 nova-tools 不重编 nova-memory
 - ✅ nova-tools / nova-memory / nova-agent 各自可 `cargo test`
 - ✅ delegate_task/delegate_complex_project 代码重复消除
 
 ---
 
-## R3: 开放联接 (2 天)
+## R3: 开放联接 (2 天) — 🟡 部分完成（trait 定义完成，整合待续）
 
 > 目标：trait 化关键接口，支持多模型、多平台扩展
 
@@ -256,14 +256,16 @@ fn scan_injection(content: &str) -> ScanResult {
 Pipeline 新增 `PlatformHintStage`，根据当前平台（TUI/Discord/未来Telegram）注入对应 hint。
 
 **R3 交付物**：
-- ✅ `LlmBackend` trait — 可 mock，未来多 provider
-- ✅ `PlatformAdapter` trait — 加平台只需实现 trait
-- ✅ memory 注入有隔离标签
-- ✅ Prompt injection 防护
+- ✅ `LlmBackend` trait — 已定义（nova-core/src/llm_backend.rs），nova-llm 已实现
+- ✅ `PlatformAdapter` trait — 已定义（nova-core/src/platform.rs），已恢复未整合
+- ✅ `AgentPolicy` trait — 已定义（nova-core/src/policy.rs），PassthroughPolicy 已实现
+- ✅ `MemoryLayer` trait — 已定义（nova-core/src/memory_layer.rs），EpisodicMemory + ConsolidationMemory 已实现
+- 🔲 memory 注入隔离标签 — 待实现
+- 🔲 Prompt injection 防护 — InjectionScanner 已恢复，未整合
 
 ---
 
-## R4: 自进化 (2 天)
+## R4: 自进化 (2 天) — 🔲 未开始
 
 > 目标：落地 Hermes 中优先级借鉴 + 补关键测试
 
@@ -355,13 +357,13 @@ async fn test_dispatcher_routes_topic_archived() {
 
 | 维度 | 当前 | R1 后 | R2 后 | R3 后 | R4 后 |
 |:--|:--|:--|:--|:--|:--|
-| Crate 数 | 5 | 5 | **8** | 8 | 8 |
-| main.rs 行数 | 1235 | **~300** | ~200 | ~100 | ~100 |
-| 策略协调 | 各自为战 | **Pipeline 闭环** | Pipeline | Pipeline | Pipeline |
-| 代码 vs 提示词 | 双轨冲突 | **职责分离** | 分离 | 分离 | 分离 |
-| 增量编译 | 全量 | 全量 | **秒级** | 秒级 | 秒级 |
+| Crate 数 | 5 | 5 | **9** ✅ | 9 | 9 |
+| main.rs 行数 | 1235 | **~300** ✅ | ~200 | ~100 | ~100 |
+| 策略协调 | 各自为战 | **Pipeline 闭环** ✅ | Pipeline | Pipeline | Pipeline |
+| 代码 vs 提示词 | 双轨冲突 | **职责分离** ✅ | 分离 | 分离 | 分离 |
+| 增量编译 | 全量 | 全量 | **秒级** ✅ | 秒级 | 秒级 |
 | 可测试性 | 几乎无 | Pipeline 可测 | 模块可测 | Mock 可测 | **关键路径覆盖** |
-| 技术债标记 | 127 处 | **~10 处** | ~5 处 | ~2 处 | 0 |
+| 技术债标记 | 127 处 | **~10 处** ✅ | ~5 处 | ~2 处 | 0 |
 | Hermes 借鉴 | 0/8 高优 | 0/8 | 0/8 | **4/8** | **7/8** |
 | 可扩展性 | 改代码 | 改代码 | 加 crate | **实现 trait** | 实现 trait |
 

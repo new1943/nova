@@ -197,20 +197,22 @@ pub async fn execute_with_review(
     }
 
     // 发送完成通知
-    let _ = notify_tx
-        .send(Notification {
-            id: task_id.clone(),
-            name: task_name.clone(),
-            tool: "execute_with_review".into(),
-            status: TaskStatus::Completed {
-                output: format!("[验证 {}]\n{}", verdict, last_output),
-                duration: start.elapsed(),
-            },
-            output: Some(last_output),
-            channel: channel.clone(),
-            phases: None,
-        })
-        .await;
+    let notification = Notification {
+        id: task_id.clone(),
+        name: task_name.clone(),
+        tool: "execute_with_review".into(),
+        status: TaskStatus::Completed {
+            output: format!("[验证 {}]\n{}", verdict, last_output),
+            duration: start.elapsed(),
+        },
+        output: Some(last_output),
+        channel: channel.clone(),
+        phases: None,
+    };
+    match notify_tx.send(notification).await {
+        Ok(_) => tracing::info!("[execute_with_review] Task {} notification sent successfully", task_id),
+        Err(e) => tracing::error!("[execute_with_review] Task {} notification send FAILED: {}", task_id, e),
+    }
 
     task_id
 }

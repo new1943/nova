@@ -71,7 +71,7 @@ Browser: 15000字符, 头尾各5000
 
 ## 八、工具清单
 
-bash, read_file, write_file, glob, grep, file_edit, browser, agentic_search
+bash, read_file, write_file, glob, grep, file_edit, browser, agentic_search, memory, execute_react, execute_chain, execute_parallel, execute_with_review, execute_project, task_list, task_stop, worktree, skills
 
 ---
 

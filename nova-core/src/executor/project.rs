@@ -388,23 +388,25 @@ pub async fn execute_project(
     }
 
     // 达到最大迭代次数
-    let _ = notify_tx
-        .send(Notification {
-            id: task_id.clone(),
-            name: task_name.clone(),
-            tool: "execute_project".into(),
-            status: TaskStatus::Completed {
-                output: format!(
-                    "[达到最大验证轮数 {}]\n{}",
-                    max_iterations, implementation_output
-                ),
-                duration: start.elapsed(),
-            },
-            output: Some(implementation_output),
-            channel: channel.clone(),
-            phases: Some(phases),
-        })
-        .await;
+    let notification = Notification {
+        id: task_id.clone(),
+        name: task_name.clone(),
+        tool: "execute_project".into(),
+        status: TaskStatus::Completed {
+            output: format!(
+                "[达到最大验证轮数 {}]\n{}",
+                max_iterations, implementation_output
+            ),
+            duration: start.elapsed(),
+        },
+        output: Some(implementation_output),
+        channel: channel.clone(),
+        phases: Some(phases),
+    };
+    match notify_tx.send(notification).await {
+        Ok(_) => tracing::info!("[execute_project] Task {} notification sent successfully", task_id),
+        Err(e) => tracing::error!("[execute_project] Task {} notification send FAILED: {}", task_id, e),
+    }
 
     task_id
 }

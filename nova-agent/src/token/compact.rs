@@ -24,7 +24,6 @@ pub struct Compactor {
 }
 
 impl Compactor {
-    #[allow(dead_code)]
     pub fn new(target_pct: f32) -> Self {
         Self {
             target_pct,

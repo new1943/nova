@@ -114,20 +114,22 @@ pub async fn execute_chain(
     }
 
     // 发送完成通知
-    let _ = notify_tx
-        .send(Notification {
-            id: task_id.clone(),
-            name: task_name.clone(),
-            tool: "execute_chain".into(),
-            status: TaskStatus::Completed {
-                output: last_output.clone(),
-                duration: start.elapsed(),
-            },
-            output: Some(last_output),
-            channel: channel.clone(),
-            phases: None,
-        })
-        .await;
+    let notification = Notification {
+        id: task_id.clone(),
+        name: task_name.clone(),
+        tool: "execute_chain".into(),
+        status: TaskStatus::Completed {
+            output: last_output.clone(),
+            duration: start.elapsed(),
+        },
+        output: Some(last_output),
+        channel: channel.clone(),
+        phases: None,
+    };
+    match notify_tx.send(notification).await {
+        Ok(_) => tracing::info!("[execute_chain] Task {} notification sent successfully", task_id),
+        Err(e) => tracing::error!("[execute_chain] Task {} notification send FAILED: {}", task_id, e),
+    }
 
     task_id
 }

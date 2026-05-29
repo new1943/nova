@@ -12,14 +12,6 @@ const TAIL_RATIO: f64 = 0.2;
 /// 内置 Agent 行为宪法 — 不可被用户篡改
 const BUILTIN_AGENTS: &str = include_str!("../../prompts/AGENTS.md");
 
-/// Bootstrap files to load, in injection order.
-#[allow(dead_code)]
-const BOOTSTRAP_FILES: &[&str] = &[
-    "SOUL.md",
-    "IDENTITY.md",
-    "USER.md",
-];
-
 /// MEMORY.md is loaded separately — it's the working memory layer (Layer 1).
 const MEMORY_FILE: &str = "MEMORY.md";
 
@@ -113,19 +105,6 @@ impl BootstrapLoader {
     /// Load MEMORY.md (Layer 1 working memory).
     pub fn load_memory(&mut self) -> String {
         self.load_with_cache(MEMORY_FILE)
-    }
-
-    /// Build a system prompt segment for MEMORY.md injection.
-    pub fn build_memory_injection(&mut self, max_chars: usize) -> String {
-        let content = self.load_memory();
-        if content.is_empty() {
-            return String::new();
-        }
-        let truncated = truncate_bootstrap(&content, max_chars);
-        format!(
-            "\n\n---\n\n## Working Memory (MEMORY.md)\n\n{}\n\n---\n\n",
-            truncated
-        )
     }
 
     /// Load a file with mtime caching.

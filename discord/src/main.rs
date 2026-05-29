@@ -15,8 +15,8 @@ impl EventHandler for DiscordBot {
             return;
         }
 
-        // 类型过滤
-        if !matches!(msg.kind, serenity::all::MessageType::Regular | serenity::all::MessageType::Reply) {
+        // 类型过滤 — 只处理普通消息
+        if msg.kind != serenity::all::MessageType::Regular {
             return;
         }
 
@@ -48,7 +48,8 @@ impl EventHandler for DiscordBot {
         }
 
         // 服务器频道需要 @mention
-        let content = if msg.is_dm() {
+        let is_dm = msg.guild_id.is_none();
+        let content = if is_dm {
             msg.content.clone()
         } else {
             if require_mention && !msg.mentions_me(&ctx).await.unwrap_or(false) {

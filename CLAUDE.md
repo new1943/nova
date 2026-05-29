@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-# Build all crates
+# Build all crates (including discord)
 cargo build --release
 
 # Build a specific crate
@@ -35,103 +35,112 @@ cargo test -p nova-core <test_name>
 
 ## Architecture Overview
 
-NOVA is a Rust rewrite of OpenClaw Agent implementing all 16 Claude Code strategies with a cyberpunk TUI. The system uses a TurnPipeline architecture for per-turn processing, trait-based abstractions for LLM and platform connectivity, and an event-driven background system (ShadowEvent).
+NOVA is a Rust agent system implementing Claude Code strategies with a cyberpunk TUI. The system uses a daemon + client architecture communicating via Unix Domain Socket IPC.
 
-### Crate Structure (8 workspace crates + 1 standalone)
+### Crate Structure (9 workspace crates)
 
 ```
 nova/
-├── nova-core/       # 核心类型与 trait：TurnContext, PipelineStage, LlmBackend, PlatformAdapter, Config, Message, ShadowEvent
-├── nova-llm/        # LLM API 客户端：Anthropic 兼容 SSE 流式，实现 LlmBackend trait
-├── nova-tools/      # 工具系统：ToolRegistry, 内置工具（bash, read_file, write_file, glob, grep, browser, skills...）
-├── nova-memory/     # 记忆系统：四层记忆架构, TopicTracker, TensionTracker, ModeRouter, SessionManager, DreamEngine
-├── nova-agent/      # Agent 逻辑：AgentLoop, TurnPipeline Stages, Token 管理, Coordinator, SubAgent, Heartbeat
-├── nova-ipc/        # 进程间通信：Unix Domain Socket, JSON lines 协议
-├── nova-daemon/     # 守护进程：Dispatcher 事件路由, Discord 适配器, TaskManager, ToolFactory
-├── nova-tui/        # 赛博朋克 TUI 客户端（ratatui + crossterm）
-└── discord/         # (standalone) Discord 独立客户端：通过 nova-ipc 连接 daemon
+├── nova-core/       # Core traits and types: LlmBackend, AgentPolicy, MemoryLayer, ToolExecutor, Config, Message, ShadowEvent
+├── nova-llm/        # LLM API client: Anthropic-compatible SSE streaming, implements LlmBackend trait
+├── nova-tools/      # Tool system: ToolRegistry, built-in tools (bash, read_file, write_file, glob, grep, browser, skills, executor_tools)
+├── nova-memory/     # Memory system: TopicTracker, TensionTracker, ModeRouter, SessionManager, MemoryBoard, DailyNotes
+├── nova-agent/      # Agent logic: QueryLoop, TurnPipeline, Token management, Hooks, ForkedAgent, Heartbeat, MemoryLayer impls
+├── nova-ipc/        # IPC: Unix Domain Socket, JSON lines protocol
+├── nova-daemon/     # Daemon: main.rs, session_handler, lifecycle, Dispatcher, Discord gateway, TaskManager, ToolFactory
+├── nova-tui/        # Cyberpunk TUI client (ratatui + crossterm)
+└── discord/         # Standalone Discord client: connects to daemon via nova-ipc
 ```
 
 ### Dependency Graph
 
 ```
-                    nova-core (基础层)
+                    nova-core (foundation)
                    /    |     \      \
               nova-llm  |   nova-ipc  nova-memory
-                 |      |      |  \      |
-              nova-tools |     |   \     |
-                 \      |     |    \    /
-                  nova-agent  |   nova-tui
-                      \       |
+                 |      |      |        |
+              nova-tools |     |        |
+                 \      |     |        /
+                  nova-agent  |       /
+                      \       |      /
                        nova-daemon
-                           
-                        discord ──→ nova-ipc (standalone)
+                      /       |
+                   nova-tui  discord
 ```
 
-**依赖关系说明：**
-- `nova-core`：零内部依赖，定义所有核心 trait 和类型
-- `nova-llm`：依赖 `nova-core`（使用 CompletionRequest/Response 类型）
-- `nova-memory`：依赖 `nova-core`（使用 Message, ShadowEvent 类型）
-- `nova-tools`：依赖 `nova-core` + `nova-llm`
-- `nova-agent`：依赖 `nova-core` + `nova-llm` + `nova-tools` + `nova-memory`
-- `nova-ipc`：零内部依赖（独立协议层）
-- `nova-tui`：依赖 `nova-ipc`（通过 UDS 连接 daemon）
-- `nova-daemon`：依赖所有 crate（顶层组装）
-- `discord`：(standalone) 仅依赖 `nova-ipc`（通过 IPC 连接 daemon）
+**Dependencies:**
+- `nova-core`: zero internal deps, defines all core traits and types
+- `nova-llm`: depends on `nova-core` (CompletionRequest/Response types)
+- `nova-memory`: depends on `nova-core` (Message, ShadowEvent types)
+- `nova-tools`: depends on `nova-core` + `nova-llm`
+- `nova-agent`: depends on `nova-core` + `nova-llm` + `nova-tools` + `nova-memory`
+- `nova-ipc`: zero internal deps (standalone protocol layer)
+- `nova-tui`: depends on `nova-ipc` (connects to daemon via UDS)
+- `nova-daemon`: depends on all crates (top-level assembly)
+- `discord`: depends on `nova-ipc` (connects to daemon via IPC)
 
-### TurnPipeline Stage 说明
+### Core Traits (nova-core)
 
-TurnPipeline 是每轮对话的处理流水线，各 Stage 通过共享的 `TurnContext` 协作：
+| Trait | File | Purpose | Implementations |
+|:------|:-----|:--------|:----------------|
+| `LlmBackend` | `llm_backend.rs` | LLM API abstraction | `ApiClient` (nova-llm) |
+| `AgentPolicy` | `policy.rs` | Tool visibility + behavior per turn | `PassthroughPolicy` (default) |
+| `MemoryLayer` | `memory_layer.rs` | Unified memory interface | `EpisodicMemory`, `ConsolidationMemory` (nova-agent) |
+| `ToolHandler` | `executor/mod.rs` | Tool execution | `ToolRegistry` (nova-tools) |
+| `PlatformAdapter` | `platform.rs` | Platform abstraction | `DiscordAdapter` (defined, not wired) |
 
-```
-Classify → Track → Gate → Inject → PlatformHint → ExecuteConfig
-```
+### TurnPipeline (nova-agent)
 
-| Stage | 职责 | 写入字段 |
-|:------|:-----|:---------|
-| **ClassifyStage** | 调用 PreFlight 分类用户输入复杂度 | `complexity`, `preflight_result` |
-| **TrackStage** | 检测话题切换、计算张力值 | `topic_shift`, `tension` |
-| **GateStage** | 根据复杂度决定工具白名单 | `allowed_tools` |
-| **InjectStage** | 注入上下文（记忆、Skills 摘要、auto_trigger） | `prompt_injections` |
-| **PlatformHintStage** | 根据平台（Discord/TUI）注入平台特定提示 | `prompt_injections` |
-| **ExecuteConfigStage** | 设置执行配置（如高复杂度时 terminate_after_tool） | `should_terminate_after_tool` |
+The agent loop uses a `TurnPipeline` orchestrator with 5 composable stages:
 
-**核心规则：** 每个 Stage "写自己负责的字段，读别人的字段"，Stage 之间不直接通信。
+| Stage | File | Responsibility |
+|:------|:-----|:---------------|
+| **PolicyStage** | `pipeline/stages/policy.rs` | Tool visibility + termination via `AgentPolicy::decide()` |
+| **InjectStage** | `pipeline/stages/inject.rs` | Assembles system prompt with prompt injections |
+| **BudgetStage** | `pipeline/stages/budget.rs` | Pre-flight token budget check |
+| **StreamStage** | `pipeline/stages/stream.rs` | LLM API call + streaming response |
+| **ExecuteStage** | `pipeline/stages/execute.rs` | Tool execution with approval checks |
 
-### LlmBackend Trait
+`QueryLoop::run_turn()` creates a `TurnPipeline` once, then loops: each iteration runs all 5 stages via `pipeline.run()`, followed by post-pipeline control flow (compact, retry, overflow handling). A single `TurnContext` is reused across iterations via `reset_iteration()`.
 
-`nova-core/src/llm_backend.rs` 定义了 LLM 后端抽象，使系统可对接任意 LLM provider：
+### Memory Subsystems (nova-daemon)
 
-```rust
-#[async_trait]
-pub trait LlmBackend: Send + Sync {
-    /// 非流式补全
-    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse>;
-    /// 流式补全 — 通过 channel 发送增量事件
-    async fn stream(&self, req: &CompletionRequest, tx: Sender<StreamDelta>) -> Result<()>;
-}
-```
+The daemon initializes 5 memory subsystems per connection:
 
-- `nova-llm` 提供 Anthropic 兼容的 HTTP 实现
-- 测试中使用 mock 实现避免真实 API 调用
-- `CompletionRequest` / `CompletionResponse` 是 provider 无关的统一类型
+| Subsystem | Module | Purpose |
+|:----------|:-------|:--------|
+| **TensionTracker** | `nova-memory/src/memory/tension_tracker.rs` | Emotion/tension detection from user messages |
+| **ModeRouter** | `nova-memory/src/memory/mode_router.rs` | Interaction mode (Normal/SoftIntimate/HighIntimate/Cooling) |
+| **TopicTracker** | `nova-memory/src/memory/topic_state.rs` | Topic lifecycle (Started→Active→Suspended→Archived) |
+| **MemoryBoard** | `nova-memory/src/memory/memory_board.rs` | MEMORY.md whiteboard management |
+| **MemoryRecall** | `nova-memory/src/memory/recall.rs` | Diary-based relevant memory recall |
 
-### PlatformAdapter Trait
+Mode hints are injected into the system prompt per turn. Topic transitions are tracked and archived to MemoryBoard.
 
-`nova-core/src/platform.rs` 定义了平台适配器抽象，支持多平台接入：
+### Executor System
 
-```rust
-#[async_trait]
-pub trait PlatformAdapter: Send + Sync {
-    fn platform(&self) -> Platform;
-    async fn send(&self, channel_id: &str, content: &str) -> Result<()>;
-    async fn start(&mut self, tx: Sender<PlatformMessage>) -> Result<()>;
-}
-```
+The executor system provides 5 execution modes for different task complexities:
 
-- `Platform` 枚举：`Discord` | `Tui`
-- `nova-daemon` 中的 `DiscordAdapter` 实现此 trait
-- 统一的 `PlatformMessage` 结构上报消息给 Agent
+| Mode | Module | Description |
+|:-----|:-------|:------------|
+| **React** | `nova-core/src/executor/react.rs` | ReAct reasoning + action loop |
+| **Chain** | `nova-core/src/executor/chain.rs` | Sequential step chain |
+| **Parallel** | `nova-core/src/executor/parallel.rs` | Parallel sub-tasks |
+| **WithReview** | `nova-core/src/executor/review.rs` | Adversarial self-review |
+| **Project** | `nova-core/src/executor/project.rs` | 4-phase orchestrator (Research→Synthesis→Implementation→Verification) |
+
+These are exposed as tools via `nova-tools/src/executor_tools.rs` and managed by `TaskRegistry` (global singleton).
+
+### Daemon Structure (nova-daemon)
+
+| File | Lines | Responsibility |
+|:-----|:------|:---------------|
+| `main.rs` | ~300 | Entry point, daemon lifecycle, IPC server loop, Discord gateway setup |
+| `session_handler.rs` | ~560 | Per-connection session management, QueryLoop orchestration, memory subsystems |
+| `lifecycle.rs` | ~45 | PID file management, PidGuard |
+| `tool_factory.rs` | ~110 | ToolRegistry construction |
+| `dispatcher.rs` | ~180 | ShadowEvent routing |
+| `discord.rs` | ~890 | Discord gateway handler |
 
 ## Configuration
 
@@ -149,39 +158,50 @@ Workspace directory: `~/.nova/` containing:
 - MEMORY.md — long-term memory (not injected, accessed via tools)
 - sessions/ — JSONL session storage
 
-## Claude Code 16 Strategy Implementation
+## Strategy Implementation
 
 | # | Strategy | Module | Status |
 |:--|:--|:--|:--|
-| 1 | Query Loop | `nova-agent/src/agent_loop.rs` | ✅ |
-| 2 | Token Budget | `nova-agent/src/token/budget.rs` | ✅ |
-| 3 | Compact | `nova-agent/src/token/compact.rs` | ✅ |
-| 4 | Forked Agent | `nova-agent/src/forked.rs` | ✅ |
-| 5 | PostSampling Hooks | `nova-agent/src/hooks/post_sampling.rs` | ✅ |
-| 6 | StopHooks | `nova-agent/src/hooks/stop.rs` | ✅ |
-| 7 | Dual-Write Memory | `nova-memory/src/memory/dual_write.rs` | ✅ |
-| 8 | Tool Pool Stable Sort | `nova-tools/src/registry.rs` | ✅ |
-| 9 | Team | `nova-tools/src/team/` | ✅ |
-| 10 | Subagent spawn | `nova-agent/src/subagent/` | ✅ |
-| 11 | SideQuery | `nova-memory/src/sidequery/query.rs` | ✅ |
-| 12 | autoDream | `nova-memory/src/dream/engine.rs` | ✅ |
-| 13 | Worktree | `nova-tools/src/worktree/` | ✅ |
-| 14 | Coordinator | `nova-agent/src/coordinator/orchestrator.rs` | ✅ |
-| 15 | Paste Store | `nova-tools/src/paste/` | ✅ |
-| 16 | Session JSONL | `nova-memory/src/session/` | ✅ |
+| 1 | Query Loop | `nova-agent/src/agent_loop.rs` | Done |
+| 2 | Token Budget | `nova-agent/src/token/budget.rs` | Done |
+| 3 | Compact | `nova-agent/src/token/compact.rs` | Done |
+| 4 | Forked Agent | `nova-agent/src/forked.rs` | Defined (not wired) |
+| 5 | PostSampling Hooks | `nova-agent/src/hooks/post_sampling.rs` | Done |
+| 6 | StopHooks | `nova-agent/src/hooks/stop.rs` | Done |
+| 7 | Dual-Write Memory | `nova-memory/src/memory/dual_write.rs` | Done |
+| 8 | Tool Pool Stable Sort | `nova-tools/src/registry.rs` | Done |
+| 9 | Executor Tools | `nova-tools/src/executor_tools.rs` | Done |
+| 10 | SideQuery | `nova-memory/src/sidequery/query.rs` | Done |
+| 11 | Worktree | `nova-tools/src/worktree/` | Done |
+| 12 | Paste Store | `nova-tools/src/paste/` | Defined (not wired) |
+| 13 | Session JSONL | `nova-memory/src/session/` | Done |
+| 14 | TurnPipeline | `nova-agent/src/pipeline/` | Done (5 stages) |
+| 15 | MemoryLayer | `nova-agent/src/memory/` | Done (Episodic + Consolidation) |
+| 16 | Memory Subsystems | `nova-memory/src/memory/` | Done (5 subsystems wired) |
+
+## Not Yet Integrated
+
+These modules are defined and tested but not wired into the production pipeline:
+
+- `nova-core/src/retry/policy.rs` — `RetryPolicy` with exponential backoff, planned for LLM API retry
+- `nova-core/src/injection_scanner.rs` — `InjectionScanner` for prompt injection detection, has property tests
+- `nova-core/src/platform.rs` — `PlatformAdapter` trait for unified platform abstraction, `DiscordAdapter` exists but unused
+- `nova-agent/src/forked.rs` — `ForkedAgent` for background task spawning with retry, defined but unused
+- `nova-tools/src/paste/` — `PasteStore` for content deduplication by hash, defined but unused
+- `nova-tools/src/sandbox/` — `SandboxPolicy` for file access control, defined but unused
 
 ## ShadowEvent System
 
-`nova-core/src/models/events.rs` 定义了统一事件总线：
+`nova-core/src/models/events.rs` defines the event bus:
 
-| Event | 频率 | 路由目标 | 用途 |
-|:------|:-----|:---------|:-----|
-| `TaskProgress` | 高频 | TaskManager | Tasks.md CRUD |
-| `TopicArchived` | 低频 | MemoryKeeper | 话题归档 → 记忆提取 |
-| `SystemIdle` | 低频 | MemoryKeeper | 空闲时 flush 缓冲 |
-| `ProjectCompleted` | 低频 | Dispatcher | 推送通知 |
+| Event | Frequency | Target | Purpose |
+|:------|:----------|:-------|:--------|
+| `TaskProgress` | High | TaskManager | Tasks.md CRUD |
+| `TopicArchived` | Low | MemoryKeeper | Topic archiving → memory extraction |
+| `SystemIdle` | Low | MemoryKeeper | Idle-time flush |
+| `ProjectCompleted` | Low | Dispatcher | Push notification |
 
-事件流：`QueryLoop / Heartbeat → mpsc channel → Dispatcher → handlers`
+Event flow: `QueryLoop / Heartbeat → mpsc channel → Dispatcher → handlers`
 
 ## Running the Application
 
@@ -192,14 +212,18 @@ Workspace directory: `~/.nova/` containing:
 # Stop daemon
 ./target/release/nova-daemon stop
 
-# Connect TUI (if nova-tui is built)
+# Connect TUI
 ./target/release/nova-tui
 ```
 
 ## Discord Integration
 
-The daemon embeds a Discord gateway as a tokio Task when `discord_enabled=true` and `DISCORD_TOKEN` is set. TUI and Discord share the same daemon session management.
+Two ways to use Discord:
 
-- `<nova_os>` 标签在发送消息前自动过滤，不会暴露给 Discord 用户
-- 集成 TopicTracker、TensionTracker、ModeRouter（通过 Pipeline）
-- MemoryBoard 自动更新归档话题和偏好
+1. **Embedded** — daemon starts Discord gateway when `discord_enabled=true` and `DISCORD_TOKEN` is set
+2. **Standalone** — run `discord/` binary separately, connects to daemon via IPC
+
+TUI and Discord share the same daemon session management.
+
+- Discord slash commands: `/new`, `/reset`, `/stop`, `/tasks`
+- Background task completion notifications are pushed to Discord channels

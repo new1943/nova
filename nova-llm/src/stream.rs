@@ -1,5 +1,3 @@
-use serde_json::Value;
-
 use crate::types::Usage;
 
 /// High-level stream event emitted by ApiClient::stream()
@@ -19,18 +17,4 @@ pub enum StreamEvent {
     Usage(Usage),
     /// Error from API
     Error(String),
-}
-
-/// Accumulated tool call from streaming
-#[derive(Debug, Clone)]
-pub struct AccumulatedToolCall {
-    pub id: String,
-    pub name: String,
-    pub input_json: String,
-}
-
-impl AccumulatedToolCall {
-    pub fn parse_input(&self) -> anyhow::Result<Value> {
-        Ok(serde_json::from_str(&self.input_json)?)
-    }
 }

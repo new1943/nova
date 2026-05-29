@@ -4,6 +4,7 @@ use nova_llm::types::ToolSchema;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::debug;
 
@@ -31,11 +32,16 @@ pub trait ToolHandler: Send + Sync {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<String>;
 }
 
-/// Tool registry with stable ordering (builtin first, MCP second)
-pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn ToolHandler>>,
+struct ToolRegistryInner {
+    tools: HashMap<String, Arc<dyn ToolHandler>>,
     builtin_order: Vec<String>,
     mcp_order: Vec<String>,
+}
+
+/// Tool registry with stable ordering (builtin first, MCP second).
+/// Uses interior mutability (RwLock) so tools can be registered after Arc wrapping.
+pub struct ToolRegistry {
+    inner: RwLock<ToolRegistryInner>,
 }
 
 impl Default for ToolRegistry {
@@ -45,30 +51,35 @@ impl Default for ToolRegistry {
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
-            builtin_order: Vec::new(),
-            mcp_order: Vec::new(),
+            inner: RwLock::new(ToolRegistryInner {
+                tools: HashMap::new(),
+                builtin_order: Vec::new(),
+                mcp_order: Vec::new(),
+            }),
         }
     }
 
-    pub fn register_builtin(&mut self, tool: Box<dyn ToolHandler>) {
+    pub fn register_builtin(&self, tool: Box<dyn ToolHandler>) {
         let name = tool.name().to_string();
-        self.builtin_order.push(name.clone());
-        self.tools.insert(name, tool);
+        let mut inner = self.inner.write().unwrap();
+        inner.builtin_order.push(name.clone());
+        inner.tools.insert(name, Arc::from(tool));
     }
 
-    pub fn register_mcp(&mut self, tool: Box<dyn ToolHandler>) {
+    pub fn register_mcp(&self, tool: Box<dyn ToolHandler>) {
         let name = tool.name().to_string();
-        self.mcp_order.push(name.clone());
-        self.tools.insert(name, tool);
+        let mut inner = self.inner.write().unwrap();
+        inner.mcp_order.push(name.clone());
+        inner.tools.insert(name, Arc::from(tool));
     }
 
     /// Export tool schemas in stable order (builtin first, MCP second)
     pub fn as_api_schemas(&self) -> Vec<ToolSchema> {
-        self.builtin_order
+        let inner = self.inner.read().unwrap();
+        inner.builtin_order
             .iter()
-            .chain(self.mcp_order.iter())
-            .filter_map(|name| self.tools.get(name))
+            .chain(inner.mcp_order.iter())
+            .filter_map(|name| inner.tools.get(name))
             .map(|t| ToolSchema {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -82,15 +93,16 @@ impl ToolRegistry {
     where
         F: Fn(&str) -> bool,
     {
-        let names: Vec<&String> = self.builtin_order
+        let inner = self.inner.read().unwrap();
+        let names: Vec<&String> = inner.builtin_order
             .iter()
-            .chain(self.mcp_order.iter())
+            .chain(inner.mcp_order.iter())
             .filter(|name| filter(name))
             .collect();
         debug!("[V4] Tool filtering: {} tools allowed: {:?}", names.len(), names);
         names
             .iter()
-            .filter_map(|name| self.tools.get(*name))
+            .filter_map(|name| inner.tools.get(*name))
             .map(|t| ToolSchema {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -107,10 +119,11 @@ impl ToolRegistry {
         ctx: &ToolContext,
         timeout: Duration,
     ) -> Result<String> {
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Tool not found: {}", name))?;
+        let tool = {
+            let inner = self.inner.read().unwrap();
+            inner.tools.get(name).cloned()
+        };
+        let tool = tool.ok_or_else(|| anyhow::anyhow!("Tool not found: {}", name))?;
 
         match tokio::time::timeout(timeout, tool.execute(input, ctx)).await {
             Ok(result) => result,
@@ -120,9 +133,10 @@ impl ToolRegistry {
 
     /// Human-readable description of all tools
     pub fn describe_all(&self) -> String {
+        let inner = self.inner.read().unwrap();
         let mut desc = String::from("Available tools:\n");
-        for name in self.builtin_order.iter().chain(self.mcp_order.iter()) {
-            if let Some(tool) = self.tools.get(name) {
+        for name in inner.builtin_order.iter().chain(inner.mcp_order.iter()) {
+            if let Some(tool) = inner.tools.get(name) {
                 desc.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
             }
         }
@@ -149,7 +163,7 @@ impl nova_core::executor::ToolExecutor for ToolRegistry {
         // 写工具名称列表 — 不是只读的工具
         // 这里集中管理，取代之前 review.rs/project.rs 中分散的 substring 匹配
         const WRITE_TOOLS: &[&str] = &[
-            "write_file", "file_edit", "execute_bash", "browser",
+            "write_file", "file_edit", "execute_bash", "browser", "skill_manage",
         ];
         !WRITE_TOOLS.contains(&tool_name)
     }

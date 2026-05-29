@@ -9,6 +9,7 @@ members = [
     "nova-ipc",
     "nova-daemon",
     "nova-tui",
+    "discord",
 ]
 
 [workspace.dependencies]
